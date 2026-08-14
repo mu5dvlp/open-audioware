@@ -1,0 +1,48 @@
+# --- Rust ---
+/target/
+**/target/
+Cargo.lock.bak
+*.pdb
+
+# --- macOS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# --- ビルド成果物(初期構築仕様 §13: バイナリはコミットしない) ---
+unity/Runtime/Plugins/macOS/*.dylib
+unity/Runtime/Plugins/iOS/*.xcframework
+unity/Runtime/Plugins/iOS/**/*.a
+unity/Runtime/Plugins/Android/**/*.so
+/dist/
+/build/
+
+# csbindgen 生成物は毎回 `make bindgen` で再生成されるため追跡しない
+unity/Runtime/Generated/*.g.cs
+
+# --- Unity (unity/ パッケージ側。通常は生成物なし想定だが保険) ---
+unity/**/*.meta.bak
+unity/Library/
+unity/Temp/
+unity/Logs/
+unity/obj/
+
+# --- unity-sample/ (統合検証用 Unity プロジェクト) ---
+unity-sample/Library/
+unity-sample/Temp/
+unity-sample/Logs/
+unity-sample/obj/
+unity-sample/Build/
+unity-sample/Builds/
+unity-sample/UserSettings/
+unity-sample/.vs/
+unity-sample/*.csproj
+unity-sample/*.sln
+unity-sample/*.userprefs
+unity-sample/.idea/
+# make unity-test の出力(NUnit XML)
+unity-sample/*TestResults*.xml
+
+# --- IDE ---
+.vscode/
+*.swp

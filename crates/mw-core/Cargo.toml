@@ -1,0 +1,15 @@
+[package]
+name = "mw-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "OS 非依存のミキサ・ボイス管理・クロック・デコード・リサンプルコア(オフラインレンダリング可能)"
+
+[lib]
+# unity-sample の csbindgen 経由テストや将来のホスト側ベンチから素直にリンクできるよう rlib のみ。
+crate-type = ["rlib"]
+
+[dependencies]
+
+[dev-dependencies]

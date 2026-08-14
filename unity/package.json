@@ -1,0 +1,13 @@
+{
+  "name": "com.mu5dvlp.audio-middleware",
+  "version": "0.1.0",
+  "displayName": "Audio Middleware (Native)",
+  "description": "音楽ゲーム向け自作オーディオミドルウェア(Rust)のネイティブバイナリ・生成 C# バインディング・薄い C# ラッパ(Mw.Native)。テンプレート非依存。パッケージ名/組織 ID は未定(MU7)。",
+  "unity": "2022.3",
+  "keywords": [
+    "audio",
+    "native",
+    "ffi"
+  ],
+  "type": "library"
+}

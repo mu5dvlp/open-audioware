@@ -1,0 +1,16 @@
+[package]
+name = "mw-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "出力デバイス抽象(Backend trait)と cpal 実装"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+mw-core = { path = "../mw-core" }
+cpal = "0.18"
+
+[dev-dependencies]

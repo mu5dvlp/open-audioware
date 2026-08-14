@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/mw-core",
+    "crates/mw-backend",
+    "crates/mw-ffi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "UNLICENSED"
+publish = false
+repository = "https://github.com/mu5dvlp/audio-middleware-sample"
+
+[profile.release]
+# リアルタイムオーディオコールバックの性能を優先する。
+# panic=abort は FFI 境界での catch_unwind と両立しないため既定(unwind)のままにする。
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1

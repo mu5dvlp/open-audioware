@@ -1,0 +1,19 @@
+[package]
+name = "mw-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "C ABI 境界。ハンドル管理、コマンド/イベントキュー、csbindgen の入力"
+
+[lib]
+name = "mw_ffi"
+# cdylib: macOS Editor / Android(.so)。staticlib: iOS(xcframework 経由の静的リンク)。
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+mw-core = { path = "../mw-core" }
+mw-backend = { path = "../mw-backend" }
+
+[build-dependencies]
+csbindgen = "1.9"
