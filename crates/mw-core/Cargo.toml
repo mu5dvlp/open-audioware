@@ -11,5 +11,9 @@ description = "OS 非依存のミキサ・ボイス管理・クロック・デ�
 crate-type = ["rlib"]
 
 [dependencies]
+# SPSC ロックフリーリングバッファ。コマンドキュー(ゲーム→音声スレッド)と
+# 回収キュー(音声→ゲームスレッド、Arc<SoundData> の解放をゲームスレッド側へ戻す)に使う
+# (初期構築仕様 §7.1, §5.2)。
+rtrb = "0.3"
 
 [dev-dependencies]

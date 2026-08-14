@@ -7,20 +7,47 @@
 //!
 //! M0 時点ではインスタンスは同時に1つのみ(グローバルレジストリ)。
 //! 複数インスタンスを許すかは未検討(現状の Unity 統合はプロセス内で1つのみ使う想定)。
+//!
+//! M1 で `Instance` にゲームスレッド側ハンドル(`CommandSender` / `ReclaimReceiver`)と
+//! サウンドストレージ・ボイスシリアル採番器を追加した(§5.2「コマンド/イベントキュー」)。
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 use mw_backend::{Backend, CpalBackend};
-use mw_core::Renderer;
+use mw_core::{CommandSender, Config, ReclaimReceiver, Renderer, SoundStorage};
 
-struct Instance {
+/// 出力デバイスが実際にオープンされるまでの暫定サンプルレート(§4.7 推奨の 48kHz)。
+/// `CpalBackend::open` がデバイスとネゴシエートした実レートで上書きする
+/// (`Renderer::set_sample_rate`、コールバックが動き出す前)。
+const PROVISIONAL_SAMPLE_RATE: u32 = 48_000;
+
+pub struct Instance {
     handle: u64,
     backend: CpalBackend,
-    // M0 では Renderer はまだミキサを持たないが、Backend が保持する Arc の対とし、
-    // 将来のコマンドキュー処理(§5.2)から参照できるようここに保持しておく。
-    #[allow(dead_code)]
-    renderer: Arc<Renderer>,
+    pub command_sender: CommandSender,
+    pub reclaim_receiver: Mutex<ReclaimReceiver>,
+    pub sounds: Mutex<SoundStorage>,
+    next_voice_serial: AtomicU64,
+}
+
+impl Instance {
+    /// 新規ボイスシリアル(不透明な voice id)を1つ払い出す。0 は「未割当」の予約値。
+    pub fn next_voice_serial(&self) -> u64 {
+        self.next_voice_serial
+            .fetch_add(1, Ordering::Relaxed)
+            .max(1)
+    }
+
+    /// 音声スレッドが手放した `Arc<SoundData>` をゲームスレッド上で回収する。
+    /// FFI 呼び出しの合間に日和見的に呼ぶ(§5.4: 非ブロッキング。rtrb の pop は O(1))。
+    pub fn drain_reclaimed(&self) {
+        let mut guard = self
+            .reclaim_receiver
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.drain();
+    }
 }
 
 /// ハンドルは 1 から始まる単調増加の不透明 ID。0 は「未割当」を意味する予約値として使わない
@@ -30,6 +57,20 @@ static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 fn registry() -> &'static Mutex<Option<Instance>> {
     static REGISTRY: OnceLock<Mutex<Option<Instance>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(None))
+}
+
+/// 現在初期化済みのインスタンスに対して `f` を実行する。無効ハンドルは `None` を返す。
+///
+/// レジストリの `Mutex` はゲームスレッド側のコードでのみ取得される(§5.3 が禁止するのは
+/// 音声スレッド側でのロック取得のみ。ここは FFI 呼び出し = ゲームスレッド経路)。
+pub fn with_instance<T>(handle: u64, f: impl FnOnce(&Instance) -> T) -> Option<T> {
+    let guard = registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match guard.as_ref() {
+        Some(instance) if instance.handle == handle => Some(f(instance)),
+        _ => None,
+    }
 }
 
 pub enum InitOutcome {
@@ -51,9 +92,11 @@ pub fn init() -> InitOutcome {
         return InitOutcome::AlreadyOpen(instance.handle);
     }
 
-    let renderer = Arc::new(Renderer::new());
+    let (renderer, command_sender, reclaim_receiver) =
+        Renderer::build(Config::default(), PROVISIONAL_SAMPLE_RATE);
+
     let mut backend = CpalBackend::new();
-    if backend.open(Arc::clone(&renderer)).is_err() {
+    if backend.open(renderer).is_err() {
         return InitOutcome::Failed;
     }
 
@@ -61,7 +104,10 @@ pub fn init() -> InitOutcome {
     *guard = Some(Instance {
         handle,
         backend,
-        renderer,
+        command_sender,
+        reclaim_receiver: Mutex::new(reclaim_receiver),
+        sounds: Mutex::new(SoundStorage::new()),
+        next_voice_serial: AtomicU64::new(1),
     });
     InitOutcome::Opened(handle)
 }
@@ -117,5 +163,10 @@ mod tests {
                 panic!("unissued handle must not match an existing instance")
             }
         }
+    }
+
+    #[test]
+    fn with_instance_returns_none_for_unknown_handle() {
+        assert!(with_instance(u64::MAX, |_| ()).is_none());
     }
 }

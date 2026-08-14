@@ -4,15 +4,23 @@
 `mw-core` にのみ依存する(依存の向きは `mw-backend → mw-core`。ワークスペース全体の方針は
 `../../CLAUDE.md` を参照)。`mw-ffi` からのみ利用される。
 
-## 現状(M0)
+## 現状(M1)
 
-- `backend::Backend` — `open(&mut self, renderer: Arc<Renderer>)` / `close(&mut self)` /
+- `backend::Backend` — `open(&mut self, renderer: Renderer)` / `close(&mut self)` /
   `is_open(&self)`。実装はパニックせず、失敗は必ず `BackendError` で返す。
+  `renderer` は**値渡し(ムーブ)**。`Renderer` はコールバックスレッド専用の排他所有物として
+  ストリームクロージャへムーブされる(M0 時点の `Arc<Renderer>` 共有から変更。
+  `crates/mw-core/src/renderer.rs` のドキュメント参照。ゲームスレッドは
+  `mw_core::CommandSender` / `mw_core::ReclaimReceiver` という別ハンドル経由でのみ
+  音声スレッドとやり取りする)。
 - `backend::BackendError` — デバイス無し・対応構成無し・ストリーム構築/開始失敗・
   二重 open・未 open close、の6種。
 - `cpal_backend::CpalBackend` — 既定の出力デバイスに **f32 ステレオ**のストリームを開く。
   対応する構成が無い場合(モノ/サラウンド専用デバイス、非対応サンプルフォーマット等)は
   `BackendError::NoSupportedStreamConfig` を返す(サンプルフォーマット変換は未実装、将来課題)。
+  デバイスが実際にネゴシエートしたサンプルレートは、コールバックが動き出す
+  (`stream.play()`)前に `Renderer::set_sample_rate` で確定させる(バス/ボイスのランプの
+  ミリ秒→サンプル数換算に必要。初期構築仕様 §4.1)。
 
 ## 設計意図
 

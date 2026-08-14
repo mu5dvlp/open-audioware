@@ -4,8 +4,6 @@
 //! 計測後、必要なら Android を oboe 直叩き、iOS を RemoteIO 直叩きに置換する可能性がある
 //! (その際もこの `Backend` trait 経由で差し替えられるようにしてある)。
 
-use std::sync::Arc;
-
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig, SupportedStreamConfig};
 use mw_core::{CHANNELS, Renderer};
@@ -28,7 +26,7 @@ impl CpalBackend {
 }
 
 impl Backend for CpalBackend {
-    fn open(&mut self, renderer: Arc<Renderer>) -> Result<(), BackendError> {
+    fn open(&mut self, mut renderer: Renderer) -> Result<(), BackendError> {
         if self.stream.is_some() {
             return Err(BackendError::AlreadyOpen);
         }
@@ -41,6 +39,10 @@ impl Backend for CpalBackend {
         let supported_config =
             find_f32_stereo_config(&device).ok_or(BackendError::NoSupportedStreamConfig)?;
         let config: StreamConfig = supported_config.into();
+
+        // ランプのミリ秒→サンプル数換算(初期構築仕様 §4.1)が正しいサンプルレートを
+        // 使えるよう、コールバックが動き出す(`stream.play()`)前に確定させる。
+        renderer.set_sample_rate(config.sample_rate);
 
         let stream = build_output_stream(&device, &config, renderer)?;
         stream
@@ -83,7 +85,7 @@ fn find_f32_stereo_config(device: &cpal::Device) -> Option<SupportedStreamConfig
 fn build_output_stream(
     device: &cpal::Device,
     config: &StreamConfig,
-    renderer: Arc<Renderer>,
+    mut renderer: Renderer,
 ) -> Result<cpal::Stream, BackendError> {
     let err_fn = |err: cpal::Error| {
         // 音声スレッドではなく cpal のエラー通知経路から呼ばれる(§5.3 の対象外)。
@@ -97,7 +99,9 @@ fn build_output_stream(
             // `StreamConfig` は `Copy`。呼び出し元との共有を避けるため値で渡す。
             *config,
             move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
-                // ここが音声スレッド上のオーディオコールバック本体。
+                // ここが音声スレッド上のオーディオコールバック本体。`renderer` はこの
+                // クロージャへムーブ済みで、以後は音声スレッドの単一の書き手が
+                // `&mut` で触るだけ(ロックも `Arc` 共有も無い。§5.3)。
                 // `Renderer::render` はリアルタイム安全性規約(§5.3)を満たす実装である前提。
                 renderer.render(data);
             },

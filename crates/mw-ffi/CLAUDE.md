@@ -9,20 +9,50 @@ C ABI 境界。`mw-core` / `mw-backend` 両方に依存する唯一のクレー�
 
 - `src/result.rs` — `MwResult`(`#[repr(i32)]`)。全 FFI 関数の戻り値。`Ok = 0`、
   それ以外は負の整数のエラーコード(初期構築仕様 §4.8)。
+- `src/types.rs` — `MwSoundMode` / `MwBus`。FFI 境界の `i32` 引数を検証・復元する内部専用の
+  値型(`from_raw(i32) -> Option<Self>`)。**csbindgen の入力には含めない**
+  (下記「enum を FFI 引数に直接使わない理由」参照)。
 - `src/handle.rs` — init/shutdown のグローバルレジストリ(`OnceLock<Mutex<Option<Instance>>>`)。
   ハンドルは不透明な `u64`(ポインタを C# に渡さない)。二重 init は同一ハンドルを返す
-  (冪等)、無効ハンドルの shutdown はエラーコードで検出する。
+  (冪等)、無効ハンドルの shutdown はエラーコードで検出する。`Instance` は M1 で
+  `mw_core::CommandSender` / `mw_core::ReclaimReceiver` / `mw_core::SoundStorage` /
+  ボイスシリアル採番器(`AtomicU64`)を持つ。
 - `src/ffi.rs` — `#[unsafe(no_mangle)] pub extern "C" fn mw_*` 本体。
   **csbindgen の入力**(`build.rs` がここと `result.rs` を読む)。
 - `build.rs` — csbindgen で `unity/Runtime/Generated/NativeMethods.g.cs` を生成する。
 
-## 現状の公開 API(M0)
+## 現状の公開 API(M1: SE 再生)
 
 ```
-mw_abi_version() -> u32                  // 定数 1
-mw_init(out_handle: *mut u64) -> MwResult   // 冪等。既定出力デバイスにストリームを開く
-mw_shutdown(handle: u64) -> MwResult        // 冪等ではない(無効ハンドルはエラー)。ストリームを閉じる
+mw_abi_version() -> u32                                          // 定数 1
+mw_init(out_handle: *mut u64) -> MwResult                        // 冪等。既定出力デバイスにストリームを開く
+mw_shutdown(handle: u64) -> MwResult                              // 冪等ではない(無効ハンドルはエラー)。ストリームを閉じる
+
+mw_sound_load(handle, bytes: *const u8, len: usize, mode: i32, out_id: *mut u64) -> MwResult
+    // mode=0(SE)のみ実装。mode=1(Music)は ErrUnsupportedSoundMode(M2 で実装)
+mw_sound_release(handle, id: u64) -> MwResult
+    // 再生中ボイスがあれば既定ランプ経由で即停止させたうえで解放する
+
+mw_se_play(handle, id: u64, bus: i32, volume: f32, out_voice: *mut u64) -> MwResult
+    // 次のオーディオコールバックで必ず発音される(初期構築仕様 §4.2)
+mw_voice_stop(handle, voice: u64) -> MwResult                     // 既定ランプ経由
+mw_voice_set_volume(handle, voice: u64, volume: f32) -> MwResult  // 既定ランプ経由
+mw_bus_set_volume(handle, bus: i32, volume: f32) -> MwResult      // 既定ランプ経由
+mw_bus_fade(handle, bus: i32, target: f32, ms: f32) -> MwResult   // 呼び出し側指定の時間
 ```
+
+すべて非ブロッキング(コマンドをキューへ積むだけ)。キューが満杯の場合は
+`MwResult::ErrCommandQueueFull` を返す(黙って捨てない。「次のコールバックで必ず発音」の
+保証はコマンドが実際にキューへ積まれたことが前提のため)。
+
+### `bus` / `mode` を `i32` で受け取る理由(enum を FFI 引数に直接使わない)
+
+`#[repr(i32)]` の Rust enum を `extern "C"` 関数の引数型に直接使うと、呼び出し側
+(C#)が列挙の定義外の整数値を渡した場合に未定義動作になりうる(Rust は enum が
+宣言済みの判別子以外の値を取らない前提で最適化する)。これを避けるため、
+`mw_bus_*` 系・`mw_sound_load` は `bus`/`mode` を素の `i32` として受け取り、
+`MwBus::from_raw` / `MwSoundMode::from_raw`(`src/types.rs`)で検証してから使う。
+範囲外の値は `MwResult::ErrInvalidBus` / `MwResult::ErrUnsupportedSoundMode` を返す。
 
 ## 不変条件
 

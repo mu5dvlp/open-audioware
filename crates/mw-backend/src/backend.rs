@@ -1,7 +1,6 @@
 //! 出力デバイス抽象(初期構築仕様 §5.1: 「将来の oboe / RemoteIO 直叩き実装もここに並べる」)。
 
 use std::fmt;
-use std::sync::Arc;
 
 use mw_core::Renderer;
 
@@ -47,12 +46,18 @@ impl std::error::Error for BackendError {}
 ///
 /// 実装はスレッドセーフであること(§5.4)。`open`/`close` はゲームスレッドから
 /// 呼ばれる想定だが、コールバック自体は OS が生成する専用の音声スレッドで実行される。
+///
+/// `renderer` は値渡し(ムーブ)で受け取る。`Renderer` のミキサ状態(ボイスプール・バス・
+/// コマンドキュー受信側)は音声コールバックスレッドの単一の書き手専用であり、
+/// ゲームスレッドは別途 `mw_core::CommandSender` / `mw_core::ReclaimReceiver` 経由でのみ
+/// やり取りする(`Arc` 共有や内部可変性を持ち込まない設計。`crates/mw-core/src/renderer.rs`
+/// のドキュメント参照)。
 pub trait Backend {
     /// 出力ストリームを開き、再生を開始する。
     ///
     /// 既に開いている場合は `Err(BackendError::AlreadyOpen)` を返す(パニックしない)。
     /// 冪等性(二重 init の扱い)は呼び出し元の mw-ffi が担う(§4.8)。
-    fn open(&mut self, renderer: Arc<Renderer>) -> Result<(), BackendError>;
+    fn open(&mut self, renderer: Renderer) -> Result<(), BackendError>;
 
     /// ストリームを停止して閉じる。
     ///

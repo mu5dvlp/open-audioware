@@ -10,10 +10,27 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod bus;
+pub mod clipper;
 pub mod clock;
+pub mod command;
+pub mod config;
 pub mod format;
+pub mod mixer;
+pub mod ramp;
 pub mod renderer;
+pub mod sound;
+pub mod voice;
+pub mod wav;
 
+pub use bus::{ALL_BUSES, BUS_COUNT, Bus, BusId, BusSet};
+pub use clipper::SoftClipper;
 pub use clock::RenderedFrameCounter;
+pub use command::Command;
+pub use config::Config;
 pub use format::{AudioFormat, CHANNELS, Sample};
+pub use mixer::{CommandSender, Mixer, ReclaimReceiver};
+pub use ramp::{Ramp, ms_to_samples};
 pub use renderer::Renderer;
+pub use sound::{SoundData, SoundId, SoundStorage};
+pub use wav::WavError;
