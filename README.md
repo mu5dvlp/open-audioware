@@ -1,6 +1,11 @@
+<p align="center">
+  <img src="docs/assets/logo.png" alt="Open Audioware — open source audio middleware" width="520" />
+</p>
+
 # audio-middleware-sample
 
-音楽ゲーム向けに自作している、CRI Ware の大まかな代替となるオーディオミドルウェア(Rust)。
+**Open Audioware** — 音楽ゲーム向けに自作している、CRI Ware の大まかな代替となる
+オーディオミドルウェア(Rust)。
 CRI の全機能を再現するのではなく、音ゲーに必要な機能だけを絞って実装する。
 
 - OS のローレイテンシ音声 API を直接叩き、タップ SE の発音遅延と音楽クロックの精度を
