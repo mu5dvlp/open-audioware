@@ -152,11 +152,9 @@ pub fn decode(bytes: &[u8]) -> Result<SoundData, WavError> {
 
     let bytes_per_sample = 2usize; // 16bit
     let frame_size = bytes_per_sample * channels as usize;
-    let frames = if frame_size == 0 {
-        0
-    } else {
-        data.len() / frame_size
-    };
+    // channels は上で 1/2 に検証済みのため frame_size は 0 にならないが、
+    // ゼロ除算の可能性を型の上でも消しておく(パニック経路禁止の規約 §5.3 とも整合)
+    let frames = data.len().checked_div(frame_size).unwrap_or(0);
 
     let mut interleaved = Vec::with_capacity(frames * CHANNELS);
     for frame_index in 0..frames {
