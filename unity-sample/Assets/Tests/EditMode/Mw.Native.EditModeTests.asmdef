@@ -3,6 +3,7 @@
     "rootNamespace": "",
     "references": [
         "Mw.Native",
+        "Measurement.Runtime",
         "UnityEngine.TestRunner",
         "UnityEditor.TestRunner"
     ],

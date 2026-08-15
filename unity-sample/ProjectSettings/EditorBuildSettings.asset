@@ -4,5 +4,8 @@
 EditorBuildSettings:
   m_ObjectHideFlags: 0
   serializedVersion: 2
-  m_Scenes: []
+  m_Scenes:
+  - enabled: 1
+    path: Assets/Measurement/MeasurementScene.unity
+    guid: 780743d4595804b7cba29844183f4e61
   m_configObjects: {}

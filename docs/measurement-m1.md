@@ -70,9 +70,10 @@
 
 ### 3.2 手順
 
-1. `unity-sample` に A/B 両方の再生ボタンを持つ最小シーンを用意する(【TODO】§6 参照。
-   現状 `unity-sample` は EditMode テストのみで実機確認用シーンは未整備)
+1. `unity-sample` に A/B 両方の再生ボタンを持つ最小シーンを用意する(**準備済み**。
+   `unity-sample/Assets/Measurement/MeasurementScene.unity`。§6 参照)
 2. 同一の SE 音源(短いクリック系、立ち上がりが明瞭な波形を推奨)を両実装にロードする
+   (**準備済み**。`ClickSeGenerator`(§6)がコードで合成し、両実装に同一波形を渡す)
 3. 実機を録音環境に固定し、同一条件(同じ端末・同じ距離・同じ音量設定)で:
    - A実装で10回タップ→計測
    - B実装で10回タップ→計測
@@ -99,25 +100,45 @@ SE音源: <ファイル名>, 長さ <ms>
 
 ### 4.1 iOS
 
-**現状**: `make build-ios` で `aarch64-apple-ios` 静的ライブラリ → `MwFfi.xcframework` の生成まで
-確認済み(CI・ローカル双方でビルド成功)。Apple Developer 登録済みのため、自動署名での
-実機インストールは即着手できる(初期構築仕様 §11)。
+**現状(2026-08-15 時点で準備完了)**: 以下がすべてローカルで実行・確認済み。
+**ユーザーがやることは Xcode を開いて Team を選び、実機に Run するだけ**の状態にしてある。
 
-手順:
+- `make build-ios` → `unity/Runtime/Plugins/iOS/MwFfi.xcframework` 生成(確認済み)
+- `make bindgen` → `unity/Runtime/Generated/NativeMethods.g.cs` 最新化(確認済み)
+- `unity-sample/Assets/Measurement/` に A/B 計測用シーン一式を実装済み(§6)
+- Unity バッチモードで iOS 向け Xcode プロジェクトを書き出し済み:
+  `unity-sample/Build/iOS/Unity-iPhone.xcodeproj`
+  (`Measurement.EditorTools.IosXcodeExporter` が `PlayerSettings.iOS.appleEnableAutomaticSigning = true`
+  ・`CODE_SIGN_STYLE = Automatic` を設定済み。`PRODUCT_BUNDLE_IDENTIFIER` は既定の
+  `com.DefaultCompany.unity-sample` のまま — 変更が必要なら Xcode 上で構わない)
+- MwFfi.xcframework は `Build/iOS/Frameworks/com.mu5dvlp.audio-middleware/Runtime/Plugins/iOS/`
+  配下に正しく埋め込まれていることを確認済み
+
+手順(再実行する場合):
 
 1. `make build-ios` で最新の `unity/Runtime/Plugins/iOS/MwFfi.xcframework` を生成する
 2. `make bindgen` で C# バインディングを最新化する
-3. Unity で `unity-sample`(または統合用シーンを持つプロジェクト)を開き、
-   iOS ビルドターゲットに切り替える
-4. Xcode プロジェクトを書き出し、実機を接続して自動署名でビルド・インストールする
-   (Apple Developer 登録済み。端末接続はユーザー作業、初期構築仕様 §11)
+3. Unity バッチモードでシーンと Xcode プロジェクトを再生成する(いずれも Unity 起動のため
+   `tools/with-unity-lock.sh` 経由でロックを取得すること):
+   - `Measurement.EditorTools.MeasurementSceneBuilder.Build`
+     (`unity-sample/Assets/Measurement/MeasurementScene.unity` を作成 / 上書き)
+   - `Measurement.EditorTools.IosXcodeExporter.Build`
+     (`unity-sample/Build/iOS/` に Xcode プロジェクトを書き出す。Editor メニューの
+     `Measurement/Export iOS Xcode Project` からも実行可)
+4. `unity-sample/Build/iOS/Unity-iPhone.xcodeproj` を Xcode で開き、Signing & Capabilities で
+   自分の Team を選び、実機を接続して Run する(自動署名は有効化済み。端末接続・Team 選択は
+   ユーザー作業、初期構築仕様 §11)
 5. AVAudioSession のカテゴリ・バッファ長設定は未実装(初期構築仕様 §14 リスク表、M3 で
    Obj-C シムを実装予定)。**M1 時点では OS 既定のセッション設定のまま計測する**
    (これ自体が M1 実測値に影響する可能性があり、計測結果と合わせて記録すること)
 
 **TODO(【未定】)**:
 - 実機ビルド・インストールの自動化(fastlane 等)は未整備。手動 Xcode 操作が前提
+  (今回自動署名 + Xcode プロジェクト書き出しまでは自動化した。Team 選択と実機への
+  インストール操作自体は Apple ID のサインイン状態に依存するためユーザー作業のまま)
 - AVAudioSession 未設定時の実際のバッファ長・レイテンシ特性は未計測
+- `unity-sample/Build/` は `.gitignore` 対象(ビルド成果物はコミットしない方針、CLAUDE.md)。
+  再取得する環境では上記手順3を再実行すること
 
 ### 4.2 Android
 
@@ -158,13 +179,51 @@ SE音源: <ファイル名>, 長さ <ms>
 
 いずれの場合も、**先に進まず原因を潰すか計画を見直す**(初期構築仕様 §10)。
 
-## 6. このドキュメント作成時点でのTODOサマリ
+## 6. 準備状況とTODO(2026-08-15 更新)
 
-- [ ] `unity-sample` に A/B 両実装を切り替えて再生できる実機確認用シーン(タップUI)を追加する
-- [ ] 実機(iOS/Android 各1台)への接続・インストールをユーザーと協働で実施する
+### 準備済み(実装・ローカル確認済み)
+
+- [x] **計測用シーン**: `unity-sample/Assets/Measurement/MeasurementScene.unity`
+      (`Measurement.EditorTools.MeasurementSceneBuilder` がコードから組み立てて保存する。
+      手作業でのシーン編集に依存しない)。画面いっぱいの大きなボタン2つ:
+      - **ボタンA**(左半分・青): Unity 既定実装(`AudioSource.PlayOneShot`)
+      - **ボタンB**(右半分・赤): 本ミドルウェア(`Mw.Native.MwNative.PlaySe`)
+      画面上部に現在(直近にタップした)モードを表示する `StatusText`
+      (例: `Mode: B (Mw.Native.MwNative.PlaySe)`)を常設。タップと同一フレームで
+      画面全体を白フラッシュ(既定2フレーム、`ScreenFlash` コンポーネント)する
+- [x] **クリック SE の生成**: `unity-sample/Assets/Measurement/Runtime/ClickSeGenerator.cs`。
+      2kHz・約30ms・指数減衰・位相 π/2(コサイン)開始でサンプル0から最大振幅に立ち上がる
+      自作波形をコードで合成する(バイナリ資産はコミットしない)。A・B 両実装に
+      **完全に同一のサンプル列**を渡す(A は `AudioClip.Create`、B は同じ配列から
+      組み立てた 48kHz/16bit モノラル wav バイト列を `LoadSound` に渡す)
+- [x] iOS ビルドパイプライン: `make build-ios` → `MwFfi.xcframework`、`make bindgen` →
+      C# バインディング、Unity バッチモードでの Xcode プロジェクト書き出しまで実行済み
+      (詳細・生成物パスは §4.1)。**自動署名を有効化した状態で書き出し済み**のため、
+      ユーザーは Xcode を開いて Team を選び実機で Run するだけでよい
+- [x] macOS Editor 上での動作確認: `make unity-test`(EditMode)で
+      `ClickSeGeneratorEditModeTests`(波形の健全性・`AudioClip` 生成・
+      `MwNative.LoadSound`/`PlaySe` が実際に成功すること)を含む9件すべて green。
+      `cargo test --workspace`(69件)・`make lint` も green
+
+### 未解決(ユーザー協働が必要 / 未着手)
+
+- [ ] 実機(iOS 1台。Android は本ラウンド未着手)への接続・Team 選択・インストールを
+      ユーザーと協働で実施する(§4.1 手順4)
 - [ ] 外部録音(まずは方式A: スロー動画)で A/B 計測を実施し、本ドキュメント §3.3 の
       フォーマットで記録する
 - [ ] 目標値未達の場合、§5 の切り分けに従い対応する
 - [ ] 初期構築仕様の未決事項「プロファイル基準端末」を確定し、以後の計測はその端末を基準にする
 - [ ] (iOS)AVAudioSession シム実装(M3 前倒し検討)
-- [ ] (Android)AAudio performance mode の明示設定の要否を調査する
+- [ ] Android 側(`make build-android` の再実行・Unity での Android ビルド書き出し・
+      AAudio performance mode の明示設定の要否調査)は本ラウンドでは未着手。§4.2 参照
+
+### 計測当日にユーザーがやることの最短手順(iOS)
+
+1. `unity-sample/Build/iOS/Unity-iPhone.xcodeproj` を Xcode で開く
+2. Signing & Capabilities で自分の Apple Developer Team を選ぶ(自動署名は有効化済み)
+3. iPhone を接続し、ビルドターゲットとして選択して Run(Development ビルド)
+4. アプリ起動後、画面上の A ボタン(青・左半分)を10回タップ → 別端末のスロー動画で録画
+5. 続けて B ボタン(赤・右半分)を10回タップ → 同様に録画
+   (画面上部の `StatusText` で直前にどちらを押したか常時確認できる)
+6. スロー動画から白フラッシュの立ち上がりフレームと SE 音の立ち上がりを読み取り、
+   §3.3 のフォーマットで記録する
