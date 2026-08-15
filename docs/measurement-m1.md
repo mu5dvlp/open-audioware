@@ -96,6 +96,25 @@ SE音源: <ファイル名>, 長さ <ms>
 | 中央値 | | |
 ```
 
+### 3.4 解析の自動化(準備済み)
+
+波形・フレームの目視読み取りは不要。`tools/measurement/analyze_ab_video.py` が
+動画から自動で遅延を算出する(ffmpeg / ffprobe が必要。Python 標準ライブラリのみ使用):
+
+```
+python3 tools/measurement/analyze_ab_video.py <Aの動画> --label A
+python3 tools/measurement/analyze_ab_video.py <Bの動画> --label B
+```
+
+- 白フラッシュは映像輝度(YAVG)の立ち上がり、SE は 2kHz バンドパス後の RMS の
+  立ち上がりで検出し、タップごとの遅延と中央値・ばらつきを出力する
+  (タップの操作音は帯域外なので誤検出しない)
+- **1モード1動画**で撮影する(A の連続タップで1本、B で1本)
+- **iPhone のスロー動画は「オリジナル」のまま AirDrop すること**。Photos アプリで
+  スロー編集を適用して書き出すと時間軸が歪み、解析できない
+- 検出原理の自己検証: `python3 tools/measurement/analyze_ab_video.py --self-test`
+  (既知の遅延 50/70ms を合成動画に埋め込み、誤差なく復元できることを確認済み)
+
 ## 4. 実機組み込みビルド手順
 
 ### 4.1 iOS
@@ -222,8 +241,9 @@ SE音源: <ファイル名>, 長さ <ms>
 1. `unity-sample/Build/iOS/Unity-iPhone.xcodeproj` を Xcode で開く
 2. Signing & Capabilities で自分の Apple Developer Team を選ぶ(自動署名は有効化済み)
 3. iPhone を接続し、ビルドターゲットとして選択して Run(Development ビルド)
-4. アプリ起動後、画面上の A ボタン(青・左半分)を10回タップ → 別端末のスロー動画で録画
-5. 続けて B ボタン(赤・右半分)を10回タップ → 同様に録画
+4. アプリ起動後、別端末のスロー動画(240fps 推奨)で画面を撮りながら
+   A ボタン(青・左半分)を10回ゆっくりタップ → 録画停止(A の動画1本)
+5. 同様に B ボタン(赤・右半分)を10回タップして録画(B の動画1本)
    (画面上部の `StatusText` で直前にどちらを押したか常時確認できる)
-6. スロー動画から白フラッシュの立ち上がりフレームと SE 音の立ち上がりを読み取り、
-   §3.3 のフォーマットで記録する
+6. 動画2本を**オリジナルのまま** AirDrop で Mac へ送り、
+   `tools/measurement/analyze_ab_video.py`(§3.4)で解析 → §3.3 のフォーマットで記録する
