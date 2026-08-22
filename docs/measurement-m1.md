@@ -193,8 +193,31 @@ Resave は Xcode のメモリ上にある**古い**プロジェクトをディ�
 1. `make build-android` で最新の `unity/Runtime/Plugins/Android/libs/arm64-v8a/libmw_ffi.so`
    を生成する
 2. `make bindgen` で C# バインディングを最新化する
-3. Unity で Android ビルドターゲットに切り替え、実機(要 USB デバッグ有効化)へビルド・
-   インストールする
+3. `make measurement-build-android` で apk を書き出す
+   (`unity-sample/Build/Android/measurement.apk`。`Measurement.EditorTools.AndroidApkExporter`。
+   Editor メニューの `Measurement/Export Android APK` からも実行可)
+4. `adb install -r unity-sample/Build/Android/measurement.apk` で実機へ入れる
+   (要 USB デバッグ有効化。`adb devices` に端末が1行出ることを先に確認する)
+
+**apk にネイティブライブラリが入っているか必ず確認すること**
+
+```
+unzip -l unity-sample/Build/Android/measurement.apk | grep libmw_ffi
+```
+
+`.so` はビルド成果物なのでコミットしない(CLAUDE.md)。そのため `.meta` にインポータ設定が
+入っておらず、放っておくと Unity が「どのプラットフォーム向けのプラグインか」を判断できずに
+**apk へ同梱されない**(2026-08-22 に実際に踏んだ。ビルドは成功するのに B だけ動かない apk が
+できる、という気づきにくい失敗をする)。`AndroidApkExporter` が毎ビルド
+`PluginImporter` を Android/ARM64 に設定し直して防いでいるが、確認は残しておくこと。
+
+**計測時の注意(iOS には無かった要因)**
+
+- **充電しながら、省電力モードをオフにして測る**。電池残量が少ないと CPU が
+  スロットリングされ、オーディオコールバックが締め切りに間に合わなくなると
+  Android のオーディオスタックがバッファを広げることがある。§4.2 が挙げている
+  AAudio の performance mode の検討と、電池由来のノイズを混同しないため
+- 記録には端末名・Android バージョン・**充電状態と省電力モードの有無**を書く
 4. cpal の Android 実装は `ndk`/`jni` クレート経由で AAudio を直接叩く(`crates/mw-backend/CLAUDE.md`
    参照)。パフォーマンスモード(low-latency / exclusive)の明示設定は未検証 —
    計測結果が目標値(≤40ms)に届かない場合、ここが M6(oboe 直叩き)判断の主要な検討材料になる

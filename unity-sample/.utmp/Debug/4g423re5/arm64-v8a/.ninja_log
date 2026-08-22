@@ -1,0 +1,12 @@
+# ninja log v5
+19	1504	1787401733732492678	FramePacing/CMakeFiles/swappywrapper.dir/UnitySwappyWrapper.cpp.o	21c649b161ef5860
+1505	2165	1787401734461048001	/Volumes/T9/projects/music-game-template/audio-middleware-sample/unity-sample/Library/Bee/Android/Prj/IL2CPP/Gradle/unityLibrary/build/intermediates/cxx/Debug/4g423re5/obj/arm64-v8a/libswappywrapper.so	ec8a5ddd44229c59
+2	10896	1787401743255547121	GameActivity/CMakeFiles/game.dir/UGAConfiguration.cpp.o	8e2616121e56539d
+10	11295	1787401743650126568	GameActivity/CMakeFiles/game.dir/UGAInputKeyEvent.cpp.o	77404f56d86c11d5
+6	11566	1787401743794353446	GameActivity/CMakeFiles/game.dir/UGAEntry.cpp.o	5c0c2886462c78e4
+12	11703	1787401744026739353	GameActivity/CMakeFiles/game.dir/UGAInputMotionEvent.cpp.o	1a46faf8962aedae
+4	12039	1787401744335437598	GameActivity/CMakeFiles/game.dir/UGADebug.cpp.o	c6c6c9fb30723c76
+16	12559	1787401744826768765	GameActivity/CMakeFiles/game.dir/UGASoftKeyboard.cpp.o	6c70793da4f696db
+8	13210	1787401745493978442	GameActivity/CMakeFiles/game.dir/UGAInput.cpp.o	aaceaad69a331955
+0	13647	1787401745966082156	GameActivity/CMakeFiles/game.dir/UGAApplication.cpp.o	622378828976856f
+13647	14059	1787401746312263708	/Volumes/T9/projects/music-game-template/audio-middleware-sample/unity-sample/Library/Bee/Android/Prj/IL2CPP/Gradle/unityLibrary/build/intermediates/cxx/Debug/4g423re5/obj/arm64-v8a/libgame.so	ebfc911e3662825f

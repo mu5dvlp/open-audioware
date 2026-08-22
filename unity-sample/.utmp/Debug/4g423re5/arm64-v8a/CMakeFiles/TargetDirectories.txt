@@ -1,0 +1,8 @@
+/Volumes/T9/projects/music-game-template/audio-middleware-sample/unity-sample/.utmp/Debug/4g423re5/arm64-v8a/CMakeFiles/edit_cache.dir
+/Volumes/T9/projects/music-game-template/audio-middleware-sample/unity-sample/.utmp/Debug/4g423re5/arm64-v8a/CMakeFiles/rebuild_cache.dir
+/Volumes/T9/projects/music-game-template/audio-middleware-sample/unity-sample/.utmp/Debug/4g423re5/arm64-v8a/GameActivity/CMakeFiles/game.dir
+/Volumes/T9/projects/music-game-template/audio-middleware-sample/unity-sample/.utmp/Debug/4g423re5/arm64-v8a/GameActivity/CMakeFiles/edit_cache.dir
+/Volumes/T9/projects/music-game-template/audio-middleware-sample/unity-sample/.utmp/Debug/4g423re5/arm64-v8a/GameActivity/CMakeFiles/rebuild_cache.dir
+/Volumes/T9/projects/music-game-template/audio-middleware-sample/unity-sample/.utmp/Debug/4g423re5/arm64-v8a/FramePacing/CMakeFiles/swappywrapper.dir
+/Volumes/T9/projects/music-game-template/audio-middleware-sample/unity-sample/.utmp/Debug/4g423re5/arm64-v8a/FramePacing/CMakeFiles/edit_cache.dir
+/Volumes/T9/projects/music-game-template/audio-middleware-sample/unity-sample/.utmp/Debug/4g423re5/arm64-v8a/FramePacing/CMakeFiles/rebuild_cache.dir

@@ -29,7 +29,7 @@ XCFRAMEWORK           := $(PLUGINS_IOS_DIR)/MwFfi.xcframework
 .PHONY: help setup lint format test bench bindgen \
         build-macos build-ios build-android \
         package unity-sample-create unity-test \
-        measurement-scene measurement-export-ios clean
+        measurement-scene measurement-export-ios measurement-build-android clean
 
 help:
 	@echo "audio-middleware-sample — make ターゲット"
@@ -47,6 +47,7 @@ help:
 	@echo "  make unity-test     - unity-sample の EditMode テストを実行(要 Unity ロック)"
 	@echo "  make measurement-scene     - A/B 計測シーンを生成/更新(要 Unity ロック)"
 	@echo "  make measurement-export-ios - A/B 計測アプリの Xcode プロジェクトを書き出す(要 Unity ロック)"
+	@echo "  make measurement-build-android - A/B 計測アプリの apk を書き出す(要 Unity ロック)"
 	@echo "  make clean          - target/ 以下のビルド成果物を削除"
 
 # --- setup --------------------------------------------------------------
@@ -195,6 +196,15 @@ measurement-export-ios:
 		-executeMethod Measurement.EditorTools.IosXcodeExporter.Build \
 		-quit -logFile -
 	@echo "書き出し先: $(UNITY_SAMPLE_DIR)/Build/iOS/Unity-iPhone.xcodeproj"
+
+# 事前に make build-android(.so)と make bindgen を済ませておくこと。
+measurement-build-android:
+	$(UNITY_LOCK_RUNNER) "$(UNITY_APP)" -batchmode -nographics \
+		-projectPath "$(CURDIR)/$(UNITY_SAMPLE_DIR)" \
+		-buildTarget Android \
+		-executeMethod Measurement.EditorTools.AndroidApkExporter.Build \
+		-quit -logFile -
+	@echo "書き出し先: $(UNITY_SAMPLE_DIR)/Build/Android/measurement.apk"
 
 # --- 掃除 ------------------------------------------------------------------
 
