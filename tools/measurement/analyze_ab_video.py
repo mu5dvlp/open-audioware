@@ -32,6 +32,11 @@ from pathlib import Path
 AUDIO_RATE = 48000
 RMS_WINDOW_SEC = 0.001  # 1ms 窓
 SEARCH_AFTER_FLASH_SEC = 0.4  # フラッシュ後、SE を探す最大時間
+# フラッシュ「前」も探す。アプリはタップと同一フレームで白フラッシュと発音を要求するが、
+# 画面に実際に出るまでにはレンダリング+垂直同期+パネルの応答があり、遅延の小さい実装では
+# 音のほうが先に出る(第2回計測でミドルウェア側が中央値 -31.5ms になった)。
+# 前を探さないと「SE を検出できなかった」= 無音、という致命的な偽陰性になる。
+SEARCH_BEFORE_FLASH_SEC = 0.15
 MIN_FLASH_GAP_SEC = 0.3  # フラッシュ同士の最小間隔(チャタリング除去)
 MIN_FLASH_JUMP = 40.0  # フラッシュと見なす baseline→peak の最小輝度差(--min-flash-jump で変更可)
 FLASH_THRESHOLD_RATIO = 0.5  # baseline と peak の間のどこを「明るい」の境目にするか
@@ -125,7 +130,7 @@ def rms_envelope(samples):
     return env, RMS_WINDOW_SEC
 
 
-def detect_onset_after(env, step, t_from, t_to, noise_floor, peak):
+def detect_onset_in(env, step, t_from, t_to, noise_floor, peak):
     """[t_from, t_to] 内で最初に有意に立ち上がる時刻を返す(なければ None)。"""
     threshold = max(noise_floor * 6.0, peak * 0.15)
     i0 = max(0, int(t_from / step))
@@ -136,7 +141,8 @@ def detect_onset_after(env, step, t_from, t_to, noise_floor, peak):
     return None
 
 
-def analyze(video, label, min_jump=MIN_FLASH_JUMP, flash_ratio=FLASH_THRESHOLD_RATIO):
+def analyze(video, label, min_jump=MIN_FLASH_JUMP, flash_ratio=FLASH_THRESHOLD_RATIO,
+            search_before=SEARCH_BEFORE_FLASH_SEC):
     series = frame_luma_series(video)
     flashes = detect_flashes(series, min_jump, flash_ratio)
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -148,9 +154,10 @@ def analyze(video, label, min_jump=MIN_FLASH_JUMP, flash_ratio=FLASH_THRESHOLD_R
     latencies = []
     misses = []
     for t in flashes:
-        onset = detect_onset_after(env, step, t, t + SEARCH_AFTER_FLASH_SEC,
-                                   noise_floor, peak)
-        if onset is None or onset < t:
+        onset = detect_onset_in(env, step,
+                                max(0.0, t - search_before), t + SEARCH_AFTER_FLASH_SEC,
+                                noise_floor, peak)
+        if onset is None:
             misses.append(t)
         else:
             latencies.append((t, (onset - t) * 1000.0))
@@ -167,6 +174,11 @@ def analyze(video, label, min_jump=MIN_FLASH_JUMP, flash_ratio=FLASH_THRESHOLD_R
         sd = statistics.pstdev(vals) if len(vals) > 1 else 0.0
         print(f"  中央値 {med:.1f} ms / 最小 {min(vals):.1f} / 最大 {max(vals):.1f}"
               f" / 標準偏差 {sd:.1f} (n={len(vals)})")
+        if med < 0:
+            print("  ※ 負値 = 音がフラッシュより先に出ている。白フラッシュは画面に出るまでに"
+                  "レンダリング+垂直同期+パネル応答ぶん遅れるため、この方式の基準点としては"
+                  "この実装の遅延より遅い。A/B の『差』は有効だが、絶対値は求まらない"
+                  "(必要なら §2.2 の方式B: ライン録音へ切り替える)。")
         return med
     return None
 
@@ -211,13 +223,16 @@ def main():
                     help=f"フラッシュと見なす最小輝度差(既定 {MIN_FLASH_JUMP})")
     ap.add_argument("--flash-ratio", type=float, default=FLASH_THRESHOLD_RATIO,
                     help=f"明暗の境目の位置(既定 {FLASH_THRESHOLD_RATIO})")
+    ap.add_argument("--search-before", type=float, default=SEARCH_BEFORE_FLASH_SEC,
+                    help=f"フラッシュより前を探す秒数(既定 {SEARCH_BEFORE_FLASH_SEC})")
     args = ap.parse_args()
     if args.self_test:
         self_test()
         return
     if not args.video:
         ap.error("video を指定するか --self-test を使う")
-    analyze(Path(args.video), args.label, args.min_flash_jump, args.flash_ratio)
+    analyze(Path(args.video), args.label, args.min_flash_jump, args.flash_ratio,
+            args.search_before)
 
 
 if __name__ == "__main__":
