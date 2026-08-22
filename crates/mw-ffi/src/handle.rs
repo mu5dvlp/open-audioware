@@ -96,7 +96,11 @@ pub fn init() -> InitOutcome {
         Renderer::build(Config::default(), PROVISIONAL_SAMPLE_RATE);
 
     let mut backend = CpalBackend::new();
-    if backend.open(renderer).is_err() {
+    if let Err(err) = backend.open(renderer) {
+        // 実機(特に iOS)では失敗理由が分からないと原因を特定できないため、
+        // 具体的な BackendError を必ず残す(docs/measurement-m1.md §7.6-1)。
+        // MwResult は粒度が粗い(ErrBackendOpenFailed 一種)ので、詳細はこのログが唯一の手がかりになる。
+        eprintln!("[mw-ffi] mw_init: backend open failed: {err}");
         return InitOutcome::Failed;
     }
 

@@ -124,7 +124,10 @@ namespace Measurement.EditorTools
             text.text = "Mode: - (未タップ / not tapped yet)";
             text.alignment = TextAnchor.MiddleCenter;
             text.fontSize = 40;
-            text.color = Color.black;
+            // 背景は黒(カメラのクリア色)なので黒文字だと録画で読めない。
+            // 計測後に A/B のどちらを押していたかを動画から確認できることが重要なため白にする
+            // (docs/measurement-m1.md §7.6-2)。
+            text.color = Color.white;
             text.font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
 
             return text;

@@ -36,8 +36,13 @@ impl Backend for CpalBackend {
             .default_output_device()
             .ok_or(BackendError::NoOutputDevice)?;
 
-        let supported_config =
-            find_f32_stereo_config(&device).ok_or(BackendError::NoSupportedStreamConfig)?;
+        let supported_config = match find_f32_stereo_config(&device) {
+            Some(config) => config,
+            None => {
+                log_available_configs(&device);
+                return Err(BackendError::NoSupportedStreamConfig);
+            }
+        };
         let config: StreamConfig = supported_config.into();
 
         // ランプのミリ秒→サンプル数換算(初期構築仕様 §4.1)が正しいサンプルレートを
@@ -80,6 +85,35 @@ fn find_f32_stereo_config(device: &cpal::Device) -> Option<SupportedStreamConfig
         .filter(|c| c.channels() as usize == CHANNELS && c.sample_format() == SampleFormat::F32)
         .map(|c| c.with_max_sample_rate())
         .next()
+}
+
+/// f32 ステレオ構成が見つからなかったときに、デバイスが実際に提示した構成を列挙して残す。
+///
+/// iOS では cpal が `AVAudioSession.outputNumberOfChannels()` に基づく構成しか提示せず、
+/// 出力ルート次第(Bluetooth HFP 等)では 1ch しか出てこないことがある。そうなると
+/// `find_f32_stereo_config` が必ず None を返し、アプリ起動から終了までミドルウェアが
+/// 無音になる。実機ではこのログが唯一の手がかりになる(docs/measurement-m1.md §7.6-1)。
+fn log_available_configs(device: &cpal::Device) {
+    match device.supported_output_configs() {
+        Ok(configs) => {
+            let mut found_any = false;
+            for config in configs {
+                found_any = true;
+                eprintln!(
+                    "[mw-backend] available output config: channels={} sample_format={:?} \
+                     sample_rate={}..{}",
+                    config.channels(),
+                    config.sample_format(),
+                    config.min_sample_rate(),
+                    config.max_sample_rate(),
+                );
+            }
+            if !found_any {
+                eprintln!("[mw-backend] the device reported no output configs at all");
+            }
+        }
+        Err(err) => eprintln!("[mw-backend] supported_output_configs() failed: {err}"),
+    }
 }
 
 fn build_output_stream(

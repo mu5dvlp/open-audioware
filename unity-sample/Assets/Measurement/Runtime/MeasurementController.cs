@@ -28,6 +28,14 @@ namespace Measurement
         private ulong _soundId;
         private bool _nativeReady;
 
+        /// <summary>
+        /// ネイティブ側の状態を画面へ常時表示するための文字列。
+        /// 初期化に失敗しても <see cref="Debug.LogError"/> だけでは実機・録画から気づけず、
+        /// 「B が1打も鳴っていない」ことに計測後まで気づけなかったため
+        /// (docs/measurement-m1.md §7.6-1)、画面に出して録画に残す。
+        /// </summary>
+        private string _nativeStatus = "native: (not initialized)";
+
         private void Awake()
         {
             if (buttonA != null)
@@ -67,6 +75,7 @@ namespace Measurement
             if (initResult != MwResult.Ok)
             {
                 Debug.LogError($"MeasurementController: mw_init failed ({initResult})");
+                _nativeStatus = $"native: INIT FAILED ({initResult})";
                 return;
             }
 
@@ -75,11 +84,13 @@ namespace Measurement
             if (loadResult != MwResult.Ok)
             {
                 Debug.LogError($"MeasurementController: mw_sound_load failed ({loadResult})");
+                _nativeStatus = $"native: LOAD FAILED ({loadResult})";
                 MwNative.Shutdown(_handle);
                 return;
             }
 
             _nativeReady = true;
+            _nativeStatus = "native: ready";
         }
 
         /// <summary>ボタンA: Unity 既定実装で発音し、同一フレームで白フラッシュする。</summary>
@@ -108,7 +119,14 @@ namespace Measurement
 
             if (_nativeReady)
             {
-                MwNative.PlaySe(_handle, _soundId, Bus.Se, volume: 1f, voice: out _);
+                MwResult playResult = MwNative.PlaySe(_handle, _soundId, Bus.Se, volume: 1f, voice: out _);
+                if (playResult != MwResult.Ok)
+                {
+                    // 戻り値を捨てていると「鳴らないのに理由が分からない」状態になる
+                    // (docs/measurement-m1.md §7.6-1)。
+                    Debug.LogError($"MeasurementController: mw_se_play failed ({playResult})");
+                    _nativeStatus = $"native: PLAY FAILED ({playResult})";
+                }
             }
             else
             {
@@ -122,7 +140,7 @@ namespace Measurement
         {
             if (statusText != null)
             {
-                statusText.text = text;
+                statusText.text = $"{text}    |    {_nativeStatus}";
             }
         }
     }

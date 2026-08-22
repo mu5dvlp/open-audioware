@@ -33,6 +33,8 @@ AUDIO_RATE = 48000
 RMS_WINDOW_SEC = 0.001  # 1ms 窓
 SEARCH_AFTER_FLASH_SEC = 0.4  # フラッシュ後、SE を探す最大時間
 MIN_FLASH_GAP_SEC = 0.3  # フラッシュ同士の最小間隔(チャタリング除去)
+MIN_FLASH_JUMP = 40.0  # フラッシュと見なす baseline→peak の最小輝度差(--min-flash-jump で変更可)
+FLASH_THRESHOLD_RATIO = 0.5  # baseline と peak の間のどこを「明るい」の境目にするか
 
 
 def run(cmd):
@@ -65,16 +67,23 @@ def frame_luma_series(video):
     return series
 
 
-def detect_flashes(series):
-    """輝度の立ち上がりエッジ = フラッシュ開始時刻のリストを返す。"""
+def detect_flashes(series, min_jump=MIN_FLASH_JUMP, ratio=FLASH_THRESHOLD_RATIO):
+    """輝度の立ち上がりエッジ = フラッシュ開始時刻のリストを返す。
+
+    `min_jump` は「フラッシュらしい輝度ジャンプ」と見なす baseline→peak の最小差。
+    画面がフレーム内で小さい・周囲が明るいと差が縮むため、撮影条件によっては
+    既定値では弾かれる。その場合は `--min-flash-jump` で下げる(下げすぎると
+    手ブレや被写体の動きをフラッシュと誤検出するので、検出回数がタップ回数と
+    一致するか必ず確認すること)。"""
     lumas = [y for _, y in series]
     baseline = statistics.median(lumas)
     peak = max(lumas)
-    if peak - baseline < 40:
+    if peak - baseline < min_jump:
         raise RuntimeError(
-            f"白フラッシュらしい輝度ジャンプがない(baseline={baseline:.1f}, peak={peak:.1f})。"
-            "画面がフレーム内に映っているか確認")
-    threshold = baseline + (peak - baseline) * 0.5
+            f"白フラッシュらしい輝度ジャンプがない(baseline={baseline:.1f}, peak={peak:.1f}, "
+            f"必要な差={min_jump})。画面がフレーム内に映っているか確認するか、"
+            "--min-flash-jump で閾値を下げる")
+    threshold = baseline + (peak - baseline) * ratio
     flashes = []
     prev_bright = True  # 冒頭から明るい場合はエッジ扱いしない
     for t, y in series:
@@ -127,9 +136,9 @@ def detect_onset_after(env, step, t_from, t_to, noise_floor, peak):
     return None
 
 
-def analyze(video, label):
+def analyze(video, label, min_jump=MIN_FLASH_JUMP, flash_ratio=FLASH_THRESHOLD_RATIO):
     series = frame_luma_series(video)
-    flashes = detect_flashes(series)
+    flashes = detect_flashes(series, min_jump, flash_ratio)
     with tempfile.TemporaryDirectory() as tmpdir:
         samples = extract_bandpassed_audio(video, tmpdir)
     env, step = rms_envelope(samples)
@@ -198,13 +207,17 @@ def main():
     ap.add_argument("video", nargs="?", help="計測動画(1モード1ファイル)")
     ap.add_argument("--label", default="?", help="表示ラベル(A / B など)")
     ap.add_argument("--self-test", action="store_true", help="合成動画で自己検証")
+    ap.add_argument("--min-flash-jump", type=float, default=MIN_FLASH_JUMP,
+                    help=f"フラッシュと見なす最小輝度差(既定 {MIN_FLASH_JUMP})")
+    ap.add_argument("--flash-ratio", type=float, default=FLASH_THRESHOLD_RATIO,
+                    help=f"明暗の境目の位置(既定 {FLASH_THRESHOLD_RATIO})")
     args = ap.parse_args()
     if args.self_test:
         self_test()
         return
     if not args.video:
         ap.error("video を指定するか --self-test を使う")
-    analyze(Path(args.video), args.label)
+    analyze(Path(args.video), args.label, args.min_flash_jump, args.flash_ratio)
 
 
 if __name__ == "__main__":
