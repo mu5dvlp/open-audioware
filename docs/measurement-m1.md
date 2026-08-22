@@ -144,9 +144,22 @@ python3 tools/measurement/analyze_ab_video.py <Bの動画> --label B
    - `Measurement.EditorTools.IosXcodeExporter.Build`
      (`unity-sample/Build/iOS/` に Xcode プロジェクトを書き出す。Editor メニューの
      `Measurement/Export iOS Xcode Project` からも実行可)
+**書き出し前に Xcode を終了しておくこと(重要)**
+
+Unity の iOS 書き出しは既存の `Build/iOS` を削除してから作り直す。Xcode がそのプロジェクトを
+開いたままだと削除に失敗し、`IOException: Directory not empty` で書き出しごと落ちる
+(2026-08-22 に実際に踏んだ)。しかも失敗した時点でディレクトリは半分消えているため、
+`rm -rf unity-sample/Build/iOS` してから再実行することになる。
+
+開いたまま書き出してしまい Xcode が **「Resave / Close」**を聞いてきた場合は、**必ず Close** を選ぶ。
+Resave は Xcode のメモリ上にある**古い**プロジェクトをディスクへ書き戻すため、生成し直した
+プロジェクト(新しい xcframework への参照を含む)が壊れ、古いバイナリのまま実行されてしまう。
+バイナリを差し替えたのにログや挙動が変わらない、という最悪の混乱の原因になる。
+
 4. `unity-sample/Build/iOS/Unity-iPhone.xcodeproj` を Xcode で開き、Signing & Capabilities で
    自分の Team を選び、実機を接続して Run する(自動署名は有効化済み。端末接続・Team 選択は
-   ユーザー作業、初期構築仕様 §11)
+   ユーザー作業、初期構築仕様 §11)。**Team の選択は書き出しのたびに必要**
+   —— プロジェクトごと再生成されるため `DEVELOPMENT_TEAM` は空に戻る
 5. AVAudioSession の設定は **2026-08-22 に実装済み**(`crates/mw-backend/src/ios_session.rs`。
    カテゴリ Playback / 希望サンプルレート 48kHz / 希望 I/O バッファ長 5ms)。
    第1回計測(§7)は**未設定のまま**行ったものなので、比較する際は必ず区別すること。
