@@ -22,6 +22,13 @@
   (`stream.play()`)前に `Renderer::set_sample_rate` で確定させる(バス/ボイスのランプの
   ミリ秒→サンプル数換算に必要。初期構築仕様 §4.1)。
 
+- `ios_session::configure` — iOS / tvOS で AVAudioSession(カテゴリ・希望サンプルレート・
+  希望 I/O バッファ長)を設定し、採用された実値をログへ出す。`CpalBackend::open` の冒頭、
+  **cpal に触る前に**呼ぶ(iOS の cpal はデバイス列挙をセッションの現在状態から作るため)。
+  iOS / tvOS 以外では何もしない。初期構築仕様 §14 のリスク表は Obj-C シムを想定していたが、
+  cpal 0.18 が `objc2-avf-audio` を持ち込むため Rust から直接設定している(詳細は同ファイルの
+  モジュールコメント)。設定値はすべて【仮】で、変更が要るのはこのファイル1枚。
+
 ## 設計意図
 
 - 初期構築仕様 M6(【仮】): 立ち上げは cpal で macOS Editor / iOS / Android を1系統に揃える。

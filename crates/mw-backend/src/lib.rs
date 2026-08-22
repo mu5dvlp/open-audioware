@@ -6,6 +6,7 @@
 
 pub mod backend;
 pub mod cpal_backend;
+pub mod ios_session;
 
 pub use backend::{Backend, BackendError};
 pub use cpal_backend::CpalBackend;

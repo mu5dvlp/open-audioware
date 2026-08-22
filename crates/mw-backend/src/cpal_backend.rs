@@ -31,6 +31,11 @@ impl Backend for CpalBackend {
             return Err(BackendError::AlreadyOpen);
         }
 
+        // iOS では cpal のデバイス列挙(チャンネル数・サンプルレート)が AVAudioSession の
+        // 現在の状態から作られるため、cpal に触る前に設定しておく必要がある。
+        // iOS / tvOS 以外では何もしない。
+        crate::ios_session::configure();
+
         let host = cpal::default_host();
         let device = host
             .default_output_device()

@@ -28,7 +28,8 @@ XCFRAMEWORK           := $(PLUGINS_IOS_DIR)/MwFfi.xcframework
 
 .PHONY: help setup lint format test bench bindgen \
         build-macos build-ios build-android \
-        package unity-sample-create unity-test clean
+        package unity-sample-create unity-test \
+        measurement-scene measurement-export-ios clean
 
 help:
 	@echo "audio-middleware-sample — make ターゲット"
@@ -44,6 +45,8 @@ help:
 	@echo "  make package        - UPM パッケージ組み立て(スタブ)"
 	@echo "  make unity-sample-create - unity-sample/ プロジェクトを作成(初回のみ。要 Unity ロック)"
 	@echo "  make unity-test     - unity-sample の EditMode テストを実行(要 Unity ロック)"
+	@echo "  make measurement-scene     - A/B 計測シーンを生成/更新(要 Unity ロック)"
+	@echo "  make measurement-export-ios - A/B 計測アプリの Xcode プロジェクトを書き出す(要 Unity ロック)"
 	@echo "  make clean          - target/ 以下のビルド成果物を削除"
 
 # --- setup --------------------------------------------------------------
@@ -174,6 +177,24 @@ unity-test:
 		-testResults "$(CURDIR)/$(UNITY_SAMPLE_DIR)/EditModeTestResults.xml" \
 		-logFile -
 	@echo "results: $(UNITY_SAMPLE_DIR)/EditModeTestResults.xml"
+
+# --- M1 A/B 計測(docs/measurement-m1.md)------------------------------------
+# 手順書 §4.1 が -executeMethod の手打ちを求めていたのをターゲット化したもの。
+# どちらも Unity を起動するため必ずロック経由で実行する。
+
+measurement-scene:
+	$(UNITY_LOCK_RUNNER) "$(UNITY_APP)" -batchmode -nographics \
+		-projectPath "$(CURDIR)/$(UNITY_SAMPLE_DIR)" \
+		-executeMethod Measurement.EditorTools.MeasurementSceneBuilder.Build \
+		-quit -logFile -
+
+# 事前に make build-ios(xcframework)と make bindgen を済ませておくこと。
+measurement-export-ios:
+	$(UNITY_LOCK_RUNNER) "$(UNITY_APP)" -batchmode -nographics \
+		-projectPath "$(CURDIR)/$(UNITY_SAMPLE_DIR)" \
+		-executeMethod Measurement.EditorTools.IosXcodeExporter.Build \
+		-quit -logFile -
+	@echo "書き出し先: $(UNITY_SAMPLE_DIR)/Build/iOS/Unity-iPhone.xcodeproj"
 
 # --- 掃除 ------------------------------------------------------------------
 

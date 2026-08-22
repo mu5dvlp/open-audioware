@@ -13,4 +13,12 @@ crate-type = ["rlib"]
 mw-core = { path = "../mw-core" }
 cpal = "0.18"
 
+# AVAudioSession(カテゴリ・I/O バッファ長)を Rust から設定するために使う。
+# cpal 0.18 が iOS 実装で既に依存しているクレートなので、依存ツリーは増えない。
+# 詳細は crates/mw-backend/src/ios_session.rs を参照。
+[target.'cfg(any(target_os = "ios", target_os = "tvos"))'.dependencies.objc2-avf-audio]
+version = "0.3"
+features = ["std", "AVAudioSession", "AVAudioSessionTypes"]
+default-features = false
+
 [dev-dependencies]

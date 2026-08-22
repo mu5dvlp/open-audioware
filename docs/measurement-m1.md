@@ -147,9 +147,12 @@ python3 tools/measurement/analyze_ab_video.py <Bの動画> --label B
 4. `unity-sample/Build/iOS/Unity-iPhone.xcodeproj` を Xcode で開き、Signing & Capabilities で
    自分の Team を選び、実機を接続して Run する(自動署名は有効化済み。端末接続・Team 選択は
    ユーザー作業、初期構築仕様 §11)
-5. AVAudioSession のカテゴリ・バッファ長設定は未実装(初期構築仕様 §14 リスク表、M3 で
-   Obj-C シムを実装予定)。**M1 時点では OS 既定のセッション設定のまま計測する**
-   (これ自体が M1 実測値に影響する可能性があり、計測結果と合わせて記録すること)
+5. AVAudioSession の設定は **2026-08-22 に実装済み**(`crates/mw-backend/src/ios_session.rs`。
+   カテゴリ Playback / 希望サンプルレート 48kHz / 希望 I/O バッファ長 5ms)。
+   第1回計測(§7)は**未設定のまま**行ったものなので、比較する際は必ず区別すること。
+   起動時に `[mw-backend] AVAudioSession configured: ...` が OS の採用値
+   (実サンプルレート・実 I/O バッファ長・出力レイテンシ・出力チャンネル数)を出すので、
+   **計測のたびにこの1行を記録へ転記する**
 
 **TODO(【未定】)**:
 - 実機ビルド・インストールの自動化(fastlane 等)は未整備。手動 Xcode 操作が前提
@@ -228,7 +231,8 @@ python3 tools/measurement/analyze_ab_video.py <Bの動画> --label B
 
 - [x] 実機への接続・Team 選択・インストール(2026-08-22 実施。実機は iPad だった。§7.1)
 - [x] 外部録音(方式A: スロー動画)で A/B 計測を実施し記録する(§7)
-- [ ] **目標値未達の見込みのため §5 の切り分けを行う。第一候補は AVAudioSession 未設定(§7.5)**
+- [x] AVAudioSession の設定を実装する(2026-08-22。§7.5)
+- [ ] **第2回計測を実施し、AVAudioSession 設定後に ≤20ms へ届くか確認する(§7.5)**
 - [ ] B が起動から終了まで無音になるセッションがあった件の原因究明(§7.6-1)
 - [ ] `handle.rs` が BackendError を握り潰している問題の修正(§7.6-1)
 - [ ] `StatusText` を白文字にする(§7.6-2)
@@ -325,10 +329,25 @@ B が 25ms で鳴っている以上、経路に BT(A2DP なら 100〜200ms)は�
 (iOS 既定の I/O バッファは通常 ~23ms)。§5 の分岐でいえば「3. AVAudioSession のカテゴリ・
 バッファ長が未設定であることの影響切り分け」に該当する。
 
-→ **M3 で予定している Obj-C シムを前倒しで実装し、`preferredIOBufferDuration` を 5ms 程度に
-設定して再計測する。** cpal 側は `BufferSize::Fixed` を渡したときだけ
-`set_audio_session_buffer_size` を呼ぶ実装になっており(cpal 0.18 の iOS 実装)、現状は
-`BufferSize::Default` のため**バッファ長の要求を一切していない**。ここも併せて見直す。
+→ **対応済み(2026-08-22)**: `crates/mw-backend/src/ios_session.rs` を追加し、
+`CpalBackend::open` の冒頭でカテゴリ(Playback)・希望サンプルレート(48kHz)・
+希望 I/O バッファ長(5ms)を設定して `setActive(true)` するようにした。Obj-C シムではなく
+Rust + `objc2-avf-audio`(cpal 0.18 が既に依存)で実装している。
+
+副次的な効果として、カテゴリを Playback にすると Bluetooth のルートが HFP(モノラル)ではなく
+A2DP(ステレオ)側になるため、§7.6-1 の「B が起動から終了まで無音」も解消する可能性がある。
+
+**第2回計測(未実施)で確認すること**:
+
+1. 起動ログの `[mw-backend] AVAudioSession configured: ...` で、OS が実際に採用した
+   I/O バッファ長・サンプルレート・出力レイテンシ・出力チャンネル数を記録する
+2. B の遅延が §1 の目標(≤20ms)に入るか(系統誤差 0〜16.7ms を織り込んで判断)
+3. Bluetooth をオンにした状態でも B が鳴るか(§7.6-1 の再現確認)
+
+なお cpal 側は `BufferSize::Fixed` を渡したときだけ `set_audio_session_buffer_size` を呼ぶ
+実装で(cpal 0.18 の iOS 実装)、現状は `BufferSize::Default` のままである。
+`ios_session` 側でセッションに直接要求しているため二重には設定していないが、
+上記1の実測値が希望どおりにならない場合はここも見直す。
 
 ### 7.6 計測中に判明した不具合・注意点
 
