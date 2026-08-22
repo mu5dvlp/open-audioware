@@ -254,6 +254,9 @@ pub unsafe extern "C" fn mw_se_play(
 
         let result = handle_registry::with_instance(handle, |instance| {
             instance.drain_reclaimed();
+            // I/O バッファ長の実測値を1回だけ残す(docs/measurement-m1.md §8.7)。
+            // 初回の発音時点ならコールバックは既に走っている。
+            instance.log_buffer_info_once();
             let sound = {
                 let sounds = instance
                     .sounds

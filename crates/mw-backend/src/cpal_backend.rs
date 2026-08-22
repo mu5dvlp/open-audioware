@@ -4,6 +4,9 @@
 //! 計測後、必要なら Android を oboe 直叩き、iOS を RemoteIO 直叩きに置換する可能性がある
 //! (その際もこの `Backend` trait 経由で差し替えられるようにしてある)。
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig, SupportedStreamConfig};
 use mw_core::{CHANNELS, Renderer};
@@ -17,11 +20,20 @@ use crate::backend::{Backend, BackendError};
 #[derive(Default)]
 pub struct CpalBackend {
     stream: Option<cpal::Stream>,
+    /// 音声スレッドが書き、ゲームスレッドが読む「直近のコールバックのフレーム数」。
+    /// 詳細は [`Backend::last_callback_frames`]。
+    callback_frames: Arc<AtomicU32>,
+    /// オープン時にネゴシエートしたサンプルレート(未オープンなら 0)。
+    sample_rate: u32,
 }
 
 impl CpalBackend {
     pub fn new() -> Self {
-        Self { stream: None }
+        Self {
+            stream: None,
+            callback_frames: Arc::new(AtomicU32::new(0)),
+            sample_rate: 0,
+        }
     }
 }
 
@@ -54,11 +66,17 @@ impl Backend for CpalBackend {
         // 使えるよう、コールバックが動き出す(`stream.play()`)前に確定させる。
         renderer.set_sample_rate(config.sample_rate);
 
-        let stream = build_output_stream(&device, &config, renderer)?;
+        let stream = build_output_stream(
+            &device,
+            &config,
+            renderer,
+            Arc::clone(&self.callback_frames),
+        )?;
         stream
             .play()
             .map_err(|e| BackendError::PlayStreamFailed(e.to_string()))?;
 
+        self.sample_rate = config.sample_rate;
         self.stream = Some(stream);
         Ok(())
     }
@@ -69,6 +87,8 @@ impl Backend for CpalBackend {
                 // `pause` はベストエフォート。stream の drop で確実にコールバックは止まる。
                 let _ = stream.pause();
                 drop(stream);
+                self.sample_rate = 0;
+                self.callback_frames.store(0, Ordering::Relaxed);
                 Ok(())
             }
             None => Err(BackendError::NotOpen),
@@ -77,6 +97,14 @@ impl Backend for CpalBackend {
 
     fn is_open(&self) -> bool {
         self.stream.is_some()
+    }
+
+    fn last_callback_frames(&self) -> u32 {
+        self.callback_frames.load(Ordering::Relaxed)
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
     }
 }
 
@@ -125,6 +153,7 @@ fn build_output_stream(
     device: &cpal::Device,
     config: &StreamConfig,
     mut renderer: Renderer,
+    callback_frames: Arc<AtomicU32>,
 ) -> Result<cpal::Stream, BackendError> {
     let err_fn = |err: cpal::Error| {
         // 音声スレッドではなく cpal のエラー通知経路から呼ばれる(§5.3 の対象外)。
@@ -138,6 +167,9 @@ fn build_output_stream(
             // `StreamConfig` は `Copy`。呼び出し元との共有を避けるため値で渡す。
             *config,
             move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+                // I/O バッファ長の実測用。アトミックストア1回だけで、アロケーション・
+                // ロック・IO をしないためリアルタイム安全性規約(§5.3)に抵触しない。
+                callback_frames.store((data.len() / CHANNELS) as u32, Ordering::Relaxed);
                 // ここが音声スレッド上のオーディオコールバック本体。`renderer` はこの
                 // クロージャへムーブ済みで、以後は音声スレッドの単一の書き手が
                 // `&mut` で触るだけ(ロックも `Arc` 共有も無い。§5.3)。

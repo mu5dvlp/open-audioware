@@ -13,6 +13,11 @@
   `crates/mw-core/src/renderer.rs` のドキュメント参照。ゲームスレッドは
   `mw_core::CommandSender` / `mw_core::ReclaimReceiver` という別ハンドル経由でのみ
   音声スレッドとやり取りする)。
+- `backend::last_callback_frames` / `backend::sample_rate` — オーディオコールバックが実際に
+  受け取ったフレーム数と、ネゴシエートされたサンプルレート。**I/O バッファ長の実測値**で、
+  iOS の `AVAudioSession` の申告値を裏取りするために使う(`docs/measurement-m1.md` §8.7)。
+  音声スレッドはアトミックストア1回だけ行い、読むのはゲームスレッド
+  (リアルタイム安全性規約に抵触しない)。初期構築仕様 M3「出力レイテンシ問い合わせ」の第一歩。
 - `backend::BackendError` — デバイス無し・対応構成無し・ストリーム構築/開始失敗・
   二重 open・未 open close、の6種。
 - `cpal_backend::CpalBackend` — 既定の出力デバイスに **f32 ステレオ**のストリームを開く。

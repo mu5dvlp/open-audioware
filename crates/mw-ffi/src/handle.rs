@@ -11,7 +11,7 @@
 //! M1 で `Instance` にゲームスレッド側ハンドル(`CommandSender` / `ReclaimReceiver`)と
 //! サウンドストレージ・ボイスシリアル採番器を追加した(§5.2「コマンド/イベントキュー」)。
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use mw_backend::{Backend, CpalBackend};
@@ -29,6 +29,8 @@ pub struct Instance {
     pub reclaim_receiver: Mutex<ReclaimReceiver>,
     pub sounds: Mutex<SoundStorage>,
     next_voice_serial: AtomicU64,
+    /// I/O バッファ長の実測ログを既に出したか(1インスタンスにつき1回だけ出す)。
+    logged_buffer_info: AtomicBool,
 }
 
 impl Instance {
@@ -37,6 +39,31 @@ impl Instance {
         self.next_voice_serial
             .fetch_add(1, Ordering::Relaxed)
             .max(1)
+    }
+
+    /// オーディオコールバックが実際に受け取ったバッファ長を、1インスタンスにつき1回だけ
+    /// ログへ出す(`docs/measurement-m1.md` §8.7 の裏取り)。
+    ///
+    /// iOS の `AVAudioSession` は希望した I/O バッファ長をそのまま採用したかのように申告する
+    /// ことがあり、申告値だけでは遅延の見積もりを信用できない。ここで出すのは音声スレッドが
+    /// 実際に受け取ったフレーム数なので、突き合わせれば申告値の真偽が分かる。
+    ///
+    /// ゲームスレッドから呼ぶこと(`eprintln!` はリアルタイム安全ではない)。
+    /// コールバックがまだ1度も走っていなければ何もせず、次の機会に持ち越す。
+    pub fn log_buffer_info_once(&self) {
+        if self.logged_buffer_info.load(Ordering::Relaxed) {
+            return;
+        }
+        let frames = self.backend.last_callback_frames();
+        let sample_rate = self.backend.sample_rate();
+        if frames == 0 || sample_rate == 0 {
+            return;
+        }
+        self.logged_buffer_info.store(true, Ordering::Relaxed);
+        let ms = frames as f64 * 1000.0 / sample_rate as f64;
+        eprintln!(
+            "[mw-ffi] audio callback buffer (measured): {frames} frames @ {sample_rate} Hz = {ms:.3} ms"
+        );
     }
 
     /// 音声スレッドが手放した `Arc<SoundData>` をゲームスレッド上で回収する。
@@ -112,6 +139,7 @@ pub fn init() -> InitOutcome {
         reclaim_receiver: Mutex::new(reclaim_receiver),
         sounds: Mutex::new(SoundStorage::new()),
         next_voice_serial: AtomicU64::new(1),
+        logged_buffer_info: AtomicBool::new(false),
     });
     InitOutcome::Opened(handle)
 }
