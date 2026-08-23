@@ -48,7 +48,7 @@ impl Instance {
     /// ことがあり、申告値だけでは遅延の見積もりを信用できない。ここで出すのは音声スレッドが
     /// 実際に受け取ったフレーム数なので、突き合わせれば申告値の真偽が分かる。
     ///
-    /// ゲームスレッドから呼ぶこと(`eprintln!` はリアルタイム安全ではない)。
+    /// ゲームスレッドから呼ぶこと(`mw_backend::mw_log!` はリアルタイム安全ではない)。
     /// コールバックがまだ1度も走っていなければ何もせず、次の機会に持ち越す。
     pub fn log_buffer_info_once(&self) {
         if self.logged_buffer_info.load(Ordering::Relaxed) {
@@ -61,7 +61,7 @@ impl Instance {
         }
         self.logged_buffer_info.store(true, Ordering::Relaxed);
         let ms = frames as f64 * 1000.0 / sample_rate as f64;
-        eprintln!(
+        mw_backend::mw_log!(
             "[mw-ffi] audio callback buffer (measured): {frames} frames @ {sample_rate} Hz = {ms:.3} ms"
         );
     }
@@ -127,7 +127,7 @@ pub fn init() -> InitOutcome {
         // 実機(特に iOS)では失敗理由が分からないと原因を特定できないため、
         // 具体的な BackendError を必ず残す(docs/measurement-m1.md §7.6-1)。
         // MwResult は粒度が粗い(ErrBackendOpenFailed 一種)ので、詳細はこのログが唯一の手がかりになる。
-        eprintln!("[mw-ffi] mw_init: backend open failed: {err}");
+        mw_backend::mw_log!("[mw-ffi] mw_init: backend open failed: {err}");
         return InitOutcome::Failed;
     }
 

@@ -96,6 +96,12 @@ allow = [
     "Unicode-3.0",
     "Unlicense",
     "Zlib",
+    # MPL-2.0 はファイル単位のコピーレフト。MPL のファイルを**改変**したときにその
+    # ファイルだけ公開義務が生じるもので、リンクして使う限り利用側のコードには伝播しない
+    # (ゲーム本体のソース公開義務は生じない)。2026-08-23 にユーザー判断で許可した。
+    # 現在の該当クレート: audio_thread_priority(cpal の realtime フィーチャ経由。Android で
+    # AAudio の performance mode を LowLatency にするために必要。docs/measurement-m1.md §9)。
+    "MPL-2.0",
 ]
 # The confidence threshold for detecting a license from license text.
 # The higher the value, the more closely the license text must be to the

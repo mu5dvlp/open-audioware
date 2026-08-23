@@ -10,7 +10,7 @@
 |---|---|
 | Unity 既定実装との A/B で有意に改善 | ✅ 差 **137.8 ms**(ジッタも 11.8 → 2.5 ms) |
 | iOS ≤ 20ms | ✅ **10.0〜15.0 ms**(平均 12.5 ms) |
-| Android ≤ 40ms | ⬜ 未着手(§4.2) |
+| Android ≤ 40ms | 🟡 **見込みあり**(2.0〜4.0ms + HW 出力レイテンシ。§9)。動画による A/B 比較は未実施 |
 
 計測実施済み: 第1回(AVAudioSession 未設定)→ §7 / 第2回(設定あり)→ §8 / 絶対値の確定 → §8.7。
 §1〜§6 は手順・目標値・準備状況を定義する部分で、計測のたびに再利用する。
@@ -245,9 +245,9 @@ unzip -l unity-sample/Build/Android/measurement.apk | grep libmw_ffi
 
 いずれの場合も、**先に進まず原因を潰すか計画を見直す**(初期構築仕様 §10)。
 
-## 6. 準備状況とTODO(2026-08-15 更新)
+## 6. 準備状況とTODO(2026-08-23 更新)
 
-### 準備済み(実装・ローカル確認済み)
+### 6.1 準備済み(実装・ローカル確認済み)
 
 - [x] **計測用シーン**: `unity-sample/Assets/Measurement/MeasurementScene.unity`
       (`Measurement.EditorTools.MeasurementSceneBuilder` がコードから組み立てて保存する。
@@ -262,47 +262,155 @@ unzip -l unity-sample/Build/Android/measurement.apk | grep libmw_ffi
       自作波形をコードで合成する(バイナリ資産はコミットしない)。A・B 両実装に
       **完全に同一のサンプル列**を渡す(A は `AudioClip.Create`、B は同じ配列から
       組み立てた 48kHz/16bit モノラル wav バイト列を `LoadSound` に渡す)
-- [x] iOS ビルドパイプライン: `make build-ios` → `MwFfi.xcframework`、`make bindgen` →
+- [x] **iOS ビルドパイプライン**: `make build-ios` → `MwFfi.xcframework`、`make bindgen` →
       C# バインディング、Unity バッチモードでの Xcode プロジェクト書き出しまで実行済み
       (詳細・生成物パスは §4.1)。**自動署名を有効化した状態で書き出し済み**のため、
       ユーザーは Xcode を開いて Team を選び実機で Run するだけでよい
+- [x] **Android ビルドパイプライン**(2026-08-23 通し確認): `make build-android` →
+      `make bindgen` → `make measurement-build-android` → `adb install -r` まで一気通貫。
+      apk 内に `lib/arm64-v8a/libmw_ffi.so` が入ることも確認済み(§4.2 の確認コマンド)
+- [x] **Android で診断ログが logcat に出る**(2026-08-23。`crates/mw-backend/src/platform_log.rs`)。
+      Android はプロセスの stderr がどこにも出ないため、それまで `eprintln!` で書いた診断は
+      実機で1行も読めなかった(`log.redirect-stdio` は user ビルドの SELinux ポリシーで
+      設定できない)。§8.6-1「起動ログから絶対値を見積もる」を Android でも使えるようにするための前提
+- [x] **ストリームを開いた構成をログに残す**(2026-08-23。
+      `[mw-backend] output stream opened: sample_rate=... channels=... buffer_size=...`)。
+      iOS には `AVAudioSession configured: ...` があったが Android には対応する行が無かった
 - [x] macOS Editor 上での動作確認: `make unity-test`(EditMode)で
       `ClickSeGeneratorEditModeTests`(波形の健全性・`AudioClip` 生成・
       `MwNative.LoadSound`/`PlaySe` が実際に成功すること)を含む9件すべて green。
-      `cargo test --workspace`(69件)・`make lint` も green
+      `cargo test --workspace`・`make lint` も green
 
-### 未解決(ユーザー協働が必要 / 未着手)
+### 6.2 直近ターゲット —— Android の計測(目標 ≤40ms)
 
-- [x] 実機への接続・Team 選択・インストール(2026-08-22 実施。実機は iPad だった。§7.1)
-- [x] 外部録音(方式A: スロー動画)で A/B 計測を実施し記録する(§7)
-- [x] AVAudioSession の設定を実装する(2026-08-22。§7.5)
-- [x] 第2回計測を実施する(§8)
-- [ ] **絶対値の計測手段を用意する。白フラッシュ基準では原理的に測れないことが確定した(§8.3)**
-- [x] 起動ログ `[mw-backend] AVAudioSession configured: ...` を記録する(§8.1)
-- [x] 見積もり(§8.7)を裏取りする手段を実装する(2026-08-22。初回発音時に
-      `[mw-ffi] audio callback buffer (measured): N frames @ R Hz = M ms` を1回だけ出す)
-- [x] 実機でその1行を取得し、§8.7 の申告値と突き合わせる(2026-08-22。240 frames = 5.000ms で一致)
-- [ ] Android 側の計測(§4.2。目標 ≤40ms)。iOS 側は §1 の成功基準を満たしたが Android は未着手
-- [ ] Bluetooth オン時に B が鳴るかの再現確認(§7.6-1。第2回は Bluetooth オフで実施)
-- [ ] B が起動から終了まで無音になるセッションがあった件の原因究明(§7.6-1)
-- [ ] `handle.rs` が BackendError を握り潰している問題の修正(§7.6-1)
-- [ ] `StatusText` を白文字にする(§7.6-2)
-- [ ] 初期構築仕様の未決事項「プロファイル基準端末」を確定し、以後の計測はその端末を基準にする
-- [ ] (iOS)AVAudioSession シム実装(M3 前倒し検討)
-- [ ] Android 側(`make build-android` の再実行・Unity での Android ビルド書き出し・
-      AAudio performance mode の明示設定の要否調査)は本ラウンドでは未着手。§4.2 参照
+iOS は §1 の成功基準を満たした(§8.5)。残るゲートは Android だけ。
 
-### 計測当日にユーザーがやることの最短手順(iOS)
+| # | やること | 担当 | 状態 |
+|---|---|---|---|
+| 1 | `.so` → apk → 実機インストール | エージェント | [x] 2026-08-23(初期化不具合を1件発見・修正) |
+| 2 | 起動ログ(`output stream opened` / `audio callback buffer (measured)`)を実機で取得 | エージェント(`adb logcat`) | [ ] |
+| 3 | §8.7 と同じモデルで絶対値を見積もる | エージェント | [ ] |
+| 4 | A/B 動画(240fps・各10タップ)を撮る | **ユーザー** | [ ] |
+| 5 | `analyze_ab_video.py` で解析し §3.3 の形式で記録 | エージェント | [ ] |
+| 6 | ≤40ms を満たすか判定 → §5 の分岐(満たさなければ M6: oboe 直叩き検討) | 双方 | [ ] |
+
+**iOS より有利な点**: Android は `adb logcat` でログを直接吸えるので、2〜3(絶対値の見積もり)は
+ユーザーの手を借りずに完結する。**動画が要るのは A/B の相対比較(4〜5)だけ**。
+
+#### 2026-08-23: 最初のログ取得で判明した不具合(修正済み)
+
+ログを logcat へ出せるようにした直後、実機(SH-M16 / Android 11)の1本目のログで
+**ミドルウェアが Android で初期化に失敗していた**ことが分かった。B は一度も鳴らない状態。
+
+```
+[mw-backend] output stream opened: sample_rate=5512 Hz, channels=2, buffer_size=Default
+[mw-ffi] mw_init: backend open failed: failed to build stream: InvalidRate
+```
+
+原因は `find_f32_stereo_config` が「f32 ステレオ構成の**列挙の先頭**を取り、その最大レートを使う」
+実装だったこと。cpal 0.18 の Android(AAudio)実装は 5512Hz のような低いレートから列挙するため、
+5512Hz でストリームを開こうとして AAudio が `InvalidRate` を返していた。
+
+修正: **デバイス既定の構成(`default_output_config`)を最優先**し、それが f32 ステレオでない
+場合のみ列挙へフォールバックする(既定レートを含む範囲 → 最大レートが最も高い範囲、の順)。
+併せて `log_available_configs` を `open` から**毎回**呼ぶようにして、次に同種の問題が起きたときに
+「何が提示され、何を選んだか」がログだけで追えるようにした。
+
+**教訓**: この不具合は §7.6-1 の「B が起動から終了まで無音」と**同じ症状で原因が別**。
+Android は stderr がどこにも出ないため、ログ経路を用意するまで存在すら分からなかった。
+実機で動かす前に「失敗したときに何が読めるか」を先に作ること。
+
+#### 2026-08-23(続き): `ndk_context` 未初期化による panic(暫定対処済み)
+
+上の修正で 48kHz を選べるようになった直後、今度は `mw_init` が `ErrPanic` を返した。
+`catch_unwind` が panic を畳んで中身が消えるため、**panic の内容も logcat へ流すフック**を
+入れて再取得した(`crates/mw-ffi/src/ffi.rs` の `install_panic_hook`。既定のフックは
+置き換えず後ろで呼ぶのでデスクトップの挙動は不変)。結果:
+
+```
+[mw-ffi] panic: panicked at ndk-context-0.1.1/src/lib.rs:72:30:
+android context was not initialized
+```
+
+cpal 0.18 の AAudio 実装は `default_output_config` などから **Java 側の `AudioManager`** を
+参照するため、`ndk_context`(JavaVM + Android Context)が初期化済みであることを前提にしている。
+`ndk-glue` や `android-activity` を使うアプリでは自動的に初期化されるが、**Unity のような
+ホストアプリのプロセスでは誰も初期化しない**。
+
+暫定対処: `default_output_config()` の呼び出しを `catch_unwind` で畳み、Android では
+列挙からの選択(48kHz → 44.1kHz → 最大レートの順)へフォールバックする。
+
+**恒久対処は未実施(§6.5)**。`JNI_OnLoad` で JavaVM を受け取り、`ActivityThread` 経由で
+Application Context を取って `ndk_context::initialize_android_context` を呼べば、cpal が
+Java 側のネイティブレート・**frames per burst**(低レイテンシ経路のバッファ長)まで参照できる。
+**計測値が目標に届かない場合、ここが最初に疑う場所になる。**
+
+**iOS に無かった注意点**(§4.2 再掲): 充電しながら、省電力モードをオフにして測る。
+記録には端末名・Android バージョン・充電状態・省電力モードの有無を書く。
+
+参考(2026-08-23 に `dumpsys media.audio_flinger` で確認した基準端末候補の値):
+SH-M16 / Android 11 は稼働中の出力スレッドが **HAL frame count 192 @ 48kHz = 4.0ms**、
+Normal frame count 960(20ms)。AAudio が低レイテンシ経路を掴めれば目標には余裕がある見込み。
+
+### 6.3 既知の不具合(未修正)
+
+- [ ] **`handle.rs` が `BackendError` を握り潰している**(§7.6-1)。
+      `if backend.open(renderer).is_err()` で具体的なエラーが消え、実機で原因が特定できない。
+      ログ出力自体は 6.1 で Android にも届くようになったので、次はここを直す番
+- [ ] **B が起動から終了まで無音になるセッションがあった件の原因究明**(§7.6-1)。
+      Bluetooth オン時に `find_f32_stereo_config` が 2ch f32 を1つも見つけられず
+      `mw_init` が失敗する、という**未確認の仮説**。Bluetooth オン/オフでの再現確認が必要
+- [ ] **`StatusText` が黒文字で背景も黒**(§7.6-2)。録画から A/B を判別できない。白文字にする
+
+### 6.4 手法の限界(絶対値をどう測るか)
+
+白フラッシュ基準では**原理的に絶対値が測れない**ことが確定している(§8.3。音がフラッシュより
+早く出るため差が負になる)。現状は §8.6-1(起動ログからの解析的な見積もり)で代用している。
+
+- [x] 起動ログからの見積もり手段を実装(iOS: §8.7 で実施済み / Android: 6.1 で前提を整備)
+- [ ] **断定が必要になったら §8.6-2(方式B: ライン録音)で直接測る**。
+      トリガーを画面ではなく電気信号にすれば表示遅延が消える
+- [ ] (代替)表示遅延を一度だけ較正して以後それを引く(§8.6-3)。端末・OS・フレームレートが
+      変われば較正し直しになるため常用には向かない
+
+### 6.5 M1 の外へ送るもの
+
+- [ ] 初期構築仕様の未決事項「**プロファイル基準端末**」を確定し、以後の計測はその端末を基準にする
+- [ ] (iOS)AVAudioSession シム実装(M3 前倒しを検討。§8.4 でシムが Unity 側にも効くことが判明)
+- [ ] **クライアントテンプレートへの示唆**(§8.4): ミドルウェアを採用しなくても出力バッファを
+      詰めるだけで Unity の遅延はかなり縮む(`ProjectSettings/AudioManager.asset` の
+      `m_DSPBufferSize`)。採用判断は**チューニング後の Unity** と比べて行うこと
+- [x] **`ndk_context` の初期化**(2026-08-23 実施。`crates/mw-backend/src/android_context.rs`)。
+      `JNI_OnLoad` で JavaVM を控え、バックエンドを開く直前に `ActivityThread
+      .currentActivityThread().getApplication()` で Application Context を取って登録する。
+      ホスト側(Unity の C#)に協力を求めない形にしてある(`.so` を置くだけで動く)
+- [x] **AAudio の performance mode**(2026-08-23 実施)。cpal では `realtime` フィーチャが
+      `AudioPerformanceMode::LowLatency` を設定する唯一のスイッチで、既定では設定されない。
+      Android ターゲットで有効化した(音声コールバックスレッドの優先度も上がる)
+- [ ] AAudio の **exclusive モード**の要否。上記でも目標に届かない場合の次の手
+
+### 6.6 計測当日にユーザーがやることの最短手順
+
+**Android**(現在のターゲット)
+
+1. 端末を USB で繋ぎ、USB デバッグを許可する(`adb devices` に1行出ることを確認)
+2. **充電したまま・省電力モードをオフ**にする
+3. エージェントが apk をインストールして起動ログを取る(ここまで自動)
+4. 別端末のスロー動画(240fps 推奨)で画面を撮りながら
+   A ボタン(青・左半分)を10回ゆっくりタップ → 録画停止(A の動画1本)
+5. 同様に B ボタン(赤・右半分)を10回タップして録画(B の動画1本)
+6. 動画2本を**オリジナルのまま**(スロー編集を焼き込まない)Mac へ渡す
+
+**iOS**(実施済み。再計測するとき用)
 
 1. `unity-sample/Build/iOS/Unity-iPhone.xcodeproj` を Xcode で開く
 2. Signing & Capabilities で自分の Apple Developer Team を選ぶ(自動署名は有効化済み)
 3. iPhone を接続し、ビルドターゲットとして選択して Run(Development ビルド)
-4. アプリ起動後、別端末のスロー動画(240fps 推奨)で画面を撮りながら
-   A ボタン(青・左半分)を10回ゆっくりタップ → 録画停止(A の動画1本)
-5. 同様に B ボタン(赤・右半分)を10回タップして録画(B の動画1本)
+4. 上の Android 手順 4〜6 と同じ(A/B 各10タップ・240fps・オリジナルのまま共有)
    (画面上部の `StatusText` で直前にどちらを押したか常時確認できる)
-6. 動画2本を**オリジナルのまま** AirDrop で Mac へ送り、
-   `tools/measurement/analyze_ab_video.py`(§3.4)で解析 → §3.3 のフォーマットで記録する
+
+どちらの OS でも、解析は `tools/measurement/analyze_ab_video.py`(§3.4)で行い、
+§3.3 のフォーマットで記録する。
 
 ---
 
@@ -599,3 +707,84 @@ Unity の既定構成として説明がつく。
 **結論: 音の遅延 10.0〜15.0ms(平均 12.5ms)。初期構築仕様 §1 の iOS ≤ 20ms を達成。**
 - したがって「達成」と断定はせず、**達成の見込み**と記録する。断定が必要なら
   §8.6-2(方式B: ライン録音)で直接測ること
+
+---
+
+## 9. 実測結果(Android 第1回: 2026-08-23 / 起動ログからの見積もり)
+
+動画による A/B 比較(§6.2 の 4〜5)は未実施。ここに記録するのは §8.6-1 の
+「起動ログから絶対値を見積もる」ぶんだけ。
+
+### 9.1 計測条件
+
+| 項目 | 値 |
+|---|---|
+| 端末 | SH-M16(AQUOS) |
+| OS | Android 11 |
+| 画面 | 1080x2400 |
+| ビルド | `make measurement-build-android`(Development ビルド) |
+| 出力先 | 本体スピーカー(Bluetooth オフ) |
+| 充電状態 | **未確認**(§4.2 の注意点。次回は充電しながら測ること) |
+| 省電力モード | **未確認**(同上) |
+
+### 9.2 結果 —— performance mode の有無で 9.2 倍
+
+`[mw-ffi] audio callback buffer (measured)` が報告した、音声コールバックが**実際に受け取った**
+フレーム数。
+
+| 条件 | コールバックバッファ | |
+|---|---|---|
+| AAudio performance mode 既定 | 886 frames @ 48kHz | **18.458 ms** |
+| `AudioPerformanceMode::LowLatency` | 96 frames @ 48kHz | **2.000 ms** |
+
+`dumpsys media.audio_flinger` でも `Fast tracks: activeMask=0x1`(FastMixer 経路に1トラック)を
+確認済み。低レイテンシ経路を掴めている。
+
+参考: この端末の稼働中の出力スレッドは HAL frame count 192 @ 48kHz = 4.0ms、
+Normal frame count 960 = 20ms。**既定の 886 frames は Normal 側に近い**値だった。
+
+### 9.3 絶対値の見積もり(§8.7 と同じモデル)
+
+```
+音の遅延 = 次のコールバックまでの待ち + I/O バッファ長 + ハードウェア出力レイテンシ
+```
+
+| 項 | 値 | 根拠 |
+|---|---|---|
+| 次のコールバックまでの待ち | 0〜2.0 ms(平均 1.0) | タップ時刻はバッファ境界に対してランダム |
+| I/O バッファ長 | 2.0 ms | 実測(96 frames @ 48kHz) |
+| ハードウェア出力レイテンシ | **未測定** | iOS の `outputLatency` に相当する値を cpal が公開していない |
+| **合計(HW を除く)** | **2.0〜4.0 ms(平均 3.0)** | |
+
+**HW 出力レイテンシを 20ms 見積もっても合計 22〜24ms** で、目標 ≤40ms には収まる見込み。
+ただしこれは**見積もりであって実測ではない**(iOS 側と同じ限界。§8.7「この見積もりの限界」)。
+断定するには §8.6-2(方式B: ライン録音)が要る。
+
+### 9.4 この計測に至るまでに直した不具合(3件)
+
+いずれも「Android では診断ログがどこにも出ない」ために存在自体が見えていなかったもの。
+詳細は §6.2 の 2026-08-23 の項。
+
+1. 診断ログが logcat に出ない(`platform_log`)
+2. サンプルレート選択が列挙の先頭を取り 5512Hz で `InvalidRate`(`find_f32_stereo_config`)
+3. `ndk_context` 未初期化で `mw_init` が `ErrPanic`(`android_context`)
+
+**この3件を直すまで、ミドルウェアは Android で一度も音を出していなかった。**
+
+### 9.5 `realtime` フィーチャのライセンス【確定】
+
+9.2 の低レイテンシ化は cpal の `realtime` フィーチャ(= `AudioPerformanceMode::LowLatency`)で
+得られたもので、このフィーチャは **`audio_thread_priority`(MPL-2.0)** を引き込む。
+`deny.toml` の許可リストに無く `make lint` が落ちたため、**ユーザー判断で MPL-2.0 を許可した**
+(2026-08-23)。
+
+判断の根拠: MPL-2.0 は**ファイル単位**のコピーレフトで、MPL のファイルを改変したときに
+そのファイルだけ公開義務が生じる。リンクして使う限り利用側のコード(`mw-core` / `mw-ffi` /
+ゲーム本体)には伝播せず、**ソース公開義務は生じない**。GPL/LGPL とは性質が異なる。
+
+見送った選択肢:
+
+- `realtime` を使わず `BufferSize::Fixed` で代替 — performance mode が設定されないため、
+  9.2 の 9.2 倍の改善は得られない見込みだった
+- M6(Android を oboe 直叩きに置換。oboe は Apache-2.0)の前倒し — 依存ライセンスは綺麗になるが
+  `Backend` 実装を1つ書き起こす作業量に見合わないと判断。目標値に届かなくなったら再検討する

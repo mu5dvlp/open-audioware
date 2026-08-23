@@ -68,34 +68,36 @@ mod imp {
             match AVAudioSessionCategoryPlayback {
                 Some(category) => {
                     if let Err(err) = session.setCategory_error(category) {
-                        eprintln!("[mw-backend] AVAudioSession setCategory failed: {err:?}");
+                        crate::mw_log!("[mw-backend] AVAudioSession setCategory failed: {err:?}");
                     }
                 }
                 None => {
-                    eprintln!("[mw-backend] AVAudioSessionCategoryPlayback is unavailable");
+                    crate::mw_log!("[mw-backend] AVAudioSessionCategoryPlayback is unavailable");
                 }
             }
 
             if let Err(err) = session.setPreferredSampleRate_error(PREFERRED_SAMPLE_RATE_HZ) {
-                eprintln!("[mw-backend] AVAudioSession setPreferredSampleRate failed: {err:?}");
+                crate::mw_log!(
+                    "[mw-backend] AVAudioSession setPreferredSampleRate failed: {err:?}"
+                );
             }
 
             if let Err(err) =
                 session.setPreferredIOBufferDuration_error(PREFERRED_IO_BUFFER_DURATION_SEC)
             {
-                eprintln!(
+                crate::mw_log!(
                     "[mw-backend] AVAudioSession setPreferredIOBufferDuration failed: {err:?}"
                 );
             }
 
             if let Err(err) = session.setActive_error(true) {
-                eprintln!("[mw-backend] AVAudioSession setActive(true) failed: {err:?}");
+                crate::mw_log!("[mw-backend] AVAudioSession setActive(true) failed: {err:?}");
             }
 
             // OS が実際に採用した値。希望どおりとは限らないため必ず残す。
             // 計測結果の解釈に直結するので、記録(`docs/measurement-m1.md` §7.1)へ
             // 転記できるようこの1行で完結させている。
-            eprintln!(
+            crate::mw_log!(
                 "[mw-backend] AVAudioSession configured: sample_rate={} Hz, io_buffer={:.3} ms, \
                  output_latency={:.3} ms, output_channels={}",
                 session.sampleRate(),

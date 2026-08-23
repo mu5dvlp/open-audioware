@@ -21,4 +21,18 @@ version = "0.3"
 features = ["std", "AVAudioSession", "AVAudioSessionTypes"]
 default-features = false
 
+# Android では cpal(AAudio 実装)が Java 側の AudioManager を参照するため、
+# JavaVM / Context を ndk_context へ登録する必要がある(src/android_context.rs 参照)。
+# どちらも cpal 0.18 の Android 実装が既に依存しているクレートなので、依存ツリーは増えない。
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.22"
+ndk-context = "0.1"
+
+# cpal の `realtime` フィーチャは Android では **AAudio の performance mode を LowLatency に
+# する**唯一のスイッチ(既定では設定されず、AAudio が大きめのバッファを選ぶ)。
+# 2026-08-23 の実機計測で、無効時のコールバックバッファが 886 frames = 18.5ms だったのに対し、
+# 端末の FastMixer は 192 frames = 4.0ms で回っていた(docs/measurement-m1.md §6.2)。
+# 併せて音声コールバックスレッドの優先度も上げる。
+cpal = { version = "0.18", features = ["realtime"] }
+
 [dev-dependencies]

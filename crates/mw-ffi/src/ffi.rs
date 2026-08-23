@@ -11,6 +11,7 @@
 //! (手書きの宣言ズレを構造的に排除するのが csbindgen 採用の目的、M2)。
 
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::Once;
 
 use crate::handle as handle_registry;
 use crate::handle::{InitOutcome, ShutdownOutcome};
@@ -36,6 +37,8 @@ pub extern "C" fn mw_abi_version() -> u32 {
 /// null の場合は書き込みを行わず `MwResult::ErrNullPointer` を返す。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mw_init(out_handle: *mut u64) -> MwResult {
+    install_panic_hook();
+
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
         if out_handle.is_null() {
             return None;
@@ -56,6 +59,48 @@ pub unsafe extern "C" fn mw_init(out_handle: *mut u64) -> MwResult {
         Ok(Some(InitOutcome::Failed)) => MwResult::ErrBackendOpenFailed,
         Err(_) => MwResult::ErrPanic,
     }
+}
+
+/// Android のライブラリロード時に JavaVM を受け取る。
+///
+/// cpal(AAudio)が Java 側を参照するため、`ndk_context` の初期化に JavaVM が要る
+/// (`mw_backend::android_context` のモジュール doc 参照)。ここで控えておき、実際の初期化は
+/// バックエンドを開く直前に行う。
+///
+/// **`System.loadLibrary` 経由でロードされた場合にのみ呼ばれる。** `dlopen` で直接開かれた
+/// 場合は呼ばれないため、そのときは `ndk_context` を初期化できない旨がログに出る。
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn JNI_OnLoad(
+    vm: *mut std::ffi::c_void,
+    _reserved: *mut std::ffi::c_void,
+) -> i32 {
+    mw_backend::android_context::set_java_vm(vm);
+    mw_backend::mw_log!("[mw-ffi] JNI_OnLoad: JavaVM を受け取った");
+
+    // JNI_VERSION_1_6
+    0x0001_0006
+}
+
+/// panic の内容をログへ出すフックを1度だけ入れる。
+///
+/// `catch_unwind` は panic を `MwResult::ErrPanic` に畳んでしまうため、**何が起きたのかは
+/// 呼び出し側に一切伝わらない**。既定の panic ハンドラはメッセージを stderr へ書くが、
+/// Android ではプロセスの stderr がどこにも出ないため実機で読めなかった
+/// (docs/measurement-m1.md §6.2。実際に `ErrPanic` の原因究明で詰まった)。
+/// ここで `mw_backend::mw_log!` 経由にして logcat へ流す。
+///
+/// 既定のフックは置き換えずに**後ろで呼ぶ**ため、デスクトップでの表示は変わらない。
+fn install_panic_hook() {
+    static INSTALL: Once = Once::new();
+
+    INSTALL.call_once(|| {
+        let previous = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            mw_backend::mw_log!("[mw-ffi] panic: {info}");
+            previous(info);
+        }));
+    });
 }
 
 /// ミドルウェアを終了し、出力ストリームを停止する。
@@ -134,7 +179,7 @@ pub unsafe extern "C" fn mw_sound_load(
         let sound_data = match mw_core::wav::decode(slice) {
             Ok(data) => data,
             Err(err) => {
-                eprintln!("[mw-ffi] mw_sound_load: decode failed: {err}");
+                mw_backend::mw_log!("[mw-ffi] mw_sound_load: decode failed: {err}");
                 return match err {
                     mw_core::WavError::UnsupportedSampleRate { .. } => {
                         MwResult::ErrUnsupportedSampleRate
