@@ -13,6 +13,7 @@
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Once;
 
+use crate::event::MwEvent;
 use crate::handle as handle_registry;
 use crate::handle::{InitOutcome, ShutdownOutcome};
 use crate::result::MwResult;
@@ -595,9 +596,84 @@ pub extern "C" fn mw_music_play_scheduled(handle: u64, host_time_ns: u64) -> MwR
     }
 }
 
+// --- M2-6: イベント通知 -----------------------------------------------------
+//
+// 初期構築仕様 §4.6(確定)/ §5.4(GC アロケーションゼロ)/ §2 M4(C → C# の
+// コールバックはしない。C# 側が毎フレームポーリングする)。
+
+/// イベントをポーリングする(初期構築仕様『§4.6 イベント通知』, M2-6)。
+///
+/// C → C# のコールバックはしない(『§2』M4, 確定)。呼び出し側が確保した `buf`
+/// (要素数 `cap`)へ blittable な [`MwEvent`] を直接書き込む。GC アロケーションゼロ
+/// (初期構築仕様『§5.4』)。
+///
+/// **戻り値は他の FFI 関数と異なる**: 成功時は `MwResult::Ok`(常に0)固定ではなく、
+/// **実際に書き込んだ件数**(0以上)を返す——毎フレーム呼ぶ関数として、呼び出し側が
+/// 知りたいのはまさにこの件数であり、`0` を「成功」に固定してしまうと別の出力引数で
+/// 件数を返す必要が生じ、アロケーションゼロという目的に対してかえって遠回りになる
+/// (`buf`/`cap` 自体は元々呼び出し側所有のバッファなので、この設計でも新たな
+/// アロケーションは発生しない)。失敗時は他の関数と同じ `MwResult` の負の値
+/// (`as i32`)を返す——「エラーは負の整数」という初期構築仕様『§4.8』の規約自体は
+/// 破っていない(`MwResult::Ok` 以外の成功値が無いだけ)。
+///
+/// `out_dropped` には、キューが固定容量(【仮】64)を超えて溢れたために
+/// **今回のポーリングで新たに判明した**破棄イベント件数を書き込む(黙って捨てない。
+/// 『§4.6』)。前回までに報告済みの分は含まない——累積は呼び出し側の責務にしない。
+///
+/// # Safety
+/// `cap > 0` の場合、`buf` は `cap` 個の [`MwEvent`] を書き込み可能な有効なポインタで
+/// なければならない。`cap <= 0` の場合は `buf` が null でもよい(書き込みを行わない。
+/// `mw_sound_load` の `len == 0` と同じ流儀)。`out_dropped` は書き込み可能な `u32` を
+/// 指す有効なポインタであるか、null でなければならない(null は書き込みを行わず
+/// `MwResult::ErrNullPointer` を返す)。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mw_poll_events(
+    handle: u64,
+    buf: *mut MwEvent,
+    cap: i32,
+    out_dropped: *mut u32,
+) -> i32 {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        if out_dropped.is_null() {
+            return Err(MwResult::ErrNullPointer);
+        }
+        // 負の容量は 0 として扱う(黙って落とさず、かつ新しいエラーコードも増やさない)。
+        let cap = cap.max(0) as usize;
+        if buf.is_null() && cap != 0 {
+            return Err(MwResult::ErrNullPointer);
+        }
+
+        let result = handle_registry::with_instance(handle, |instance| {
+            let mut written = 0usize;
+            let (_, dropped) = instance.events.drain(cap, |event| {
+                // SAFETY: `written < cap` は `drain` の `max` 引数(=`cap`)により
+                // 保証される。`buf` は上で null/cap の整合を確認済みで、`cap` 個
+                // 書き込み可能なポインタであることは呼び出し側の契約(Safety 節)。
+                unsafe {
+                    *buf.add(written) = MwEvent::from_core(event);
+                }
+                written += 1;
+            });
+            // SAFETY: 上で null チェック済み。
+            unsafe {
+                *out_dropped = dropped;
+            }
+            written as i32
+        });
+        result.ok_or(MwResult::ErrInvalidHandle)
+    }));
+
+    match outcome {
+        Ok(Ok(written)) => written,
+        Ok(Err(err)) => err as i32,
+        Err(_) => MwResult::ErrPanic as i32,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::MwEventKind;
 
     /// 最小限の 48kHz PCM16 wav バイト列を組み立てる(テスト専用。バイナリはコミットしない
     /// —初期構築仕様 §8「ゴールデン波形はテスト時にコードで生成」)。
@@ -771,6 +847,173 @@ mod tests {
             )
         };
         assert_eq!(invalid_load, MwResult::ErrUnsupportedSampleRate);
+
+        run_event_poll_checks(handle);
+    }
+
+    /// M2-6: `mw_poll_events` の一連の流れ(実ハンドル越し)。
+    ///
+    /// 実際の発生源(音声コールバック・cpal のエラー通知経路)からの配線は
+    /// `mw-core`/`mw-backend` 側のテストで検証済み。ここでは FFI 境界そのもの
+    /// (`Instance::events` への直接注入 → `mw_poll_events` での取り出し)が
+    /// 依頼書のテスト要件2〜4を満たすことを確認する。
+    fn run_event_poll_checks(handle: u64) {
+        // 前提: 空の状態から始める(0件、破棄数0)。
+        let mut buf = [MwEvent {
+            kind: MwEventKind::RouteChanged,
+            payload: 0,
+        }; 8];
+        let mut dropped = 0u32;
+        let n = unsafe { mw_poll_events(handle, buf.as_mut_ptr(), buf.len() as i32, &mut dropped) };
+        assert_eq!(n, 0, "queue must start out empty");
+        assert_eq!(dropped, 0);
+
+        // 依頼書のテスト要件3: ポーリングでキューが空になる/2回目は0件。
+        let injected = handle_registry::with_instance(handle, |instance| {
+            instance.events.push_realtime(mw_core::Event::MusicEnded);
+            instance
+                .events
+                .push_side_channel(mw_core::Event::StreamError {
+                    reason: mw_core::StreamErrorReason::DeviceUnavailable,
+                });
+        });
+        assert!(injected.is_some(), "handle must still be valid");
+
+        let n = unsafe { mw_poll_events(handle, buf.as_mut_ptr(), buf.len() as i32, &mut dropped) };
+        assert_eq!(n, 2);
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            buf[0],
+            MwEvent {
+                kind: MwEventKind::MusicEnded,
+                payload: 0
+            }
+        );
+        assert_eq!(
+            buf[1],
+            MwEvent {
+                kind: MwEventKind::StreamError,
+                payload: mw_core::StreamErrorReason::DeviceUnavailable as u64
+            }
+        );
+
+        let n2 =
+            unsafe { mw_poll_events(handle, buf.as_mut_ptr(), buf.len() as i32, &mut dropped) };
+        assert_eq!(n2, 0, "the queue must be empty after being fully drained");
+        assert_eq!(dropped, 0);
+
+        // 依頼書のテスト要件4: 呼び出し側バッファが積まれた件数より小さいとき、
+        // 残りが次回のポーリングで取れる(取りこぼさない)。
+        handle_registry::with_instance(handle, |instance| {
+            for i in 0..5u32 {
+                instance
+                    .events
+                    .push_realtime(mw_core::Event::Underrun { frames: i });
+            }
+        });
+        let mut small_buf = [MwEvent {
+            kind: MwEventKind::RouteChanged,
+            payload: 0,
+        }; 2];
+        let n_first = unsafe {
+            mw_poll_events(
+                handle,
+                small_buf.as_mut_ptr(),
+                small_buf.len() as i32,
+                &mut dropped,
+            )
+        };
+        assert_eq!(n_first, 2);
+        assert_eq!(dropped, 0);
+        let n_rest =
+            unsafe { mw_poll_events(handle, buf.as_mut_ptr(), buf.len() as i32, &mut dropped) };
+        assert_eq!(
+            n_rest, 3,
+            "the remaining 3 entries must survive to be picked up by the next poll"
+        );
+        assert_eq!(dropped, 0);
+
+        // 異常系(null / cap 0 / 不正ハンドル)で落ちないこと。
+        assert_eq!(
+            unsafe { mw_poll_events(handle, std::ptr::null_mut(), 0, &mut dropped) },
+            0,
+            "cap=0 with a null buf must be accepted (no bytes to write)"
+        );
+        assert_eq!(
+            unsafe {
+                mw_poll_events(
+                    handle,
+                    buf.as_mut_ptr(),
+                    buf.len() as i32,
+                    std::ptr::null_mut(),
+                )
+            },
+            MwResult::ErrNullPointer as i32
+        );
+    }
+
+    #[test]
+    fn poll_events_rejects_null_out_dropped() {
+        let mut buf = [MwEvent {
+            kind: MwEventKind::RouteChanged,
+            payload: 0,
+        }; 4];
+        let result = unsafe { mw_poll_events(1, buf.as_mut_ptr(), 4, std::ptr::null_mut()) };
+        assert_eq!(result, MwResult::ErrNullPointer as i32);
+    }
+
+    #[test]
+    fn poll_events_rejects_null_buf_when_capacity_is_positive() {
+        let mut dropped = 0u32;
+        let result =
+            unsafe { mw_poll_events(1, std::ptr::null_mut(), 4, &mut dropped as *mut u32) };
+        assert_eq!(result, MwResult::ErrNullPointer as i32);
+    }
+
+    #[test]
+    fn poll_events_with_zero_capacity_and_null_buf_does_not_crash() {
+        let mut dropped = 0u32;
+        let result = unsafe {
+            mw_poll_events(
+                0xDEAD_BEEF_u64,
+                std::ptr::null_mut(),
+                0,
+                &mut dropped as *mut u32,
+            )
+        };
+        assert_eq!(result, MwResult::ErrInvalidHandle as i32);
+    }
+
+    #[test]
+    fn poll_events_rejects_negative_capacity_without_crashing() {
+        let mut dropped = 0u32;
+        let result = unsafe {
+            mw_poll_events(
+                0xDEAD_BEEF_u64,
+                std::ptr::null_mut(),
+                -1,
+                &mut dropped as *mut u32,
+            )
+        };
+        assert_eq!(result, MwResult::ErrInvalidHandle as i32);
+    }
+
+    #[test]
+    fn poll_events_with_invalid_handle_is_invalid_handle_not_a_crash() {
+        let mut buf = [MwEvent {
+            kind: MwEventKind::RouteChanged,
+            payload: 0,
+        }; 4];
+        let mut dropped = 0u32;
+        let result = unsafe {
+            mw_poll_events(
+                0xDEAD_BEEF_u64,
+                buf.as_mut_ptr(),
+                4,
+                &mut dropped as *mut u32,
+            )
+        };
+        assert_eq!(result, MwResult::ErrInvalidHandle as i32);
     }
 
     #[test]

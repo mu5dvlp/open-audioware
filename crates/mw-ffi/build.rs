@@ -8,6 +8,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/ffi.rs");
     println!("cargo:rerun-if-changed=src/result.rs");
+    println!("cargo:rerun-if-changed=src/event.rs");
 
     let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../unity/Runtime/Generated/NativeMethods.g.cs");
@@ -15,6 +16,7 @@ fn main() {
     csbindgen::Builder::default()
         .input_extern_file("src/ffi.rs")
         .input_extern_file("src/result.rs")
+        .input_extern_file("src/event.rs")
         // DllImport 先のバイナリ名(拡張子・lib プレフィックスは .NET のライブラリ解決規約に従う)。
         // macOS: libmw_ffi.dylib / Android: libmw_ffi.so
         .csharp_dll_name("mw_ffi")

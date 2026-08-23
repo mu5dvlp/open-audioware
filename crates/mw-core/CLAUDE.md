@@ -9,6 +9,17 @@ OS 非依存・デバイス非依存のコア。ミキサ、ボイス管理、�
 
 ## 現状(M1: SE 再生)
 
+- `event`: `Event`(§4.6 イベント通知。`RouteChanged`/`Underrun`/`MusicEnded`/
+  `MusicLooped`/`StreamError`/`ClipperEngaged` の6種。可変長データは持たず、
+  バリアントごとの付随データは固定サイズの数値のみ)と `EventQueue`(固定容量、
+  【仮】既定64。溢れたら古いものから破棄し、破棄数を読み手側で逆算する、M2-6)。
+  書き込み経路が2系統ある: 音声スレッド(唯一の書き手 `Mixer`)専用の
+  `push_realtime`(ロック・アロケーション無し。各スロットを1本の `AtomicU64` に
+  タグ+ペイロードで詰め、`write_index` の Release/Acquire だけで公開する——
+  `clock.rs::MusicClockPublisher` のような seqlock は要らない設計にした理由は
+  `event.rs` モジュール doc を参照)と、非リアルタイムスレッド(cpal のエラー
+  コールバック等)専用の `push_side_channel`(§5.3 の対象外なので `Mutex` を使う)。
+  読み出し `drain` はゲームスレッド(`mw-ffi::mw_poll_events`)から呼ぶ。
 - `format`: 内部ミックスフォーマット定義。f32 ステレオ固定(`CHANNELS = 2`)、
   サンプルレートは出力デバイスに追従(将来変わりうる前提は `AudioFormat` に閉じ込めてある)。
 - `clock`: `RenderedFrameCounter`(音声コールバックが送出したフレーム数を数える
@@ -35,8 +46,8 @@ OS 非依存・デバイス非依存のコア。ミキサ、ボイス管理、�
 - `decode`: `MusicDecoder`/`SymphoniaDecoder` — wav / ogg vorbis のストリーミングデコード
   (§4.7, M2-3)。`stream.rs::MusicStreamProducer::pump` から呼ばれる。
 - `config`: `Config` — 【仮】既定値(ボイス数 64、既定ランプ 5ms、キュー容量、
-  予約発音キュー容量32等)を1箇所に集約する設定構造体。`mw_init(config)` からの
-  実行時上書きは未実装(既定値のみ)。
+  予約発音キュー容量32、イベントキュー容量64、アンダーラン集約報告閾値48000フレーム等)
+  を1箇所に集約する設定構造体。`mw_init(config)` からの実行時上書きは未実装(既定値のみ)。
 - `ramp`: `Ramp` — サンプル単位の線形ランプ。全ての音量変化・停止がこれを経由する(M13)。
   `advance()` は音声コールバックのホットパスから呼ばれる(`Iterator::next` と紛らわしいため
   意図的に別名にしてある)。`ms_to_samples` でミリ秒→サンプル数を変換する。
@@ -69,13 +80,19 @@ OS 非依存・デバイス非依存のコア。ミキサ、ボイス管理、�
   後ろ3つは M2-5 追加(予約発音・楽曲予約再生。`MusicSeek` は楽曲制御 API 全体の
   公開〔M2-6 以降〕を待たずに世代カウンタの不連続をテストで検証するための内部配線)。
 - `mixer`: `Mixer::render(output, buffer_start_host_time_ns)` — 「コマンド消化 →
-  楽曲ボイスのレンダリング(予約発火があればサンプル精度で分割) → アクティブ SE ボイス
-  合算 + 楽曲の Bgm バス適用 → Master → クリッパ → 音楽クロックの相関点を公開」(§4.1/§4.4)。
-  `mixer::build(config, sample_rate)` が `Mixer` とゲームスレッド側ハンドル一式
-  (`CommandSender` / `ReclaimReceiver` / `MusicStreamProducer` / `Arc<MusicClockPublisher>`)
-  を返す。`buffer_start_host_time_ns` はこのバッファの先頭フレームが実際に DAC から
+  楽曲ボイスのレンダリング(予約発火があればサンプル精度で分割) → イベント通知 →
+  アクティブ SE ボイス合算 + 楽曲の Bgm バス適用 → Master → クリッパ → 音楽クロックの
+  相関点を公開」(§4.1/§4.4/§4.6)。`mixer::build(config, sample_rate)` が `Mixer` と
+  ゲームスレッド側ハンドル一式(`CommandSender` / `ReclaimReceiver` /
+  `MusicStreamProducer` / `Arc<MusicClockPublisher>` / `Arc<EventQueue>`)を返す。
+  `buffer_start_host_time_ns` はこのバッファの先頭フレームが実際に DAC から
   出力される(と予測される)ホスト単調時刻——`mw-backend` が cpal の
   `OutputCallbackInfo::timestamp().playback` から求めて渡す(M2-5)。
+  `MusicRenderOutcome::ended`/`looped`/`underrun_frames` をそのままイベント化する
+  (新たな検知ロジックは足していない、M2-6)。`report_underrun` がアンダーランの
+  集約(コールバックをまたいで蓄積し、収まるか閾値到達で1件にまとめる)を行う理由は
+  同メソッドのコメントを参照。クリッパ動作検知(`ClipperEngaged`)は開発ビルドのみ
+  (`cfg!(debug_assertions)`)発火する。
 - `renderer`: `Renderer` — `Mixer` を包み、レンダリング済みフレーム数を数える最上位型。
   `Renderer::build` が `mixer::build` を呼ぶ薄いラッパ(戻り値もそのまま中継する)。
 

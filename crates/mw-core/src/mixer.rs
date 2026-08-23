@@ -14,6 +14,7 @@ use crate::clipper::SoftClipper;
 use crate::clock::MusicClockPublisher;
 use crate::command::{Command, ScheduledSe};
 use crate::config::Config;
+use crate::event::{Event, EventQueue};
 use crate::format::CHANNELS;
 use crate::music::{MusicFrameSource, MusicState, MusicVoice};
 use crate::ramp::ms_to_samples;
@@ -174,11 +175,21 @@ pub struct Mixer {
     /// (`Config::schedule_queue_capacity`)。
     se_schedule: ScheduleQueue<ScheduledSe>,
     /// `se_schedule` が満杯で挿入できなかった回数(`clipper.rs` の動作回数カウントと
-    /// 同じ流儀。イベント通知への昇格は M2-6 以降)。
+    /// 同じ流儀)。初期構築仕様『§4.6』の6種(M2-6 で実装済み)には含まれないため、
+    /// イベント通知への昇格は行っていない(問い合わせ API 経由のままでよいと判断)。
     se_schedule_overflow_count: AtomicU64,
     /// 音楽クロックの相関点(初期構築仕様『§4.4』)。音声スレッドが書き、
     /// ゲームスレッドが `Arc` の複製経由でロック無しに読む(seqlock、`clock.rs`)。
     music_clock: Arc<MusicClockPublisher>,
+    /// イベント通知(初期構築仕様『§4.6』)。音声スレッドはここへ `push_realtime` する
+    /// だけで、実際の解放・破棄数の計算は読み手(ゲームスレッド、`event.rs` 参照)側で行う。
+    events: Arc<EventQueue>,
+    /// アンダーランの集約中カウンタ(`report_underrun` 参照)。コールバックをまたいで
+    /// 蓄積し、まとめて1件のイベントにする。
+    underrun_accumulator: u32,
+    /// `underrun_accumulator` がこの値に達したら、まだアンダーランが収まっていなくても
+    /// 一度報告する(初期構築仕様『§4.6』, `Config::underrun_report_threshold_frames`)。
+    underrun_report_threshold_frames: u32,
 }
 
 /// [`Mixer`] とゲームスレッド側ハンドル一式を構築する。
@@ -187,11 +198,17 @@ pub struct Mixer {
 /// バックエンド側がデバイスをオープンした直後、音声コールバックが動き出す前に
 /// 確定させる想定(cpal 実装は `CpalBackend::open` 内で行う)。
 ///
-/// 戻り値は `(Mixer, コマンド送信, Arc 回収, 楽曲PCM供給の生産側, 音楽クロックの読み手)`。
+/// 戻り値は `(Mixer, コマンド送信, Arc 回収, 楽曲PCM供給の生産側, 音楽クロックの読み手,
+/// イベントキューの読み書きハンドル)`。
 /// `MusicStreamProducer` を駆動するデコードスレッドの起動は mw-ffi 側の後続作業
 /// (M2-5 の時点では誰も `pump` を呼ばないため、楽曲ボイスは供給が無いまま
 /// `MusicState::Loading` に留まる——これは「まだロード API が無い」という現状を
 /// 正直に反映した状態であり、誤魔化しではない)。
+///
+/// `Arc<EventQueue>` は書き込み・読み出しの両方を1つの型に集約してある(`event.rs`
+/// モジュール doc 参照)。呼び出し側(mw-ffi)はこの同じ `Arc` を、音声スレッド以外の
+/// 発生源(cpal のエラーコールバック等)からの `push_side_channel` と、ゲームスレッドの
+/// `drain`(ポーリング)の両方に使い回す。
 pub fn build(
     config: Config,
     sample_rate: u32,
@@ -201,6 +218,7 @@ pub fn build(
     ReclaimReceiver,
     MusicStreamProducer,
     Arc<MusicClockPublisher>,
+    Arc<EventQueue>,
 ) {
     let (command_producer, command_consumer) =
         RingBuffer::<Command>::new(config.command_queue_capacity);
@@ -208,6 +226,7 @@ pub fn build(
         RingBuffer::<Arc<SoundData>>::new(config.reclaim_queue_capacity);
     let (music_producer, music_source) = stream::channel(config, sample_rate);
     let music_clock = Arc::new(MusicClockPublisher::new());
+    let events = Arc::new(EventQueue::new(config.event_queue_capacity));
 
     let mixer = Mixer {
         buses: BusSet::new(),
@@ -225,6 +244,9 @@ pub fn build(
         se_schedule: ScheduleQueue::with_capacity(config.schedule_queue_capacity),
         se_schedule_overflow_count: AtomicU64::new(0),
         music_clock: Arc::clone(&music_clock),
+        events: Arc::clone(&events),
+        underrun_accumulator: 0,
+        underrun_report_threshold_frames: config.underrun_report_threshold_frames,
     };
     let sender = CommandSender {
         producer: Mutex::new(command_producer),
@@ -232,7 +254,7 @@ pub fn build(
     let receiver = ReclaimReceiver {
         consumer: reclaim_consumer,
     };
-    (mixer, sender, receiver, music_producer, music_clock)
+    (mixer, sender, receiver, music_producer, music_clock, events)
 }
 
 impl Mixer {
@@ -414,6 +436,27 @@ impl Mixer {
             self.music_clock.bump_generation();
         }
 
+        // --- イベント通知(初期構築仕様『§4.6』, M2-6) ---
+        // `MusicRenderOutcome` は M2-5 までに既に実装済みの戻り値をそのまま使う
+        // (新たな検知ロジックは作らない。依頼書のとおり)。
+        if music_outcome.ended {
+            self.events.push_realtime(Event::MusicEnded);
+        }
+        if music_outcome.looped {
+            self.events.push_realtime(Event::MusicLooped {
+                restart_frame: music_outcome.loop_restart_frame,
+            });
+        }
+        self.report_underrun(music_outcome.underrun_frames as u32);
+
+        // クリッパの動作検知は開発ビルドのみイベント化する(初期構築仕様『§4.1』
+        // 「動作した場合は開発ビルドでイベントとして観測できるようにする」)。
+        // 既存の累計カウンタ(`clipper.rs::SoftClipper::engaged_count`)をこのコールバックの
+        // 前後で比較するだけで足りる——1サンプルごとではなく、このコールバックで
+        // 1回でも動作したかどうかを1件のイベントにまとめる(`ClipperEngaged` は
+        // 数を持たないマーカーイベントなので、これで十分)。
+        let clipper_engaged_before_frame_loop = self.clipper.engaged_count();
+
         // --- SE ボイス + 楽曲の合成 ---
         for frame_index in 0..frames {
             self.fire_due_se(
@@ -454,6 +497,14 @@ impl Mixer {
             }
         }
 
+        // 開発ビルドのみ発火(`cfg!` はリリースビルドでは定数 false に畳み込まれ、
+        // 分岐ごと最適化で消える。実行時コストは事実上ゼロ)。
+        let clipper_engaged_this_callback =
+            self.clipper.engaged_count() != clipper_engaged_before_frame_loop;
+        if cfg!(debug_assertions) && clipper_engaged_this_callback {
+            self.events.push_realtime(Event::ClipperEngaged);
+        }
+
         let reclaim = &mut self.reclaim;
         self.voices.reap(|arc| reclaim.send_or_leak(arc));
 
@@ -467,6 +518,37 @@ impl Mixer {
             self.sample_rate,
             self.music_voice.state() == MusicState::Playing,
         );
+    }
+
+    /// アンダーランの集約(初期構築仕様『§4.6』)。
+    ///
+    /// `MusicVoice::render` は既にコールバック1回ぶんの合計フレーム数を
+    /// `MusicRenderOutcome::underrun_frames` として返す(= 1コールバックにつき
+    /// ここでの加算は高々1回)。それでも毎コールバック素直にイベント化すると、
+    /// デコードスレッドの継続的な遅延など「アンダーランが何十〜何百コールバックも
+    /// 連続する」状況で、固定容量64のイベントキューを数百ms〜数秒のうちに
+    /// アンダーラン単体で溢れさせてしまう(他の重要なイベントを押し出してしまう)。
+    ///
+    /// そこで「アンダーランが止んだ(このコールバックは0フレームだった)」か
+    /// 「累積が閾値([`Config::underrun_report_threshold_frames`])に達した」の
+    /// **いずれか早い方**で1件のイベントにまとめて報告し、累積をリセットする。
+    /// 後者が無いと、アンダーランが無限に続くケース(=最も報告してほしいケース)を
+    /// 「収まるまで待つ」だけでは永遠に報告できない。
+    fn report_underrun(&mut self, frames_this_callback: u32) {
+        self.underrun_accumulator = self
+            .underrun_accumulator
+            .saturating_add(frames_this_callback);
+        if self.underrun_accumulator == 0 {
+            return;
+        }
+        let should_flush = frames_this_callback == 0
+            || self.underrun_accumulator >= self.underrun_report_threshold_frames;
+        if should_flush {
+            self.events.push_realtime(Event::Underrun {
+                frames: self.underrun_accumulator,
+            });
+            self.underrun_accumulator = 0;
+        }
     }
 
     /// クリッパが動作(閾値超過)した累計回数(開発ビルドでの動作検知。§4.1)。
@@ -529,7 +611,7 @@ mod tests {
 
     #[test]
     fn silence_by_default() {
-        let (mut mixer, _sender, _reclaim, _music_producer, _music_clock) =
+        let (mut mixer, _sender, _reclaim, _music_producer, _music_clock, _events) =
             build(Config::default(), 48_000);
         let mut buf = vec![1.0; 32 * CHANNELS];
         mixer.render(&mut buf, 0);
@@ -538,7 +620,7 @@ mod tests {
 
     #[test]
     fn play_command_produces_sound_on_the_very_next_render_call() {
-        let (mut mixer, sender, _reclaim, _music_producer, _music_clock) =
+        let (mut mixer, sender, _reclaim, _music_producer, _music_clock, _events) =
             build(Config::default(), 48_000);
         assert!(sender.send(Command::PlaySe {
             voice_serial: 1,
@@ -557,7 +639,7 @@ mod tests {
 
     #[test]
     fn bus_volume_scales_voice_output_exactly() {
-        let (mut mixer, sender, _reclaim, _music_producer, _music_clock) =
+        let (mut mixer, sender, _reclaim, _music_producer, _music_clock, _events) =
             build(Config::default(), 48_000);
         sender.send(Command::PlaySe {
             voice_serial: 1,
@@ -581,7 +663,7 @@ mod tests {
 
     #[test]
     fn master_bus_applies_once_not_double_counted_for_direct_master_voices() {
-        let (mut mixer, sender, _reclaim, _music_producer, _music_clock) =
+        let (mut mixer, sender, _reclaim, _music_producer, _music_clock, _events) =
             build(Config::default(), 48_000);
         sender.send(Command::PlaySe {
             voice_serial: 1,
@@ -608,7 +690,8 @@ mod tests {
             steal_tail_capacity: 1,
             ..Config::default()
         };
-        let (mut mixer, sender, mut reclaim, _music_producer, _music_clock) = build(config, 48_000);
+        let (mut mixer, sender, mut reclaim, _music_producer, _music_clock, _events) =
+            build(config, 48_000);
 
         sender.send(Command::PlaySe {
             voice_serial: 1,
@@ -641,7 +724,7 @@ mod tests {
 
     #[test]
     fn soft_clipper_engages_when_voices_sum_above_threshold() {
-        let (mut mixer, sender, _reclaim, _music_producer, _music_clock) =
+        let (mut mixer, sender, _reclaim, _music_producer, _music_clock, _events) =
             build(Config::default(), 48_000);
         for i in 0..4u64 {
             sender.send(Command::PlaySe {
@@ -711,6 +794,35 @@ mod tests {
         }
     }
 
+    /// `ConstantDecoder` の総フレーム数ありバージョン(M2-6: 自然終了イベントの検証用)。
+    struct FiniteDecoder {
+        cursor: u64,
+        total: u64,
+    }
+
+    impl MusicDecoder for FiniteDecoder {
+        fn read(&mut self, out: &mut [f32]) -> Result<usize, DecodeError> {
+            let want = out.len() / CHANNELS;
+            let remaining = (self.total.saturating_sub(self.cursor)) as usize;
+            let n = want.min(remaining);
+            for i in 0..n {
+                out[i * CHANNELS] = 1.0;
+                out[i * CHANNELS + 1] = 1.0;
+            }
+            self.cursor += n as u64;
+            Ok(n)
+        }
+
+        fn seek(&mut self, frame: u64) -> Result<(), DecodeError> {
+            self.cursor = frame;
+            Ok(())
+        }
+
+        fn total_frames(&self) -> Option<u64> {
+            Some(self.total)
+        }
+    }
+
     /// `build` 直後の `Mixer` へ、`MusicVoice` が `Ready` になるまで PCM を供給する。
     /// (`producer.pump` でリングバッファを満杯にし、`render` を1回呼んで
     /// `Loading` → `Ready` の遷移を確定させる)。
@@ -726,7 +838,7 @@ mod tests {
 
     #[test]
     fn se_schedule_fires_at_exact_sample_offset_within_buffer() {
-        let (mut mixer, sender, _reclaim, _music_producer, _music_clock) =
+        let (mut mixer, sender, _reclaim, _music_producer, _music_clock, _events) =
             build(Config::default(), TEST_SAMPLE_RATE);
         let offset = 7u64;
         assert!(sender.send(Command::SeSchedule {
@@ -752,7 +864,7 @@ mod tests {
     fn se_schedule_offset_boundary_values() {
         // 境界値1: バッファ先頭ちょうど。
         {
-            let (mut mixer, sender, _reclaim, _mp, _mc) =
+            let (mut mixer, sender, _reclaim, _mp, _mc, _events) =
                 build(Config::default(), TEST_SAMPLE_RATE);
             sender.send(Command::SeSchedule {
                 host_time_ns: 0,
@@ -768,7 +880,7 @@ mod tests {
 
         // 境界値2: バッファ末尾ちょうど(最後のフレームだけ発音)。
         {
-            let (mut mixer, sender, _reclaim, _mp, _mc) =
+            let (mut mixer, sender, _reclaim, _mp, _mc, _events) =
                 build(Config::default(), TEST_SAMPLE_RATE);
             let frames = 8usize;
             sender.send(Command::SeSchedule {
@@ -790,7 +902,7 @@ mod tests {
         // 境界値3: バッファをまたぐ(1バッファ目では発音せず、2バッファ目の正しい
         // オフセットで発音する)。
         {
-            let (mut mixer, sender, _reclaim, _mp, _mc) =
+            let (mut mixer, sender, _reclaim, _mp, _mc, _events) =
                 build(Config::default(), TEST_SAMPLE_RATE);
             let frames = 8usize;
             let buffer1_duration_ns = frames as u64 * NS_PER_SAMPLE;
@@ -822,7 +934,7 @@ mod tests {
     fn se_schedule_offset_advances_by_exactly_one_sample_per_sample_shift() {
         let frames = 40usize;
         for n in 0..frames as u64 {
-            let (mut mixer, sender, _reclaim, _mp, _mc) =
+            let (mut mixer, sender, _reclaim, _mp, _mc, _events) =
                 build(Config::default(), TEST_SAMPLE_RATE);
             sender.send(Command::SeSchedule {
                 host_time_ns: n * NS_PER_SAMPLE,
@@ -845,7 +957,8 @@ mod tests {
     /// 丸め方針と同じ判断: 「指定時刻以降で最短距離」を優先し、取りこぼさない)。
     #[test]
     fn se_schedule_in_the_past_fires_immediately_at_offset_zero() {
-        let (mut mixer, sender, _reclaim, _mp, _mc) = build(Config::default(), TEST_SAMPLE_RATE);
+        let (mut mixer, sender, _reclaim, _mp, _mc, _events) =
+            build(Config::default(), TEST_SAMPLE_RATE);
         // バッファ先頭(10ms 地点)よりずっと前を予約時刻に指定する。
         sender.send(Command::SeSchedule {
             host_time_ns: 0,
@@ -865,7 +978,7 @@ mod tests {
             schedule_queue_capacity: 2,
             ..Config::default()
         };
-        let (mut mixer, sender, _reclaim, _mp, _mc) = build(config, TEST_SAMPLE_RATE);
+        let (mut mixer, sender, _reclaim, _mp, _mc, _events) = build(config, TEST_SAMPLE_RATE);
 
         for i in 0..2u64 {
             assert!(sender.send(Command::SeSchedule {
@@ -894,7 +1007,7 @@ mod tests {
 
     #[test]
     fn music_play_scheduled_starts_exactly_at_sample_offset_with_fade_in() {
-        let (mut mixer, sender, _reclaim, mut producer, _music_clock) =
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events) =
             build(Config::default(), TEST_SAMPLE_RATE);
         make_music_ready(&mut mixer, &mut producer, 1.0);
 
@@ -933,7 +1046,7 @@ mod tests {
 
     #[test]
     fn music_play_scheduled_before_preroll_completion_is_deferred_then_fires_once_ready() {
-        let (mut mixer, sender, _reclaim, mut producer, _music_clock) =
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events) =
             build(Config::default(), TEST_SAMPLE_RATE);
 
         // わざと pump しない: プリロール未完了(Loading)のまま予約時刻を到来させる。
@@ -977,7 +1090,7 @@ mod tests {
 
     #[test]
     fn music_play_scheduled_in_the_past_when_already_ready_fires_immediately() {
-        let (mut mixer, sender, _reclaim, mut producer, _music_clock) =
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events) =
             build(Config::default(), TEST_SAMPLE_RATE);
         make_music_ready(&mut mixer, &mut producer, 1.0);
 
@@ -999,7 +1112,7 @@ mod tests {
 
     #[test]
     fn render_publishes_music_clock_snapshot_after_every_call() {
-        let (mut mixer, sender, _reclaim, mut producer, music_clock) =
+        let (mut mixer, sender, _reclaim, mut producer, music_clock, _events) =
             build(Config::default(), TEST_SAMPLE_RATE);
         make_music_ready(&mut mixer, &mut producer, 1.0);
 
@@ -1038,7 +1151,7 @@ mod tests {
 
     #[test]
     fn render_bumps_generation_exactly_once_on_seek_discontinuity() {
-        let (mut mixer, sender, _reclaim, mut producer, music_clock) =
+        let (mut mixer, sender, _reclaim, mut producer, music_clock, _events) =
             build(Config::default(), TEST_SAMPLE_RATE);
         make_music_ready(&mut mixer, &mut producer, 1.0);
 
@@ -1065,5 +1178,160 @@ mod tests {
         let mut buf3 = vec![0.0; 4 * CHANNELS];
         mixer.render(&mut buf3, 200_000 * NS_PER_SAMPLE);
         assert_eq!(music_clock.snapshot().generation, 1);
+    }
+
+    // =====================================================================
+    // M2-6: イベント通知(初期構築仕様『§4.6』)
+    // =====================================================================
+    //
+    // 破棄数・溢れ・部分ポーリングといった `EventQueue` 自体の汎用的な振る舞いは
+    // `event.rs` のユニットテストで検証済み。ここでは「発生源から正しく積まれること」
+    // (依頼書のテスト要件1)——`Mixer::render` が既存の戻り値・カウンタから
+    // 正しい種別・付随データでイベントを積んでいることに絞って検証する。
+
+    fn drain_events(events: &EventQueue, max: usize) -> (Vec<Event>, u32) {
+        let mut out = Vec::new();
+        let (_, dropped) = events.drain(max, |e| out.push(e));
+        (out, dropped)
+    }
+
+    #[test]
+    fn music_ended_event_is_pushed_on_natural_end() {
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, events) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+
+        let mut decoder = FiniteDecoder {
+            cursor: 0,
+            total: 5,
+        };
+        producer.pump(&mut decoder).expect("pump must succeed");
+        let mut warmup = vec![0.0; 4 * CHANNELS];
+        mixer.render(&mut warmup, 0);
+        assert_eq!(mixer.music_state(), MusicState::Ready);
+
+        sender.send(Command::MusicPlayScheduled { host_time_ns: 0 });
+        // 総フレーム数(5)より大きい要求 -> このコールバック内で自然終了するはず。
+        let mut buf = vec![0.0; 20 * CHANNELS];
+        mixer.render(&mut buf, 0);
+        assert_eq!(
+            mixer.music_state(),
+            MusicState::Ready,
+            "must have returned to Ready via natural end"
+        );
+
+        let (out, dropped) = drain_events(&events, 10);
+        assert_eq!(dropped, 0);
+        assert!(
+            out.contains(&Event::MusicEnded),
+            "natural end must push a MusicEnded event, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn music_looped_event_is_pushed_with_the_restart_frame() {
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, events) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+        make_music_ready(&mut mixer, &mut producer, 1.0);
+
+        // ループ区間の設定を行う `Command` はまだ公開されていない(楽曲制御 API 全体の
+        // 公開は M2-6 の範囲外の後続作業)。同一クレート内のテストとして `MusicVoice`
+        // (既存の公開メソッド)を直接叩く——新たな検知ロジックを作るのではなく、
+        // 既存機能への配線経路が無いだけなので、テストの都合上ここで直接呼ぶ。
+        mixer.music_voice.set_loop(Some((0, 8)));
+
+        sender.send(Command::MusicPlayScheduled { host_time_ns: 0 });
+        let mut buf = vec![0.0; 64 * CHANNELS];
+        mixer.render(&mut buf, 0);
+
+        let (out, dropped) = drain_events(&events, 10);
+        assert_eq!(dropped, 0);
+        let restart_frame = out.iter().find_map(|e| match e {
+            Event::MusicLooped { restart_frame } => Some(*restart_frame),
+            _ => None,
+        });
+        assert_eq!(
+            restart_frame,
+            Some(0),
+            "must report the loop region's start frame, got {out:?}"
+        );
+    }
+
+    /// アンダーランのまとめ方(`Mixer::report_underrun`)の検証:
+    /// 閾値に達するまでは連続するコールバックをまたいでイベントを積まず、
+    /// 達した時点でまとめて1件だけ報告する。
+    #[test]
+    fn underrun_is_coalesced_across_callbacks_not_pushed_every_time() {
+        let config = Config {
+            // preroll_ms(1.0)@1000Hz -> preroll_frames=1、リングバッファ容量はその4倍の
+            // 4フレームぶんだけ(意図的に極小にして、数コールバックで枯渇させる)。
+            preroll_ms: 1.0,
+            underrun_report_threshold_frames: 10,
+            ..Config::default()
+        };
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, events) =
+            build(config, TEST_SAMPLE_RATE);
+        make_music_ready(&mut mixer, &mut producer, 1.0);
+        sender.send(Command::MusicPlayScheduled { host_time_ns: 0 });
+
+        // 1コールバック目: リングバッファに残っていた4フレームがちょうど発火直後に
+        // 消費される(アンダーラン無し)。
+        let mut buf = vec![0.0; 4 * CHANNELS];
+        mixer.render(&mut buf, 0);
+        assert!(drain_events(&events, 10).0.is_empty());
+
+        // 以後 pump しないためリングバッファは空のまま = 毎コールバック4フレームぶん
+        // アンダーランする。閾値(10)に達するまではイベントを積まない
+        // (4 -> 8 の2コールバックぶん)。
+        for _ in 0..2 {
+            let mut buf = vec![0.0; 4 * CHANNELS];
+            mixer.render(&mut buf, 0);
+            assert!(
+                drain_events(&events, 10).0.is_empty(),
+                "must not push an event before the coalescing threshold is reached"
+            );
+        }
+
+        // 3コールバック目で累積 12(4+4+4)が閾値10を超え、まとめて1件だけ報告される。
+        let mut buf = vec![0.0; 4 * CHANNELS];
+        mixer.render(&mut buf, 0);
+        let (out, dropped) = drain_events(&events, 10);
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            out,
+            vec![Event::Underrun { frames: 12 }],
+            "consecutive underrunning callbacks must be coalesced into a single event"
+        );
+    }
+
+    #[test]
+    fn clipper_engaged_event_is_pushed_when_the_clipper_activates() {
+        let (mut mixer, sender, _reclaim, _mp, _mc, events) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+        for i in 0..4u64 {
+            sender.send(Command::PlaySe {
+                voice_serial: i + 1,
+                sound_id: i + 1,
+                sound: constant_sound(10, 0.9),
+                bus: BusId::Se,
+                volume: 1.0,
+            });
+        }
+        let mut buf = vec![0.0; CHANNELS];
+        mixer.render(&mut buf, 0);
+        assert!(
+            mixer.clipper_engaged_count() > 0,
+            "test setup must actually clip"
+        );
+
+        let (out, dropped) = drain_events(&events, 10);
+        assert_eq!(dropped, 0);
+        // `cargo test` はデバッグビルドで走る(既定。§4.6「開発ビルドのみ」に対応する
+        // 判定は `cfg!(debug_assertions)`)。リリースビルド(`cargo test --release`)では
+        // 意図的に発火しないため、このテスト自体もその場合はスキップ相当にする。
+        if cfg!(debug_assertions) {
+            assert!(out.contains(&Event::ClipperEngaged), "got {out:?}");
+        } else {
+            assert!(!out.contains(&Event::ClipperEngaged));
+        }
     }
 }

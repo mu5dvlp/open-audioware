@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use crate::clock::{MusicClockPublisher, RenderedFrameCounter};
 use crate::config::Config;
+use crate::event::EventQueue;
 use crate::format::CHANNELS;
 use crate::mixer::{self, CommandSender, Mixer, ReclaimReceiver};
 use crate::music::MusicState;
@@ -44,8 +45,9 @@ impl Renderer {
     /// 48kHz 等、暫定値を渡しておき、オープン後に [`Renderer::set_sample_rate`] で
     /// 確定させてよい(音声コールバックが動き出す前に呼ぶこと)。
     ///
-    /// 戻り値は `(Renderer, コマンド送信, Arc 回収, 楽曲PCM供給の生産側, 音楽クロックの読み手)`。
-    /// 後ろ2つは `mixer::build` のドキュメント参照(M2-5)。
+    /// 戻り値は `(Renderer, コマンド送信, Arc 回収, 楽曲PCM供給の生産側, 音楽クロックの読み手,
+    /// イベントキューの読み書きハンドル)`。後ろ3つは `mixer::build` のドキュメント参照
+    /// (M2-5, M2-6)。
     pub fn build(
         config: Config,
         sample_rate: u32,
@@ -55,8 +57,9 @@ impl Renderer {
         ReclaimReceiver,
         MusicStreamProducer,
         Arc<MusicClockPublisher>,
+        Arc<EventQueue>,
     ) {
-        let (mixer, sender, reclaim, music_producer, music_clock) =
+        let (mixer, sender, reclaim, music_producer, music_clock, events) =
             mixer::build(config, sample_rate);
         (
             Renderer {
@@ -67,6 +70,7 @@ impl Renderer {
             reclaim,
             music_producer,
             music_clock,
+            events,
         )
     }
 
@@ -135,7 +139,7 @@ mod tests {
     use super::*;
 
     fn renderer_for_test() -> Renderer {
-        let (renderer, _sender, _reclaim, _music_producer, _music_clock) =
+        let (renderer, _sender, _reclaim, _music_producer, _music_clock, _events) =
             Renderer::build(Config::default(), 48_000);
         renderer
     }
@@ -187,7 +191,7 @@ mod tests {
         // `Renderer::build` が返す `Arc<MusicClockPublisher>` は、
         // `Renderer::render`(音声コールバック役)が書き込んだ内容を
         // ゲームスレッド役から直接読める必要がある(M2-5 の核心)。
-        let (mut renderer, _sender, _reclaim, _music_producer, music_clock) =
+        let (mut renderer, _sender, _reclaim, _music_producer, music_clock, _events) =
             Renderer::build(Config::default(), 1_000);
 
         let mut buffer = vec![0.0_f32; 10 * CHANNELS];

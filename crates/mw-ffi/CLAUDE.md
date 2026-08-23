@@ -16,12 +16,21 @@ C ABI 境界。`mw-core` / `mw-backend` 両方に依存する唯一のクレー�
   ハンドルは不透明な `u64`(ポインタを C# に渡さない)。二重 init は同一ハンドルを返す
   (冪等)、無効ハンドルの shutdown はエラーコードで検出する。`Instance` は M1 で
   `mw_core::CommandSender` / `mw_core::ReclaimReceiver` / `mw_core::SoundStorage` /
-  ボイスシリアル採番器(`AtomicU64`)を持つ。
+  ボイスシリアル採番器(`AtomicU64`)を持つ。M2-6 で `Arc<mw_core::EventQueue>`
+  (`events` フィールド)を追加した——`mw_poll_events` がここから `drain` し、
+  `CpalBackend::open` にも同じ `Arc` を渡してストリームのエラー通知経路
+  (非リアルタイムスレッド)から `push_side_channel` させる。
+- `src/event.rs` — `MwEvent`(`#[repr(C)]`、blittable)/ `MwEventKind`(`#[repr(i32)]`)。
+  初期構築仕様『§4.6 イベント通知』の C ABI 表現(M2-6)。`mw_core::Event` からの
+  変換(`MwEvent::from_core`)をここに置く。**csbindgen の入力**(`build.rs` が
+  `ffi.rs`/`result.rs` と一緒にここも読む)——`types.rs` と違い、`MwEvent` は
+  `mw_poll_events` の引数型として実際に extern 関数シグネチャに現れるため、
+  C# 側の型を自動生成させる必要がある。
 - `src/ffi.rs` — `#[unsafe(no_mangle)] pub extern "C" fn mw_*` 本体。
-  **csbindgen の入力**(`build.rs` がここと `result.rs` を読む)。
+  **csbindgen の入力**(`build.rs` がここと `result.rs`/`event.rs` を読む)。
 - `build.rs` — csbindgen で `unity/Runtime/Generated/NativeMethods.g.cs` を生成する。
 
-## 現状の公開 API(M1: SE 再生 / M2-5: ホスト時刻・予約発音)
+## 現状の公開 API(M1: SE 再生 / M2-5: ホスト時刻・予約発音 / M2-6: イベント通知)
 
 ```
 mw_abi_version() -> u32                                          // 定数 1
@@ -49,6 +58,14 @@ mw_music_play_scheduled(handle, host_time_ns: u64) -> MwResult
     // 素通りするだけで実際には鳴らない(楽曲ボイスは Loading のまま繰り下げ続ける)。
     // プリロール未完了時の繰り下げは Rust 内部(`mw_core::Renderer::music_schedule_deferred`)
     // からのみ問い合わせ可能——FFI 公開は後続作業
+
+mw_poll_events(handle, buf: *mut MwEvent, cap: i32, out_dropped: *mut u32) -> i32
+    // 初期構築仕様 §4.6。C → C# のコールバックはしない(M4)——C# 側が毎フレーム
+    // これを呼ぶ想定。戻り値は他の FFI 関数と異なり「書き込んだ件数」(0以上)。
+    // 失敗時のみ他と同じ MwResult の負の値。buf は呼び出し側確保のバッファへ
+    // blittable な MwEvent を直接書き込む(GC アロケーションゼロ)。out_dropped には
+    // キュー(固定容量【仮】64、溢れたら古いものから破棄)が今回のポーリングで
+    // 溢れさせた件数を書く
 ```
 
 すべて非ブロッキング(コマンドをキューへ積むだけ)。キューが満杯の場合は

@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig, SupportedStreamConfig};
-use mw_core::{CHANNELS, Renderer};
+use mw_core::{CHANNELS, Event, EventQueue, Renderer, StreamErrorReason};
 
 use crate::backend::{Backend, BackendError};
 
@@ -39,7 +39,11 @@ impl CpalBackend {
 }
 
 impl Backend for CpalBackend {
-    fn open(&mut self, mut renderer: Renderer) -> Result<(), BackendError> {
+    fn open(
+        &mut self,
+        mut renderer: Renderer,
+        events: Arc<EventQueue>,
+    ) -> Result<(), BackendError> {
         if self.stream.is_some() {
             return Err(BackendError::AlreadyOpen);
         }
@@ -90,6 +94,7 @@ impl Backend for CpalBackend {
             &config,
             renderer,
             Arc::clone(&self.callback_frames),
+            events,
         )?;
         stream
             .play()
@@ -249,12 +254,17 @@ fn build_output_stream(
     config: &StreamConfig,
     mut renderer: Renderer,
     callback_frames: Arc<AtomicU32>,
+    events: Arc<EventQueue>,
 ) -> Result<cpal::Stream, BackendError> {
-    let err_fn = |err: cpal::Error| {
+    let err_fn = move |err: cpal::Error| {
         // 音声スレッドではなく cpal のエラー通知経路から呼ばれる(§5.3 の対象外)。
-        // M0 では標準エラーへ出力するのみ。開発/リリースの出し分けと
-        // `StreamError` イベント化(§4.8, §4.6)は mw-ffi 側の実装(M0 以降)で行う。
+        // ここは音声コールバックそのものとは別スレッドなので、`EventQueue` の
+        // 非リアルタイム経路(`push_side_channel`、内部で `Mutex` を使う)へ積んでよい
+        // (`mw_core::event` モジュール doc「なぜ2系統の書き込み経路があるか」参照)。
         crate::mw_log!("[mw-backend] output stream error: {err}");
+        events.push_side_channel(Event::StreamError {
+            reason: classify_stream_error(&err),
+        });
     };
 
     device
@@ -288,4 +298,23 @@ fn build_output_stream(
             None,
         )
         .map_err(|e| BackendError::BuildStreamFailed(e.to_string()))
+}
+
+/// `cpal::Error` を `mw_core::StreamErrorReason`(初期構築仕様『§4.6』)へ分類する。
+///
+/// cpal 側の `ErrorKind` は `#[non_exhaustive]` かつ詳細度が高い(14種)。C# 側が
+/// 実用的に分岐できる粒度(「デバイスに到達できない」「構成が壊れて再構築が要る」
+/// 「権限が無い」「その他」)へ意図的に丸める——詳細な原因は上の `mw_log!` で
+/// 開発ビルドのログに残るため、イベント側の payload まで cpal 固有の分類を
+/// 持ち込む必要は無いと判断した。
+fn classify_stream_error(err: &cpal::Error) -> StreamErrorReason {
+    use cpal::ErrorKind;
+    match err.kind() {
+        ErrorKind::DeviceNotAvailable | ErrorKind::HostUnavailable | ErrorKind::DeviceBusy => {
+            StreamErrorReason::DeviceUnavailable
+        }
+        ErrorKind::DeviceChanged | ErrorKind::StreamInvalidated => StreamErrorReason::Reconfigured,
+        ErrorKind::PermissionDenied => StreamErrorReason::PermissionDenied,
+        _ => StreamErrorReason::Backend,
+    }
 }

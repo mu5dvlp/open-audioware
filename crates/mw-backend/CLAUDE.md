@@ -6,13 +6,19 @@
 
 ## 現状(M1)
 
-- `backend::Backend` — `open(&mut self, renderer: Renderer)` / `close(&mut self)` /
-  `is_open(&self)`。実装はパニックせず、失敗は必ず `BackendError` で返す。
-  `renderer` は**値渡し(ムーブ)**。`Renderer` はコールバックスレッド専用の排他所有物として
-  ストリームクロージャへムーブされる(M0 時点の `Arc<Renderer>` 共有から変更。
-  `crates/mw-core/src/renderer.rs` のドキュメント参照。ゲームスレッドは
+- `backend::Backend` — `open(&mut self, renderer: Renderer, events: Arc<EventQueue>)` /
+  `close(&mut self)` / `is_open(&self)`。実装はパニックせず、失敗は必ず `BackendError`
+  で返す。`renderer` は**値渡し(ムーブ)**。`Renderer` はコールバックスレッド専用の
+  排他所有物としてストリームクロージャへムーブされる(M0 時点の `Arc<Renderer>` 共有から
+  変更。`crates/mw-core/src/renderer.rs` のドキュメント参照。ゲームスレッドは
   `mw_core::CommandSender` / `mw_core::ReclaimReceiver` という別ハンドル経由でのみ
-  音声スレッドとやり取りする)。
+  音声スレッドとやり取りする)。`events` は初期構築仕様『§4.6 イベント通知』のキュー
+  (M2-6)。`CpalBackend` はこれをストリームのエラー通知経路(`err_fn`、**音声スレッドとは
+  別の**非リアルタイムスレッド)から `push_side_channel` で `StreamError` イベントを積むために
+  使う(`cpal_backend::classify_stream_error` が `cpal::ErrorKind` を
+  `mw_core::StreamErrorReason` へ丸める)。この経路は §5.3 の対象外なので `Mutex` を
+  使ってよい——実際に音声コールバック本体(`build_output_stream` のデータコールバック)
+  から呼ぶのは引き続き `Renderer::render` のみ(下記「設計意図」参照)。
 - `backend::last_callback_frames` / `backend::sample_rate` — オーディオコールバックが実際に
   受け取ったフレーム数と、ネゴシエートされたサンプルレート。**I/O バッファ長の実測値**で、
   iOS の `AVAudioSession` の申告値を裏取りするために使う(`docs/measurement-m1.md` §8.7)。

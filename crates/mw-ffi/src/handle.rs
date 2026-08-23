@@ -12,10 +12,10 @@
 //! サウンドストレージ・ボイスシリアル採番器を追加した(§5.2「コマンド/イベントキュー」)。
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use mw_backend::{Backend, CpalBackend};
-use mw_core::{CommandSender, Config, ReclaimReceiver, Renderer, SoundStorage};
+use mw_core::{CommandSender, Config, EventQueue, ReclaimReceiver, Renderer, SoundStorage};
 
 /// 出力デバイスが実際にオープンされるまでの暫定サンプルレート(§4.7 推奨の 48kHz)。
 /// `CpalBackend::open` がデバイスとネゴシエートした実レートで上書きする
@@ -28,6 +28,11 @@ pub struct Instance {
     pub command_sender: CommandSender,
     pub reclaim_receiver: Mutex<ReclaimReceiver>,
     pub sounds: Mutex<SoundStorage>,
+    /// イベント通知(初期構築仕様『§4.6』)の読み書きハンドル。書き込み・読み出しの
+    /// 両方を1つの型に集約してある(`mw_core::event` モジュール doc 参照)。
+    /// `mw_poll_events`(ゲームスレッド)がここから `drain` し、`CpalBackend` が
+    /// ストリームのエラー通知経路(非リアルタイムスレッド)から `push_side_channel` する。
+    pub events: Arc<EventQueue>,
     next_voice_serial: AtomicU64,
     /// I/O バッファ長の実測ログを既に出したか(1インスタンスにつき1回だけ出す)。
     logged_buffer_info: AtomicBool,
@@ -140,11 +145,13 @@ pub fn init() -> InitOutcome {
     //   まだ無い(初期構築仕様『§4.4』が M4 に位置づけている状態問い合わせ API)。
     //   両方とも `Instance` へ保持する配線は、それぞれの利用側 FFI を実装する
     //   後続作業でまとめて行う。
-    let (renderer, command_sender, reclaim_receiver, _music_stream_producer, _music_clock) =
+    // `events`(イベントキュー)は M2-6 でここから使い始める(`mw_poll_events` と
+    // `CpalBackend::open` の両方へ同じ `Arc` を配る)。
+    let (renderer, command_sender, reclaim_receiver, _music_stream_producer, _music_clock, events) =
         Renderer::build(Config::default(), PROVISIONAL_SAMPLE_RATE);
 
     let mut backend = CpalBackend::new();
-    if let Err(err) = backend.open(renderer) {
+    if let Err(err) = backend.open(renderer, Arc::clone(&events)) {
         // 実機(特に iOS)では失敗理由が分からないと原因を特定できないため、
         // 具体的な BackendError を必ず残す(docs/measurement-m1.md §7.6-1)。
         // MwResult は粒度が粗い(ErrBackendOpenFailed 一種)ので、詳細はこのログが唯一の手がかりになる。
@@ -159,6 +166,7 @@ pub fn init() -> InitOutcome {
         command_sender,
         reclaim_receiver: Mutex::new(reclaim_receiver),
         sounds: Mutex::new(SoundStorage::new()),
+        events,
         next_voice_serial: AtomicU64::new(1),
         logged_buffer_info: AtomicBool::new(false),
     });

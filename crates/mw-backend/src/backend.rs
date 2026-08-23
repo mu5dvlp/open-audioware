@@ -1,8 +1,9 @@
 //! 出力デバイス抽象(初期構築仕様 §5.1: 「将来の oboe / RemoteIO 直叩き実装もここに並べる」)。
 
 use std::fmt;
+use std::sync::Arc;
 
-use mw_core::Renderer;
+use mw_core::{EventQueue, Renderer};
 
 /// `Backend` の操作で発生しうるエラー。
 ///
@@ -57,7 +58,13 @@ pub trait Backend {
     ///
     /// 既に開いている場合は `Err(BackendError::AlreadyOpen)` を返す(パニックしない)。
     /// 冪等性(二重 init の扱い)は呼び出し元の mw-ffi が担う(§4.8)。
-    fn open(&mut self, renderer: Renderer) -> Result<(), BackendError>;
+    ///
+    /// `events` は初期構築仕様『§4.6 イベント通知』のイベントキュー。実装は
+    /// ストリームのエラー通知経路(cpal の `err_fn` 等、**音声スレッドとは別の**
+    /// 非リアルタイムスレッド)から `EventQueue::push_side_channel` で `StreamError`
+    /// イベントを積む(`crate::cpal_backend` の実装を参照)。この経路は §5.3 の
+    /// 対象外(音声スレッドではない)なのでロックを使ってよい。
+    fn open(&mut self, renderer: Renderer, events: Arc<EventQueue>) -> Result<(), BackendError>;
 
     /// ストリームを停止して閉じる。
     ///

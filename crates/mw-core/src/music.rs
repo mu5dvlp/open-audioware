@@ -77,10 +77,12 @@ pub trait MusicFrameSource {
 }
 
 /// `render` 呼び出し1回分の結果(初期構築仕様『§4.4』の世代カウンタ・
-/// 『§4.6』の `MusicEnded`/`MusicLooped` イベントの土台)。
+/// 『§4.6』の `MusicEnded`/`MusicLooped`/`Underrun` イベントの土台)。
 ///
-/// イベント通知そのもの(§4.6)は後続作業。ここでは音声コールバック経路から
-/// アロケーション無しで返せる、素の事実だけを持たせる。
+/// ここでは音声コールバック経路からアロケーション無しで返せる、素の事実だけを持たせる。
+/// この戻り値を実際にイベントへ変換する処理(`mixer.rs::Mixer::render`)は M2-6 で
+/// 実装済み——`ended`/`looped`/`underrun_frames` をそのままイベント化するだけで、
+/// ここに新たな検知ロジックは追加していない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MusicRenderOutcome {
     /// `Playing` として処理したフレーム数(無音のまま抜けた分は含まない)。
@@ -92,6 +94,10 @@ pub struct MusicRenderOutcome {
     pub ended: bool,
     /// ループ区間の終端で開始位置へ折り返した。
     pub looped: bool,
+    /// `looped` が true のときの折り返し先(曲頭からのフレーム位置)。`looped` が
+    /// false のときは常に 0(意味を持たない)。初期構築仕様『§4.6 イベント通知』の
+    /// `MusicLooped` イベントの付随データとして呼び出し側(`mixer.rs`)がそのまま使う。
+    pub loop_restart_frame: u64,
     /// 曲位置が不連続に変化した(シーク・停止確定・ループ折り返し・巻き戻し再開)。
     /// 呼び出し側はこれを見て音楽クロックの世代カウンタ(`clock.rs`)を進める。
     pub discontinuity: bool,
@@ -110,6 +116,14 @@ impl MusicRenderOutcome {
             underrun_frames: self.underrun_frames + other.underrun_frames,
             ended: self.ended || other.ended,
             looped: self.looped || other.looped,
+            // `other` は時系列上 `self` より後(`Mixer::render` が発火前/発火後の
+            // 2回に分けて呼ぶ順序)。両方が looped になることは通常起きないが、
+            // 万一重なった場合は時系列的に後の(=最新の)折り返し位置を優先する。
+            loop_restart_frame: if other.looped {
+                other.loop_restart_frame
+            } else {
+                self.loop_restart_frame
+            },
             discontinuity: self.discontinuity || other.discontinuity,
         }
     }
@@ -503,6 +517,7 @@ impl MusicVoice {
                             let ramp = self.ramp_samples();
                             self.gain.set_target(self.target_volume, ramp);
                             outcome.looped = true;
+                            outcome.loop_restart_frame = restart_at;
                             outcome.discontinuity = true;
                             self.pending_settle = PendingTransition::None;
                             wrapped = true;
@@ -879,6 +894,7 @@ mod tests {
             underrun_frames: 1,
             ended: false,
             looped: false,
+            loop_restart_frame: 0,
             discontinuity: true,
         };
         let b = MusicRenderOutcome {
@@ -886,6 +902,7 @@ mod tests {
             underrun_frames: 2,
             ended: true,
             looped: false,
+            loop_restart_frame: 0,
             discontinuity: false,
         };
         let merged = a.merge(b);
@@ -894,6 +911,45 @@ mod tests {
         assert!(merged.ended);
         assert!(!merged.looped);
         assert!(merged.discontinuity);
+    }
+
+    /// `merge` は「後(=時系列上あと)に looped した側」の折り返し位置を優先する。
+    #[test]
+    fn merge_outcome_prefers_the_later_loop_restart_frame() {
+        let earlier_not_looped = MusicRenderOutcome::default();
+        let later_looped = MusicRenderOutcome {
+            looped: true,
+            loop_restart_frame: 42,
+            ..MusicRenderOutcome::default()
+        };
+        let merged = earlier_not_looped.merge(later_looped);
+        assert!(merged.looped);
+        assert_eq!(merged.loop_restart_frame, 42);
+    }
+
+    /// ループ折り返し時、`MusicRenderOutcome::loop_restart_frame` に折り返し先の
+    /// フレーム位置が正しく反映されること(初期構築仕様『§4.6』の `MusicLooped`
+    /// イベントが使う付随データ)。
+    #[test]
+    fn loop_wrap_reports_the_restart_frame_in_outcome() {
+        let (mut voice, mut source) = playing_voice();
+        source.constant_value = Some(1.0);
+        voice.set_loop(Some((0, 12)));
+
+        let mut restart_frame_seen = None;
+        for _ in 0..20 {
+            let mut buf = vec![0.0; 4 * CHANNELS];
+            let outcome = voice.render(&mut buf, &mut source);
+            if outcome.looped {
+                restart_frame_seen = Some(outcome.loop_restart_frame);
+                break;
+            }
+        }
+        assert_eq!(
+            restart_frame_seen,
+            Some(0),
+            "must report the loop region's start frame"
+        );
     }
 
     #[test]

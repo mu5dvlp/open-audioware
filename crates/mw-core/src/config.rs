@@ -52,6 +52,24 @@ pub struct Config {
     /// `Mixer::se_schedule_overflow_count` で計測できるようにしてある
     /// (`clipper.rs` の動作回数カウントと同じ流儀)。
     pub schedule_queue_capacity: usize,
+    /// イベント通知(初期構築仕様『§4.6 イベント通知』)のキュー容量。【仮】既定 64。
+    ///
+    /// `mw-core::event::EventQueue` の音声スレッド系列・非リアルタイム系列(`StreamError`
+    /// 用)の両方がこの容量を共有する(`event.rs` モジュール doc 参照)。溢れた場合は
+    /// 古いものから破棄し、破棄数をポーリング側へ報告する(黙って落とさない)。
+    pub event_queue_capacity: usize,
+    /// アンダーランの集約報告閾値(フレーム数)。【仮】。
+    ///
+    /// `Mixer::render` は `MusicRenderOutcome::underrun_frames` を毎コールバック
+    /// そのままイベント化せず、連続するコールバックをまたいで蓄積する
+    /// (`mixer.rs::Mixer::report_underrun` 参照)。デコードスレッドの遅延等で
+    /// アンダーランが延々と続くケースを「収まるまで一切報告しない」ままにしないための
+    /// 安全弁として、蓄積量がこの閾値に達したら収まっていなくても一度報告する。
+    /// 既定値 [`Config::DEFAULT_UNDERRUN_REPORT_THRESHOLD_FRAMES`] はサンプルレート
+    /// 非依存の固定フレーム数だが、48kHz 環境を基準に「約1秒ぶん」を選んだ
+    /// (=最悪でも1秒に1回程度しかイベントを積まないため、固定容量64のキューを
+    /// アンダーラン単体で溢れさせることは無い)。
+    pub underrun_report_threshold_frames: u32,
 }
 
 impl Config {
@@ -64,6 +82,10 @@ impl Config {
     pub const DEFAULT_PREROLL_MS: f32 = 100.0;
     /// 【仮】既定値。根拠は [`Config::schedule_queue_capacity`] のドキュメントを参照。
     pub const DEFAULT_SCHEDULE_QUEUE_CAPACITY: usize = 32;
+    /// 【仮】既定値。初期構築仕様『§4.6』が明記する既定値そのもの。
+    pub const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 64;
+    /// 【仮】既定値。根拠は [`Config::underrun_report_threshold_frames`] のドキュメントを参照。
+    pub const DEFAULT_UNDERRUN_REPORT_THRESHOLD_FRAMES: u32 = 48_000;
 }
 
 impl Default for Config {
@@ -80,6 +102,8 @@ impl Default for Config {
             clipper_threshold: Self::DEFAULT_CLIPPER_THRESHOLD,
             preroll_ms: Self::DEFAULT_PREROLL_MS,
             schedule_queue_capacity: Self::DEFAULT_SCHEDULE_QUEUE_CAPACITY,
+            event_queue_capacity: Self::DEFAULT_EVENT_QUEUE_CAPACITY,
+            underrun_report_threshold_frames: Self::DEFAULT_UNDERRUN_REPORT_THRESHOLD_FRAMES,
         }
     }
 }
@@ -96,5 +120,7 @@ mod tests {
         assert!(config.reclaim_queue_capacity > config.max_voices + config.steal_tail_capacity);
         assert_eq!(config.preroll_ms, 100.0);
         assert_eq!(config.schedule_queue_capacity, 32);
+        assert_eq!(config.event_queue_capacity, 64);
+        assert_eq!(config.underrun_report_threshold_frames, 48_000);
     }
 }
