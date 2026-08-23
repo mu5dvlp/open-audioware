@@ -25,7 +25,20 @@
   `BackendError::NoSupportedStreamConfig` を返す(サンプルフォーマット変換は未実装、将来課題)。
   デバイスが実際にネゴシエートしたサンプルレートは、コールバックが動き出す
   (`stream.play()`)前に `Renderer::set_sample_rate` で確定させる(バス/ボイスのランプの
-  ミリ秒→サンプル数換算に必要。初期構築仕様 §4.1)。
+  ミリ秒→サンプル数換算に必要。初期構築仕様 §4.1)。オーディオコールバック内では
+  cpal の `OutputCallbackInfo::timestamp().playback`(`StreamInstant`)を ns 化して
+  `Renderer::render` の `buffer_start_host_time_ns` 引数へ渡す(初期構築仕様『§4.4』の
+  デバイスタイムスタンプ相関、M2-5)。呼ぶのは引き続き `Renderer::render` のみ
+  (下記「設計意図」の制約を参照。`StreamInstant` を読むのは cpal が既に計算済みの
+  構造体を見るだけで、mw-core への別呼び出しを増やしたわけではない)。
+
+- `host_time::host_time_ns` — ホスト単調時刻を ns で返す(初期構築仕様『§4.4』, M2-5)。
+  macOS/iOS/tvOS は `mach_absolute_time` + `mach_timebase_info`、Android(と CI 専用の
+  Linux)は `clock_gettime(CLOCK_MONOTONIC)`。**cpal 0.18.1 の `StreamInstant` を
+  各ホストがどう生成しているかを実装まで確認したうえで、同じ式をそのまま再現している**
+  (調査結果と根拠は `host_time.rs` のモジュール doc に記載済み)。これにより
+  `mw_host_time_ns()`(FFI)が返す値と `OutputCallbackInfo` のデバイスタイムスタンプが
+  直接比較可能になる。`mw-ffi::mw_host_time_ns` がここへ薄く委譲する。
 
 - `ios_session::configure` — iOS / tvOS で AVAudioSession(カテゴリ・希望サンプルレート・
   希望 I/O バッファ長)を設定し、採用された実値をログへ出す。`CpalBackend::open` の冒頭、

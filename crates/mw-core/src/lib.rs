@@ -22,6 +22,7 @@ pub mod music;
 pub mod ramp;
 pub mod renderer;
 pub mod resample;
+mod schedule;
 pub mod sound;
 pub mod stream;
 pub mod voice;
@@ -29,8 +30,8 @@ pub mod wav;
 
 pub use bus::{ALL_BUSES, BUS_COUNT, Bus, BusId, BusSet};
 pub use clipper::SoftClipper;
-pub use clock::RenderedFrameCounter;
-pub use command::Command;
+pub use clock::{MusicClockPublisher, MusicClockSnapshot, RenderedFrameCounter};
+pub use command::{Command, ScheduledSe};
 pub use config::Config;
 pub use decode::{DecodeError, MusicDecoder, SymphoniaDecoder};
 pub use format::{AudioFormat, CHANNELS, Sample};

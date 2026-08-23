@@ -261,15 +261,28 @@ fn build_output_stream(
         .build_output_stream(
             // `StreamConfig` は `Copy`。呼び出し元との共有を避けるため値で渡す。
             *config,
-            move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+            move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
                 // I/O バッファ長の実測用。アトミックストア1回だけで、アロケーション・
                 // ロック・IO をしないためリアルタイム安全性規約(§5.3)に抵触しない。
                 callback_frames.store((data.len() / CHANNELS) as u32, Ordering::Relaxed);
+
+                // このバッファの先頭フレームが実際に DAC から出力される(と cpal が
+                // 予測する)ホスト単調時刻(初期構築仕様『§4.4』の「デバイスのタイムスタンプ
+                // API」に相当)。`StreamInstant::as_nanos()` は `crate::host_time::host_time_ns`
+                // と同じ時計・同じ式で導出されている(`host_time.rs` のモジュール doc に
+                // 調査結果を記載済み)ため、直接比較可能な ns 値としてそのまま渡せる。
+                // `u128 → u64` の切り捨ては現実的な稼働時間では発生しない(u64 ns は
+                // 約584年ぶん表現できる)。
+                let buffer_start_host_time_ns = info.timestamp().playback.as_nanos() as u64;
+
                 // ここが音声スレッド上のオーディオコールバック本体。`renderer` はこの
                 // クロージャへムーブ済みで、以後は音声スレッドの単一の書き手が
-                // `&mut` で触るだけ(ロックも `Arc` 共有も無い。§5.3)。
+                // `&mut` で触るだけ(ロックも `Arc` 共有も無い。§5.3)。呼ぶのは
+                // `Renderer::render` のみに保つ(`crates/mw-backend/CLAUDE.md` の設計意図。
+                // 上の2行は cpal が既に計算済みの構造体を読むだけで、mw-core の別関数を
+                // 追加で呼んではいない)。
                 // `Renderer::render` はリアルタイム安全性規約(§5.3)を満たす実装である前提。
-                renderer.render(data);
+                renderer.render(data, buffer_start_host_time_ns);
             },
             err_fn,
             None,

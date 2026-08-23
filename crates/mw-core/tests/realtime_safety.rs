@@ -14,7 +14,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use mw_core::{CHANNELS, Command, Config, Renderer, SoundData};
+use mw_core::{CHANNELS, Command, Config, Renderer, ScheduledSe, SoundData};
 
 struct CountingAllocator;
 
@@ -67,7 +67,8 @@ fn constant_sound(frames: usize, value: f32) -> Arc<SoundData> {
 fn render_path_never_allocates_or_deallocates() {
     let config = Config::default();
     let max_voices = config.max_voices;
-    let (mut renderer, sender, mut reclaim) = Renderer::build(config, 48_000);
+    let (mut renderer, sender, mut reclaim, _music_producer, _music_clock) =
+        Renderer::build(config, 48_000);
 
     // ボイスプールを満杯にし、さらに追加でスティールを誘発する(セットアップ段階。
     // ここでのアロケーションはトラッキング対象外)。
@@ -99,11 +100,55 @@ fn render_path_never_allocates_or_deallocates() {
         ms: 50.0,
     }));
 
-    let mut buffer = vec![0.0f32; 512 * CHANNELS];
+    let buffer_frames = 512u64;
+    let sample_rate = 48_000u64;
+    // 512フレーム@48kHz のバッファ長(ns)。M2-5: `Mixer::render` へ渡すホスト時刻を
+    // コールバックごとに実バッファ長ぶん進め、実運用に近い形にする。
+    let buffer_duration_ns = buffer_frames * 1_000_000_000 / sample_rate;
+
+    // M2-5: 予約発音のソート済みキュー(`ScheduleQueue::try_insert`/`pop_front`)への
+    // 挿入・取り出しも音声コールバック経路(`Mixer::apply_command`/`fire_due_se`)で
+    // 起こるため、ここで検証対象に含める。過去(即時発音)・ループ序盤・ループ終盤の
+    // 3パターンを混ぜ、挿入されたまま「未来」で残るものと実際に発火するものの両方の
+    // 経路を通す。
+    assert!(sender.send(Command::SeSchedule {
+        host_time_ns: 0, // 既に過去 = 最初のコールバックの先頭で即時発音
+        entry: ScheduledSe {
+            voice_serial: 9_001,
+            sound_id: 9_001,
+            sound: constant_sound(64, 0.3),
+            bus: mw_core::BusId::Se,
+            volume: 1.0,
+        },
+    }));
+    assert!(sender.send(Command::SeSchedule {
+        host_time_ns: buffer_duration_ns * 50 + 3, // 途中のコールバックのバッファ内で発火
+        entry: ScheduledSe {
+            voice_serial: 9_002,
+            sound_id: 9_002,
+            sound: constant_sound(64, 0.3),
+            bus: mw_core::BusId::Se,
+            volume: 1.0,
+        },
+    }));
+    assert!(sender.send(Command::SeSchedule {
+        host_time_ns: buffer_duration_ns * 1_000, // ループが終わるまで発火せず残る
+        entry: ScheduledSe {
+            voice_serial: 9_003,
+            sound_id: 9_003,
+            sound: constant_sound(64, 0.3),
+            bus: mw_core::BusId::Se,
+            volume: 1.0,
+        },
+    }));
+
+    let mut buffer = vec![0.0f32; buffer_frames as usize * CHANNELS];
 
     TRACKING.store(true, Ordering::SeqCst);
+    let mut host_time_ns = 0u64;
     for _ in 0..200 {
-        renderer.render(&mut buffer);
+        renderer.render(&mut buffer, host_time_ns);
+        host_time_ns += buffer_duration_ns;
     }
     TRACKING.store(false, Ordering::SeqCst);
 

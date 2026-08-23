@@ -128,7 +128,19 @@ pub fn init() -> InitOutcome {
         return InitOutcome::AlreadyOpen(instance.handle);
     }
 
-    let (renderer, command_sender, reclaim_receiver) =
+    // `music_stream_producer`(楽曲PCM供給の生産側)と `_music_clock`(音楽クロックの
+    // 読み手)は M2-5 時点ではまだ使い道が無いため、ここで破棄する。
+    // - `music_stream_producer` を実際に駆動するデコードスレッドはまだ無い
+    //   (楽曲ロード API `mw_music_set` 自体が未実装。M2-5 のスコープ外)。
+    //   誰も `pump` しないぶん楽曲ボイスは `MusicState::Loading` のまま
+    //   ——「まだロードする手段が無い」という現状を正直に反映しているだけで、
+    //   欺瞞ではない。`rtrb` の `Producer`/`Consumer` は片方を先に drop しても安全
+    //   (`Mixer` 側が保持する `Consumer` は無害に「供給が来ない」状態になるだけ)。
+    // - `Arc<MusicClockPublisher>` を読む FFI(`mw_music_get_position` 相当)は
+    //   まだ無い(初期構築仕様『§4.4』が M4 に位置づけている状態問い合わせ API)。
+    //   両方とも `Instance` へ保持する配線は、それぞれの利用側 FFI を実装する
+    //   後続作業でまとめて行う。
+    let (renderer, command_sender, reclaim_receiver, _music_stream_producer, _music_clock) =
         Renderer::build(Config::default(), PROVISIONAL_SAMPLE_RATE);
 
     let mut backend = CpalBackend::new();

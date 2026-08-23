@@ -21,24 +21,34 @@ C ABI 境界。`mw-core` / `mw-backend` 両方に依存する唯一のクレー�
   **csbindgen の入力**(`build.rs` がここと `result.rs` を読む)。
 - `build.rs` — csbindgen で `unity/Runtime/Generated/NativeMethods.g.cs` を生成する。
 
-## 現状の公開 API(M1: SE 再生)
+## 現状の公開 API(M1: SE 再生 / M2-5: ホスト時刻・予約発音)
 
 ```
 mw_abi_version() -> u32                                          // 定数 1
+mw_host_time_ns() -> u64                                          // ホスト単調時刻(ns)。ハンドル不要
 mw_init(out_handle: *mut u64) -> MwResult                        // 冪等。既定出力デバイスにストリームを開く
 mw_shutdown(handle: u64) -> MwResult                              // 冪等ではない(無効ハンドルはエラー)。ストリームを閉じる
 
 mw_sound_load(handle, bytes: *const u8, len: usize, mode: i32, out_id: *mut u64) -> MwResult
-    // mode=0(SE)のみ実装。mode=1(Music)は ErrUnsupportedSoundMode(M2 で実装)
+    // mode=0(SE)のみ実装。mode=1(Music)は ErrUnsupportedSoundMode(楽曲ロード API は未実装)
 mw_sound_release(handle, id: u64) -> MwResult
     // 再生中ボイスがあれば既定ランプ経由で即停止させたうえで解放する
 
 mw_se_play(handle, id: u64, bus: i32, volume: f32, out_voice: *mut u64) -> MwResult
     // 次のオーディオコールバックで必ず発音される(初期構築仕様 §4.2)
+mw_se_schedule(handle, id: u64, bus: i32, volume: f32, host_time_ns: u64, out_voice: *mut u64) -> MwResult
+    // サンプル精度の予約発音(初期構築仕様 §4.5)。バッファ内オフセットへの丸めはしない。
+    // 予約時刻が過去ならそのバッファの先頭で即座に発音する(取りこぼさない)
 mw_voice_stop(handle, voice: u64) -> MwResult                     // 既定ランプ経由
 mw_voice_set_volume(handle, voice: u64, volume: f32) -> MwResult  // 既定ランプ経由
 mw_bus_set_volume(handle, bus: i32, volume: f32) -> MwResult      // 既定ランプ経由
 mw_bus_fade(handle, bus: i32, target: f32, ms: f32) -> MwResult   // 呼び出し側指定の時間
+
+mw_music_play_scheduled(handle, host_time_ns: u64) -> MwResult
+    // 楽曲の予約再生(初期構築仕様 §4.3)。楽曲ロード API がまだ無いため、現状はコマンドが
+    // 素通りするだけで実際には鳴らない(楽曲ボイスは Loading のまま繰り下げ続ける)。
+    // プリロール未完了時の繰り下げは Rust 内部(`mw_core::Renderer::music_schedule_deferred`)
+    // からのみ問い合わせ可能——FFI 公開は後続作業
 ```
 
 すべて非ブロッキング(コマンドをキューへ積むだけ)。キューが満杯の場合は

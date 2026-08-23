@@ -360,6 +360,8 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "jni",
+ "libc",
+ "mach2 0.6.0",
  "mw-core",
  "ndk-context",
  "objc2-avf-audio",

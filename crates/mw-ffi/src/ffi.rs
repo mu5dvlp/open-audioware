@@ -27,6 +27,23 @@ pub extern "C" fn mw_abi_version() -> u32 {
     ABI_VERSION
 }
 
+/// ホスト単調時刻をナノ秒で取得する(初期構築仕様『§4.4 音楽クロック』, M2-5)。
+///
+/// C# 側は起動時にこの値と `Time.realtimeSinceStartupAsDouble` を1回ずつサンプリングし、
+/// その差を定数オフセットとして保持することで両者を橋渡しする
+/// (`mw_backend::host_time` のモジュール doc に、どの時計を使ったか・
+/// `cpal::OutputCallbackInfo` のデバイスタイムスタンプと直接比較できることの
+/// 調査結果を記載してある)。`mw_se_schedule` / `mw_music_play_scheduled` の
+/// `host_time_ns` 引数はこの関数と同じ時計の値を渡すこと。
+///
+/// ハンドル不要(`mw_init` 前でも呼べる)。GC アロケーションゼロ(初期構築仕様 §5.4)。
+/// アロケーション・ロック・パニック経路を持たないため `catch_unwind` で包んでいない
+/// (`mw_abi_version` と同じ扱い)。
+#[unsafe(no_mangle)]
+pub extern "C" fn mw_host_time_ns() -> u64 {
+    mw_backend::host_time_ns()
+}
+
 /// ミドルウェアを初期化し、既定の出力デバイスにストリームを開いて再生を開始する。
 ///
 /// 冪等: 既に初期化済みの場合は同一ハンドルを `out_handle` に書き `MwResult::Ok` を返す
@@ -350,6 +367,84 @@ pub unsafe extern "C" fn mw_se_play(
     }
 }
 
+/// SE をサンプル精度で予約発音する(初期構築仕様『§4.5 スケジュール発音』, M2-5)。
+///
+/// 用途はメトロノームとキャリブレーション用クリック。`host_time_ns` は
+/// `mw_host_time_ns()` と同じ時計の値を渡すこと。該当バッファのレンダリング時に
+/// **バッファ内オフセットサンプル位置**から発音する(バッファ境界への丸めはしない)。
+///
+/// 予約時刻が既に過去(処理される時点でバッファ先頭より前)の場合は、取りこぼして
+/// 無音にするのではなく、発見可能な最速のサンプル(そのバッファの先頭)で
+/// 即座に発音する。
+///
+/// 予約キューは固定容量(`Config::schedule_queue_capacity`)。この呼び出し自体は
+/// コマンドキューへ積めた時点で成功を返すが、音声スレッドが実際に予約キューへ
+/// 挿入する段階で満杯だった場合は**その予約は発音されない**
+/// (`mw_core::Renderer::se_schedule_overflow_count` で検知できる。イベント通知への
+/// 昇格は M2-6 以降)。
+///
+/// # Safety
+/// `out_voice` は書き込み可能な `u64` を指す有効なポインタであるか、null でなければならない。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mw_se_schedule(
+    handle: u64,
+    id: u64,
+    bus: i32,
+    volume: f32,
+    host_time_ns: u64,
+    out_voice: *mut u64,
+) -> MwResult {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        if out_voice.is_null() {
+            return MwResult::ErrNullPointer;
+        }
+        let Some(bus) = MwBus::from_raw(bus) else {
+            return MwResult::ErrInvalidBus;
+        };
+
+        let result = handle_registry::with_instance(handle, |instance| {
+            instance.drain_reclaimed();
+            let sound = {
+                let sounds = instance
+                    .sounds
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                sounds.get(mw_core::SoundId(id))
+            };
+            let Some(sound) = sound else {
+                return MwResult::ErrInvalidSoundId;
+            };
+
+            let voice_serial = instance.next_voice_serial();
+            let sent = instance.command_sender.send(mw_core::Command::SeSchedule {
+                host_time_ns,
+                entry: mw_core::ScheduledSe {
+                    voice_serial,
+                    sound_id: id,
+                    sound,
+                    bus: bus.to_core(),
+                    volume,
+                },
+            });
+            if sent {
+                // SAFETY: 上で null チェック済み。
+                unsafe {
+                    *out_voice = voice_serial;
+                }
+                MwResult::Ok
+            } else {
+                MwResult::ErrCommandQueueFull
+            }
+        });
+        result.unwrap_or(MwResult::ErrInvalidHandle)
+    }));
+
+    match outcome {
+        Ok(result) => result,
+        Err(_) => MwResult::ErrPanic,
+    }
+}
+
 /// ボイスを停止する(既定ランプ経由。初期構築仕様 M13/§4.2)。
 ///
 /// 無効・既に終了したボイス ID はコマンドとして送出されるが、音声スレッド側で
@@ -450,6 +545,41 @@ pub extern "C" fn mw_bus_fade(handle: u64, bus: i32, target: f32, ms: f32) -> Mw
                 target,
                 ms,
             });
+            if sent {
+                MwResult::Ok
+            } else {
+                MwResult::ErrCommandQueueFull
+            }
+        });
+        result.unwrap_or(MwResult::ErrInvalidHandle)
+    }));
+
+    match outcome {
+        Ok(result) => result,
+        Err(_) => MwResult::ErrPanic,
+    }
+}
+
+/// 楽曲を予約再生する(初期構築仕様『§4.3 楽曲再生』, M2-5)。
+///
+/// 指定ホスト時刻にサンプル境界で発音する(`host_time_ns` は `mw_host_time_ns()` と
+/// 同じ時計の値を渡すこと)。プリロール完了前(準備中)に予約時刻が到来した場合は
+/// エラーにせず、「準備完了後、可能な最速時刻」へ繰り下げる 【仮】。繰り下げが発生したかは
+/// 現時点では Rust 内部(`mw_core::Renderer::music_schedule_deferred`)からのみ
+/// 確認できる——FFI 公開・イベント通知への昇格は後続作業(M2-6 以降)。
+///
+/// 楽曲のロード API(`mw_music_set` 相当)はまだ実装していない(M2-5 のスコープ外)ため、
+/// 現状はこの呼び出しだけでは実際に音は鳴らない(楽曲ボイスが `Loading` のまま予約が
+/// 繰り下げられ続ける)。予約発火の仕組み自体は `mw-core` のオフラインレンダリング
+/// テストで検証済み。
+#[unsafe(no_mangle)]
+pub extern "C" fn mw_music_play_scheduled(handle: u64, host_time_ns: u64) -> MwResult {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        let result = handle_registry::with_instance(handle, |instance| {
+            instance.drain_reclaimed();
+            let sent = instance
+                .command_sender
+                .send(mw_core::Command::MusicPlayScheduled { host_time_ns });
             if sent {
                 MwResult::Ok
             } else {
@@ -573,6 +703,29 @@ mod tests {
         };
         assert_eq!(play_result, MwResult::Ok);
         assert_ne!(voice_id, 0);
+
+        // M2-5: 予約発音(サンプル精度の詳細な数値検証は mw-core 側のオフライン
+        // レンダリングテストで行う。ここでは実ハンドル越しにコマンドが素通りすること
+        // だけを確認する)。
+        let mut scheduled_voice_id = 0u64;
+        let schedule_result = unsafe {
+            mw_se_schedule(
+                handle,
+                sound_id,
+                2, // MwBus::Se
+                1.0,
+                mw_host_time_ns(), // 「今」= 発見可能な最速のサンプルで即座に発音される
+                &mut scheduled_voice_id as *mut u64,
+            )
+        };
+        assert_eq!(schedule_result, MwResult::Ok);
+        assert_ne!(scheduled_voice_id, 0);
+
+        assert_eq!(
+            mw_music_play_scheduled(handle, mw_host_time_ns()),
+            MwResult::Ok,
+            "the command must be accepted even though no music has been loaded yet"
+        );
 
         assert_eq!(mw_voice_set_volume(handle, voice_id, 0.5), MwResult::Ok);
         assert_eq!(mw_voice_stop(handle, voice_id), MwResult::Ok);
@@ -723,6 +876,44 @@ mod tests {
         // ハンドル自体が無効な場合は先にハンドル検証で弾かれる。
         assert_eq!(
             mw_sound_release(0xDEAD_BEEF_u64, 1),
+            MwResult::ErrInvalidHandle
+        );
+    }
+
+    // --- M2-5: ホスト単調時刻 / 予約発音 --------------------------------------
+
+    #[test]
+    fn host_time_ns_is_monotonically_non_decreasing_across_ffi_boundary() {
+        let a = mw_host_time_ns();
+        let b = mw_host_time_ns();
+        assert!(b >= a, "a={a}, b={b}");
+    }
+
+    #[test]
+    fn se_schedule_rejects_invalid_bus() {
+        let mut out_voice = 0u64;
+        let result = unsafe { mw_se_schedule(1, 1, 99, 1.0, 0, &mut out_voice as *mut u64) };
+        assert_eq!(result, MwResult::ErrInvalidBus);
+    }
+
+    #[test]
+    fn se_schedule_rejects_null_out_voice() {
+        let result = unsafe { mw_se_schedule(1, 1, 0, 1.0, 0, std::ptr::null_mut()) };
+        assert_eq!(result, MwResult::ErrNullPointer);
+    }
+
+    #[test]
+    fn se_schedule_with_invalid_handle_is_invalid_handle_not_a_crash() {
+        let mut out_voice = 0u64;
+        let result =
+            unsafe { mw_se_schedule(0xDEAD_BEEF_u64, 1, 0, 1.0, 0, &mut out_voice as *mut u64) };
+        assert_eq!(result, MwResult::ErrInvalidHandle);
+    }
+
+    #[test]
+    fn music_play_scheduled_with_invalid_handle_is_invalid_handle_not_a_crash() {
+        assert_eq!(
+            mw_music_play_scheduled(0xDEAD_BEEF_u64, 0),
             MwResult::ErrInvalidHandle
         );
     }

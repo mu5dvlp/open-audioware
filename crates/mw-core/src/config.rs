@@ -39,6 +39,19 @@ pub struct Config {
     /// 選曲プレビュー等での体感開始遅延としても許容できる範囲として選んだ。
     /// 実測(M2 後半のドリフト・アンダーラン計測)で見直す。
     pub preroll_ms: f32,
+    /// 予約発音(初期構築仕様『§4.5 スケジュール発音』)のソート済みキュー容量。【仮】。
+    ///
+    /// 対象は SE 予約(`mw_se_schedule`)専用(楽曲側は同時に1本しかないため単一スロットで
+    /// 足り、キューを持たない。`mixer.rs::MusicSchedule` 参照)。既定値
+    /// [`Config::DEFAULT_SCHEDULE_QUEUE_CAPACITY`] の根拠: 用途はメトロノーム/
+    /// キャリブレーション用クリックのみ(初期構築仕様『§4.5』)で、ゲーム側は
+    /// 通常「次の数拍ぶん」を先行してまとめて予約する程度(例: 4/4 拍子で8小節分でも
+    /// 32 発)を想定している。それでもキューの実体は `(u64, ScheduledSe)` を並べた
+    /// 固定長 `Vec` に過ぎず 32 件でも数百バイト程度なので、余裕を持たせても
+    /// メモリ的な負担にはならない。溢れた場合は黙って捨てず
+    /// `Mixer::se_schedule_overflow_count` で計測できるようにしてある
+    /// (`clipper.rs` の動作回数カウントと同じ流儀)。
+    pub schedule_queue_capacity: usize,
 }
 
 impl Config {
@@ -49,6 +62,8 @@ impl Config {
     pub const DEFAULT_CLIPPER_THRESHOLD: f32 = 1.0;
     /// 【仮】既定値。根拠は [`Config::preroll_ms`] のドキュメントを参照。
     pub const DEFAULT_PREROLL_MS: f32 = 100.0;
+    /// 【仮】既定値。根拠は [`Config::schedule_queue_capacity`] のドキュメントを参照。
+    pub const DEFAULT_SCHEDULE_QUEUE_CAPACITY: usize = 32;
 }
 
 impl Default for Config {
@@ -64,6 +79,7 @@ impl Default for Config {
             reclaim_queue_capacity: (max_voices + steal_tail_capacity) * 2,
             clipper_threshold: Self::DEFAULT_CLIPPER_THRESHOLD,
             preroll_ms: Self::DEFAULT_PREROLL_MS,
+            schedule_queue_capacity: Self::DEFAULT_SCHEDULE_QUEUE_CAPACITY,
         }
     }
 }
@@ -79,5 +95,6 @@ mod tests {
         assert_eq!(config.default_ramp_ms, 5.0);
         assert!(config.reclaim_queue_capacity > config.max_voices + config.steal_tail_capacity);
         assert_eq!(config.preroll_ms, 100.0);
+        assert_eq!(config.schedule_queue_capacity, 32);
     }
 }

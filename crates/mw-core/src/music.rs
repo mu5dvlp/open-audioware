@@ -97,6 +97,24 @@ pub struct MusicRenderOutcome {
     pub discontinuity: bool,
 }
 
+impl MusicRenderOutcome {
+    /// 2回に分けた [`MusicVoice::render`] 呼び出しの結果を1つにまとめる。
+    ///
+    /// 予約再生(初期構築仕様『§4.5』, M2-5)がバッファの途中サンプルで発火する場合、
+    /// `Mixer::render` は「発火前(無音のまま)」「`play()` 呼び出し」「発火後」の
+    /// 2回の `render` 呼び出しに分けてサンプル精度の開始位置を実現する。
+    /// 各フィールドの結合はどちらを先に渡しても結果は変わらない(加算 or 論理和)。
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            rendered_frames: self.rendered_frames + other.rendered_frames,
+            underrun_frames: self.underrun_frames + other.underrun_frames,
+            ended: self.ended || other.ended,
+            looped: self.looped || other.looped,
+            discontinuity: self.discontinuity || other.discontinuity,
+        }
+    }
+}
+
 /// ランプ収束後に実行する保留アクション(初期構築仕様 M13 の「変化と停止はランプを通す」を
 /// 状態機械として表現したもの)。`pause`/`stop`/ループ折り返しはいずれも
 /// 「まずゲインを 0 へ向けてランプし、収束したら実際の遷移を行う」という同じ形をしている
@@ -852,6 +870,30 @@ mod tests {
             (last - 0.25).abs() < 1e-6,
             "must fade in to the newly set volume"
         );
+    }
+
+    #[test]
+    fn merge_outcome_sums_counts_and_ors_flags() {
+        let a = MusicRenderOutcome {
+            rendered_frames: 10,
+            underrun_frames: 1,
+            ended: false,
+            looped: false,
+            discontinuity: true,
+        };
+        let b = MusicRenderOutcome {
+            rendered_frames: 20,
+            underrun_frames: 2,
+            ended: true,
+            looped: false,
+            discontinuity: false,
+        };
+        let merged = a.merge(b);
+        assert_eq!(merged.rendered_frames, 30);
+        assert_eq!(merged.underrun_frames, 3);
+        assert!(merged.ended);
+        assert!(!merged.looped);
+        assert!(merged.discontinuity);
     }
 
     #[test]

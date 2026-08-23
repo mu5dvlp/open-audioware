@@ -21,6 +21,19 @@ version = "0.3"
 features = ["std", "AVAudioSession", "AVAudioSessionTypes"]
 default-features = false
 
+# `host_time::host_time_ns`(初期構築仕様『§4.4』)が `mach_absolute_time` /
+# `mach_timebase_info` を cpal 0.18.1 の CoreAudio 実装(`host_time_to_stream_instant`)と
+# 完全に同じ式で呼ぶために使う。cpal 自身が macOS/iOS/tvOS で `mach2 0.6` に依存済みなので
+# (`Cargo.lock` で確認済み)、バージョンを揃えてある限り依存ツリーは増えない。
+[target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))'.dependencies]
+mach2 = "0.6"
+
+# `host_time::host_time_ns` が `clock_gettime(CLOCK_MONOTONIC)` を呼ぶために使う
+# (Android / Linux。cpal の AAudio 実装〔`now_stream_instant`〕と同じ式)。
+# `libc` は cpal 自身も依存しているクレートなので、依存ツリーは増えない。
+[target.'cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))'.dependencies]
+libc = "0.2"
+
 # Android では cpal(AAudio 実装)が Java 側の AudioManager を参照するため、
 # JavaVM / Context を ndk_context へ登録する必要がある(src/android_context.rs 参照)。
 # どちらも cpal 0.18 の Android 実装が既に依存しているクレートなので、依存ツリーは増えない。

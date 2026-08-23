@@ -10,6 +10,21 @@ use std::sync::Arc;
 use crate::bus::BusId;
 use crate::sound::SoundData;
 
+/// 予約 SE 1件分のペイロード(初期構築仕様『§4.5 スケジュール発音』)。
+///
+/// `Command::PlaySe` と同じ形の発音パラメータに、キュー内で時刻順を保つための
+/// `host_time_ns` を除いたものを持たせただけ(時刻自体は `Command::SeSchedule` /
+/// `crate::schedule::ScheduleQueue` のキー側で保持する)。
+#[derive(Debug)]
+pub struct ScheduledSe {
+    pub voice_serial: u64,
+    /// `SoundStorage` が払い出した不透明 ID(`StopVoicesUsingSound` の照合キー)。
+    pub sound_id: u64,
+    pub sound: Arc<SoundData>,
+    pub bus: BusId,
+    pub volume: f32,
+}
+
 /// 音声スレッドへ送るコマンド。
 ///
 /// `Command` 自体および内部の `Arc<SoundData>` の複製(clone、参照カウント増加のみ)は
@@ -43,4 +58,22 @@ pub enum Command {
     SetBusVolume { bus: BusId, volume: f32 },
     /// バスをフェードする(呼び出し側指定の時間、ms)。
     BusFade { bus: BusId, target: f32, ms: f32 },
+    /// SE をサンプル精度で予約発音する(初期構築仕様『§4.5 スケジュール発音』, M2-5)。
+    /// 用途はメトロノームとキャリブレーション用クリック。`Mixer` はこれをソート済み
+    /// キューへ挿入し、該当バッファのレンダリング時にバッファ内オフセットサンプル位置
+    /// から発音する(バッファ境界への丸めはしない)。
+    SeSchedule {
+        host_time_ns: u64,
+        entry: ScheduledSe,
+    },
+    /// 楽曲を予約再生する(初期構築仕様『§4.3 楽曲再生』, M2-5)。
+    ///
+    /// プリロール完了前(`MusicState::Loading`)に予約時刻が到来した場合はエラーにせず、
+    /// 「準備完了後、可能な最速時刻」へ繰り下げる 【仮】(`mixer.rs::MusicSchedule` 参照)。
+    MusicPlayScheduled { host_time_ns: u64 },
+    /// 楽曲ボイスをシークする(内部配線専用。初期構築仕様『§4.3』の `mw_music_seek` に
+    /// 相当するが、M2-5 時点では FFI には未公開——楽曲制御 API 全体の公開は後続作業。
+    /// ここでは音楽クロックの世代カウンタ(§4.4)が不連続で正しく進むことをオフライン
+    /// テストで検証するための最小の配線として用意した)。
+    MusicSeek { frames: u64 },
 }

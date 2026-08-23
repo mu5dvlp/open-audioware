@@ -11,11 +11,32 @@ OS 非依存・デバイス非依存のコア。ミキサ、ボイス管理、�
 
 - `format`: 内部ミックスフォーマット定義。f32 ステレオ固定(`CHANNELS = 2`)、
   サンプルレートは出力デバイスに追従(将来変わりうる前提は `AudioFormat` に閉じ込めてある)。
-- `clock`: `RenderedFrameCounter` — 音声コールバックが送出したフレーム数を数える
-  `AtomicU64` カウンタ。音楽クロック(§4.4)の土台。デバイスタイムスタンプとの相関・
-  世代カウンタ・seqlock スナップショットは未実装(M2/M4)。
-- `config`: `Config` — 【仮】既定値(ボイス数 64、既定ランプ 5ms、キュー容量等)を1箇所に
-  集約する設定構造体。`mw_init(config)` からの実行時上書きは未実装(M1 は既定値のみ)。
+- `clock`: `RenderedFrameCounter`(音声コールバックが送出したフレーム数を数える
+  `AtomicU64` カウンタ)と `MusicClockPublisher`(§4.4 の心臓部。曲位置 × ホスト単調時刻の
+  相関点・世代カウンタ・is_playing を seqlock で公開する。書き手は音声スレッドの
+  `Mixer::render` のみ、読み手はロック無しで任意スレッドから `snapshot()` できる。
+  Release/Acquire が片方向の制約にしかならない理由は `write`/`snapshot` のコメントに
+  必ず残してある——読み飛ばして単純な `Ordering::Release`/`Acquire` ロードに戻さないこと)。
+  `mixer::build` が返す `Arc<MusicClockPublisher>` を経由してゲームスレッド側へ渡す(M2-5)。
+- `schedule`: 予約発音(§4.5)のソート済みキュー `ScheduleQueue<T>` と、
+  ホスト時刻→バッファ内オフセットの変換(`offset_within_buffer`。切り捨て、
+  丸め方向の根拠はモジュール doc を参照)。SE 予約はここのキューに、楽曲の予約再生は
+  単一スロット(`mixer.rs::MusicSchedule`)に積む(楽曲ボイスは同時に1本なので
+  キューが要らない)。`Mixer::render` から呼ばれるため固定容量・アロケーション無し(M2-5)。
+- `music` / `stream`: `MusicVoice`(唯一の楽曲ボイス。状態機械は `Loading`/`Ready`/
+  `Playing`/`Paused`、M2-2)と、その PCM 供給元 `StreamingMusicSource`/
+  `MusicStreamProducer`(SPSC リングバッファ越しのストリーミングデコード連携。
+  シークはエポック ack 方式で調停する、M2-3)。M2-5 で `Mixer` へ実際に組み込んだ
+  (`Mixer::render` が毎コールバック `MusicVoice::render` を呼ぶ)。デコードスレッドを
+  起動して `MusicStreamProducer::pump` を回す側(mw-ffi の後続作業)と、
+  楽曲ロード FFI(`mw_music_set` 相当)はまだ無い——`mixer::build` は内部で
+  `stream::channel` を組み立てて返すが、誰も `pump` しない限り楽曲ボイスは
+  `Loading` のまま(M2-5 時点の正直な現状)。
+- `decode`: `MusicDecoder`/`SymphoniaDecoder` — wav / ogg vorbis のストリーミングデコード
+  (§4.7, M2-3)。`stream.rs::MusicStreamProducer::pump` から呼ばれる。
+- `config`: `Config` — 【仮】既定値(ボイス数 64、既定ランプ 5ms、キュー容量、
+  予約発音キュー容量32等)を1箇所に集約する設定構造体。`mw_init(config)` からの
+  実行時上書きは未実装(既定値のみ)。
 - `ramp`: `Ramp` — サンプル単位の線形ランプ。全ての音量変化・停止がこれを経由する(M13)。
   `advance()` は音声コールバックのホットパスから呼ばれる(`Iterator::next` と紛らわしいため
   意図的に別名にしてある)。`ms_to_samples` でミリ秒→サンプル数を変換する。
@@ -44,12 +65,19 @@ OS 非依存・デバイス非依存のコア。ミキサ、ボイス管理、�
   必ずランプを経由し、自然終了(PCM 終端到達)はランプ不要としてただちに回収する。
 - `command`: `Command` — ゲームスレッド→音声スレッドのコマンド列挙
   (`PlaySe` / `StopVoice` / `SetVoiceVolume` / `StopVoicesUsingSound` /
-  `SetBusVolume` / `BusFade`)。
-- `mixer`: `Mixer::render` — 「コマンド消化 → アクティブボイス合算 → バス音量 → Master →
-  クリッパ」(§4.1)。`mixer::build(config, sample_rate)` が `Mixer` と2つのゲームスレッド側
-  ハンドル(`CommandSender` / `ReclaimReceiver`)を返す。
+  `SetBusVolume` / `BusFade` / `SeSchedule` / `MusicPlayScheduled` / `MusicSeek`)。
+  後ろ3つは M2-5 追加(予約発音・楽曲予約再生。`MusicSeek` は楽曲制御 API 全体の
+  公開〔M2-6 以降〕を待たずに世代カウンタの不連続をテストで検証するための内部配線)。
+- `mixer`: `Mixer::render(output, buffer_start_host_time_ns)` — 「コマンド消化 →
+  楽曲ボイスのレンダリング(予約発火があればサンプル精度で分割) → アクティブ SE ボイス
+  合算 + 楽曲の Bgm バス適用 → Master → クリッパ → 音楽クロックの相関点を公開」(§4.1/§4.4)。
+  `mixer::build(config, sample_rate)` が `Mixer` とゲームスレッド側ハンドル一式
+  (`CommandSender` / `ReclaimReceiver` / `MusicStreamProducer` / `Arc<MusicClockPublisher>`)
+  を返す。`buffer_start_host_time_ns` はこのバッファの先頭フレームが実際に DAC から
+  出力される(と予測される)ホスト単調時刻——`mw-backend` が cpal の
+  `OutputCallbackInfo::timestamp().playback` から求めて渡す(M2-5)。
 - `renderer`: `Renderer` — `Mixer` を包み、レンダリング済みフレーム数を数える最上位型。
-  `Renderer::build` が `mixer::build` を呼ぶ薄いラッパ。
+  `Renderer::build` が `mixer::build` を呼ぶ薄いラッパ(戻り値もそのまま中継する)。
 
 ## 所有権モデル(M1 で確定させた設計)
 
@@ -102,9 +130,9 @@ M0 では `Arc<Renderer>` をゲームスレッドと音声スレッドで共有
 
 `tests/realtime_safety.rs` に `#[global_allocator]` としてカウンティングアロケータを
 仕込んだ統合テストがある。`Renderer::render` 呼び出しの前後だけ計測フラグを立て、
-ボイス満杯からのスティール・停止・バスフェード・クリッパ動作を含むシナリオを
-200 回コールバック相当分レンダリングしてもアロケーション/デアロケーションが
-0 回であることを固定化している。
+ボイス満杯からのスティール・停止・バスフェード・クリッパ動作・予約 SE の挿入と発火
+(`ScheduleQueue::try_insert`/`pop_front`、M2-5)を含むシナリオを200回コールバック相当分
+レンダリングしてもアロケーション/デアロケーションが0回であることを固定化している。
 
 ## 依存
 

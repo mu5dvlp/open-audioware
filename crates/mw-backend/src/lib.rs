@@ -8,8 +8,10 @@
 pub mod android_context;
 pub mod backend;
 pub mod cpal_backend;
+pub mod host_time;
 pub mod ios_session;
 pub mod platform_log;
 
 pub use backend::{Backend, BackendError};
 pub use cpal_backend::CpalBackend;
+pub use host_time::host_time_ns;
