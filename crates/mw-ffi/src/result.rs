@@ -25,7 +25,9 @@ pub enum MwResult {
     ErrUnsupportedSoundMode = -6,
     /// wav のパースに失敗した(RIFF/WAVE 構造が壊れている、`fmt `/`data` チャンクが無い等)。
     ErrDecodeFailed = -7,
-    /// wav が 48kHz 以外だった。リサンプルは M2(rubato)で対応予定(初期構築仕様 §4.7)。
+    /// wav のサンプルレートが不正だった(0Hz 等、壊れたファイル)。サンプルレートの不一致
+    /// 自体は M2(rubato)でロード時リサンプルするため、もはやここには当たらない
+    /// (初期構築仕様 §4.7)。
     ErrUnsupportedSampleRate = -8,
     /// wav が 16bit PCM でない、またはチャンネル数がモノ/ステレオでない。
     ErrUnsupportedFormat = -9,

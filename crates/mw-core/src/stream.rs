@@ -706,4 +706,57 @@ mod tests {
             assert_eq!(v, expected, "frame {i} out of order");
         }
     }
+
+    /// 依頼書のテスト要件5: 「既存の end-to-end(pump() → read())がレート不一致の
+    /// 素材でも通ること」。素材(44.1kHz)と出力(48kHz)のレートが異なっていても、
+    /// `SymphoniaDecoder` 内部のリサンプル(`decode.rs`/`resample.rs`)が
+    /// `pump`/`read` から見て完全に透明であることを確認する
+    /// (`stream.rs` 自身はレート変換を一切知らない設計。モジュール doc 参照)。
+    #[test]
+    fn end_to_end_streams_a_mismatched_rate_wav_through_pump_and_read_without_error() {
+        const SOURCE_RATE: u32 = 44_100;
+        const OUTPUT_RATE: u32 = 48_000;
+        const FRAME_COUNT: usize = 500;
+        let mut samples = Vec::with_capacity(FRAME_COUNT * 2);
+        for i in 0..FRAME_COUNT {
+            samples.push(i as i16);
+            samples.push(-(i as i16));
+        }
+        let bytes = make_pcm16_wav(SOURCE_RATE, 2, &samples);
+        let mut decoder =
+            SymphoniaDecoder::open(bytes, OUTPUT_RATE).expect("mismatched sample rate must open");
+
+        let expected_frames =
+            crate::resample::convert_frame_count(FRAME_COUNT as u64, SOURCE_RATE, OUTPUT_RATE);
+
+        let (mut producer, mut source) = channel(small_config(20.0), OUTPUT_RATE);
+
+        let mut got: Vec<f32> = Vec::with_capacity(expected_frames as usize);
+        loop {
+            let outcome = producer.pump(&mut decoder).expect("pump must succeed");
+            let mut buf = vec![0.0f32; 64 * CHANNELS];
+            let n = source.read(&mut buf);
+            for i in 0..n {
+                got.push(buf[i * CHANNELS]);
+            }
+            if outcome.reached_eof && got.len() as u64 >= expected_frames {
+                break;
+            }
+            // 空きが無く読むものも無い(あり得ないはずだが、無限ループ防止の保険)。
+            if outcome.pushed_frames == 0
+                && n == 0
+                && !outcome.reached_eof
+                && source.buffered_frames() == 0
+            {
+                break;
+            }
+        }
+
+        assert_eq!(source.total_frames(), Some(expected_frames));
+        assert_eq!(
+            got.len() as u64,
+            expected_frames,
+            "resampled stream must deliver exactly the rate-converted frame count via pump/read"
+        );
+    }
 }

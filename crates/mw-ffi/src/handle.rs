@@ -34,6 +34,15 @@ pub struct Instance {
 }
 
 impl Instance {
+    /// 出力デバイスの実サンプルレート(`CpalBackend::open` がネゴシエートした値)。
+    ///
+    /// `mw_sound_load`(SE ロード)が wav のリサンプル要否を判定するために使う
+    /// (初期構築仕様『§4.7』: 「SE はロード時に全デコード + 必要ならロード時に
+    /// リサンプルして出力レート化」)。
+    pub fn backend_sample_rate(&self) -> u32 {
+        self.backend.sample_rate()
+    }
+
     /// 新規ボイスシリアル(不透明な voice id)を1つ払い出す。0 は「未割当」の予約値。
     pub fn next_voice_serial(&self) -> u64 {
         self.next_voice_serial

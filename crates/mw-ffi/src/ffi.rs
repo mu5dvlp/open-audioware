@@ -137,8 +137,10 @@ pub extern "C" fn mw_shutdown(handle: u64) -> MwResult {
 /// 圧縮のまま保持しストリーミングデコード)は M2 で実装予定であり、
 /// `MwResult::ErrUnsupportedSoundMode` を返す(初期構築仕様 §5.2)。
 ///
-/// 対応フォーマットは 48kHz / 16bit PCM / モノラルまたはステレオの wav のみ
-/// (`crates/mw-core/src/wav.rs`)。非対応の場合は原因に応じたエラーコードを返す。
+/// 対応フォーマットは 16bit PCM / モノラルまたはステレオの wav のみ
+/// (`crates/mw-core/src/wav.rs`)。サンプルレートは出力デバイスと一致しなくてよい
+/// (一致しない場合はロード時に一括でリサンプルする。初期構築仕様『§4.7』)。
+/// 非対応の場合は原因に応じたエラーコードを返す。
 ///
 /// # Safety
 /// `bytes` は `len` バイトの読み取り可能な領域を指す有効なポインタであるか、
@@ -176,14 +178,22 @@ pub unsafe extern "C" fn mw_sound_load(
             unsafe { std::slice::from_raw_parts(bytes, len) }
         };
 
-        let sound_data = match mw_core::wav::decode(slice) {
+        // wav のサンプルレートと出力デバイスのレートが一致しない場合はロード時に
+        // 一括リサンプルして吸収する(初期構築仕様『§4.7』, `mw_core::wav::decode` 参照)。
+        // そのため出力レートを先に(ハンドル経由で)確定させておく必要がある。
+        let Some(output_sample_rate) =
+            handle_registry::with_instance(handle, |instance| instance.backend_sample_rate())
+        else {
+            return MwResult::ErrInvalidHandle;
+        };
+
+        let sound_data = match mw_core::wav::decode(slice, output_sample_rate) {
             Ok(data) => data,
             Err(err) => {
                 mw_backend::mw_log!("[mw-ffi] mw_sound_load: decode failed: {err}");
                 return match err {
-                    mw_core::WavError::UnsupportedSampleRate { .. } => {
-                        MwResult::ErrUnsupportedSampleRate
-                    }
+                    mw_core::WavError::InvalidSampleRate(_) => MwResult::ErrUnsupportedSampleRate,
+                    mw_core::WavError::Resample(_) => MwResult::ErrDecodeFailed,
                     mw_core::WavError::UnsupportedFormatTag(_)
                     | mw_core::WavError::UnsupportedBitsPerSample(_)
                     | mw_core::WavError::UnsupportedChannelCount(_) => {
@@ -574,6 +584,40 @@ mod tests {
         let mut out_voice = 0u64;
         let replay = unsafe { mw_se_play(handle, sound_id, 2, 1.0, &mut out_voice as *mut u64) };
         assert_eq!(replay, MwResult::ErrInvalidSoundId);
+
+        // 出力デバイスのレートと一致しない wav も、ロード時の一括リサンプル
+        // (`mw_core::wav::decode`, 初期構築仕様『§4.7』)でエラーにならず読み込める。
+        // 実機のデバイスレートは環境依存(cpal がネゴシエートする)なので、ここでは
+        // 「44.1kHz と 48kHz のどちらであっても両方ロードできる」ことを見る
+        // (device rate と偶然一致した側はバイパス経路、もう一方はリサンプル経路を通る)。
+        let wav_44_1k = make_pcm16_wav(44_100, 2, &[500, -500, 1000, -1000]);
+        let mut resampled_id: u64 = 0;
+        let resampled_load = unsafe {
+            mw_sound_load(
+                handle,
+                wav_44_1k.as_ptr(),
+                wav_44_1k.len(),
+                0,
+                &mut resampled_id as *mut u64,
+            )
+        };
+        assert_eq!(resampled_load, MwResult::Ok);
+        assert_ne!(resampled_id, 0);
+        assert_eq!(mw_sound_release(handle, resampled_id), MwResult::Ok);
+
+        // サンプルレートが 0(壊れたファイル)は明確なエラーコードで拒否する。
+        let wav_zero_rate = make_pcm16_wav(0, 2, &[0, 0]);
+        let mut invalid_id: u64 = 0;
+        let invalid_load = unsafe {
+            mw_sound_load(
+                handle,
+                wav_zero_rate.as_ptr(),
+                wav_zero_rate.len(),
+                0,
+                &mut invalid_id as *mut u64,
+            )
+        };
+        assert_eq!(invalid_load, MwResult::ErrUnsupportedSampleRate);
     }
 
     #[test]
@@ -637,22 +681,6 @@ mod tests {
             )
         };
         assert_eq!(result, MwResult::ErrInvalidHandle);
-    }
-
-    #[test]
-    fn sound_load_rejects_non_48k_wav_with_explicit_error() {
-        let wav_bytes = make_pcm16_wav(44_100, 2, &[0, 0]);
-        let mut out_id = 0u64;
-        let result = unsafe {
-            mw_sound_load(
-                1,
-                wav_bytes.as_ptr(),
-                wav_bytes.len(),
-                0,
-                &mut out_id as *mut u64,
-            )
-        };
-        assert_eq!(result, MwResult::ErrUnsupportedSampleRate);
     }
 
     #[test]
