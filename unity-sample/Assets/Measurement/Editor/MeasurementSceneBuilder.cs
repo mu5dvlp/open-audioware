@@ -31,6 +31,8 @@ namespace Measurement.EditorTools
 
             new GameObject("EventSystem", typeof(EventSystem), typeof(StandaloneInputModule));
 
+            CreateClearCamera();
+
             var canvasGo = new GameObject("Canvas", typeof(Canvas), typeof(CanvasScaler), typeof(GraphicRaycaster));
             var canvas = canvasGo.GetComponent<Canvas>();
             canvas.renderMode = RenderMode.ScreenSpaceOverlay;
@@ -75,6 +77,35 @@ namespace Measurement.EditorTools
             Debug.Log(saved
                 ? $"MeasurementSceneBuilder: saved {ScenePath} and set as the sole Build Settings scene."
                 : $"MeasurementSceneBuilder: FAILED to save {ScenePath}");
+        }
+
+        /// <summary>
+        /// フレームバッファを毎フレーム黒でクリアするだけのカメラ。
+        /// </summary>
+        /// <remarks>
+        /// <b>UI しか無いシーンでもカメラは必須。</b>Screen Space - Overlay の Canvas はカメラを
+        /// 必要としないが、**カメラが1台も無いとフレームバッファが誰にもクリアされない**。
+        /// その状態で全画面の白フラッシュを1回出すと、白がスワップチェーンのバッファに焼き付いたまま
+        /// 消えず、白が乗ったバッファとそうでないバッファが交互に提示されて**画面が永久に明滅する**
+        /// (2026-08-23 に Android 実機で確認。docs/measurement-m1.md §7.6-5)。
+        /// ボタンは毎フレーム描き直されるため正常に見え、白いステータス文字だけが白地に溶けて消える、
+        /// という紛らわしい見え方になる。
+        /// <para>
+        /// 計測の基準信号そのものが壊れるため、この1台は計測の前提として必須。
+        /// </para>
+        /// </remarks>
+        private static void CreateClearCamera()
+        {
+            var go = new GameObject("MainCamera", typeof(Camera));
+            go.tag = "MainCamera";
+
+            var camera = go.GetComponent<Camera>();
+            camera.clearFlags = CameraClearFlags.SolidColor;
+            camera.backgroundColor = Color.black;
+            camera.orthographic = true;
+
+            // 描画対象は無い(UI は Overlay Canvas が直接描く)。クリアだけが役割。
+            camera.cullingMask = 0;
         }
 
         private static Button CreateBigButton(Transform parent, string name, string label, Vector2 anchorMin, Vector2 anchorMax, Color color)
