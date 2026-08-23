@@ -27,6 +27,18 @@ pub struct Config {
     /// ソフトクリッパが線形領域からニー(saturation)へ切り替わる閾値(絶対値)。
     /// 初期構築仕様 §4.1: 「通常運用でクリッパが動作しないゲインステージングを既定とする」。
     pub clipper_threshold: f32,
+    /// 楽曲ストリーミングのプリロール長(ms、`stream.rs`)。初期構築仕様『§4.3 楽曲再生』の
+    /// 「準備(プリロール込み)」で、`is_ready` が真になるまでに最低限バッファへ
+    /// 溜めておくべき量をここで指定する。
+    ///
+    /// 既定値 [`Config::DEFAULT_PREROLL_MS`] の根拠(【仮】): デコードは mw-core の外側
+    /// (mw-ffi が回すデコードスレッド、初期構築仕様『§5.2 スレッドモデル』)が `pump()` を
+    /// 呼ぶことで進むため、音声コールバックの周期とデコードスレッドの起床周期は独立している。
+    /// 100ms は典型的な出力バッファ長(数〜十数 ms)の数倍にあたり、デコードスレッドが
+    /// 1〜2周期分スケジューリングで遅延しても音声側が枯渇しないだけの余裕を持たせつつ、
+    /// 選曲プレビュー等での体感開始遅延としても許容できる範囲として選んだ。
+    /// 実測(M2 後半のドリフト・アンダーラン計測)で見直す。
+    pub preroll_ms: f32,
 }
 
 impl Config {
@@ -35,6 +47,8 @@ impl Config {
     pub const DEFAULT_RAMP_MS: f32 = 5.0;
     pub const DEFAULT_COMMAND_QUEUE_CAPACITY: usize = 256;
     pub const DEFAULT_CLIPPER_THRESHOLD: f32 = 1.0;
+    /// 【仮】既定値。根拠は [`Config::preroll_ms`] のドキュメントを参照。
+    pub const DEFAULT_PREROLL_MS: f32 = 100.0;
 }
 
 impl Default for Config {
@@ -49,6 +63,7 @@ impl Default for Config {
             // 同時に「回収待ち」になりうる最大数(通常終了 + スティール尾)に余裕を掛けておく。
             reclaim_queue_capacity: (max_voices + steal_tail_capacity) * 2,
             clipper_threshold: Self::DEFAULT_CLIPPER_THRESHOLD,
+            preroll_ms: Self::DEFAULT_PREROLL_MS,
         }
     }
 }
@@ -63,5 +78,6 @@ mod tests {
         assert_eq!(config.max_voices, 64);
         assert_eq!(config.default_ramp_ms, 5.0);
         assert!(config.reclaim_queue_capacity > config.max_voices + config.steal_tail_capacity);
+        assert_eq!(config.preroll_ms, 100.0);
     }
 }
