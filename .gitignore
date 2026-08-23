@@ -42,6 +42,9 @@ unity-sample/*.userprefs
 unity-sample/.idea/
 # make unity-test の出力(NUnit XML)
 unity-sample/*TestResults*.xml
+# Android ビルドの中間生成物(Ninja のログ・CMake のキャッシュ・フィンガープリント)。
+# ビルドのたびに差分が出るだけで再現に必要な情報を持たない。
+unity-sample/.utmp/
 
 # --- IDE ---
 .vscode/
