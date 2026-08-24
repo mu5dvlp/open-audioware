@@ -39,6 +39,12 @@ pub enum MwResult {
     ErrCommandQueueFull = -11,
     /// `bus` 引数が固定4本(Master/BGM/SE/Voice)のいずれにも対応しない値だった。
     ErrInvalidBus = -12,
+    /// `mw_music_set_loop` の区間が不正だった(`begin >= end` で、かつループ解除
+    /// (`begin == 0 && end == 0`)でもない)。`mw_core::MusicVoice::set_loop` は同じ
+    /// 状況を黙ってループ無しとして扱う(音声スレッドはパニックできないため、§5.3)が、
+    /// FFI 境界(ゲームスレッド経路)では黙って捨てず明示的に拒否する
+    /// (`crates/mw-ffi/src/ffi.rs::mw_music_set_loop` 参照)。
+    ErrInvalidLoopRegion = -13,
 }
 
 #[cfg(test)]
@@ -60,5 +66,6 @@ mod tests {
         assert!((MwResult::ErrInvalidSoundId as i32) < 0);
         assert!((MwResult::ErrCommandQueueFull as i32) < 0);
         assert!((MwResult::ErrInvalidBus as i32) < 0);
+        assert!((MwResult::ErrInvalidLoopRegion as i32) < 0);
     }
 }

@@ -9,6 +9,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/ffi.rs");
     println!("cargo:rerun-if-changed=src/result.rs");
     println!("cargo:rerun-if-changed=src/event.rs");
+    println!("cargo:rerun-if-changed=src/types.rs");
 
     let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../unity/Runtime/Generated/NativeMethods.g.cs");
@@ -17,6 +18,10 @@ fn main() {
         .input_extern_file("src/ffi.rs")
         .input_extern_file("src/result.rs")
         .input_extern_file("src/event.rs")
+        // M2-7 で追加: `MwMusicPosition`(`mw_music_get_position` の out 引数の実型)
+        // が extern 関数シグネチャに現れるようになったため、`event.rs` と同じ理由で
+        // 入力に含める(`types.rs` モジュール doc 参照)。
+        .input_extern_file("src/types.rs")
         // DllImport 先のバイナリ名(拡張子・lib プレフィックスは .NET のライブラリ解決規約に従う)。
         // macOS: libmw_ffi.dylib / Android: libmw_ffi.so
         .csharp_dll_name("mw_ffi")

@@ -84,15 +84,22 @@ OS 非依存・デバイス非依存のコア。ミキサ、ボイス管理、�
   必ずランプを経由し、自然終了(PCM 終端到達)はランプ不要としてただちに回収する。
 - `command`: `Command` — ゲームスレッド→音声スレッドのコマンド列挙
   (`PlaySe` / `StopVoice` / `SetVoiceVolume` / `StopVoicesUsingSound` /
-  `SetBusVolume` / `BusFade` / `SeSchedule` / `MusicPlayScheduled` / `MusicSeek` /
-  `MusicPause` / `MusicResumeAt` / `MusicStop` / `MusicSetLoop`)。`SeSchedule`〜
-  `MusicSeek` は M2-5 追加(予約発音・楽曲予約再生・楽曲シーク)。楽曲制御4種
-  (`MusicPause`/`MusicResumeAt`/`MusicStop`/`MusicSetLoop`)は M2-7 追加——
-  §4.3 の楽曲制御 API を mw-ffi へ公開する下ごしらえとして、`MusicVoice` 側に
+  `SetBusVolume` / `BusFade` / `SeSchedule` / `MusicPlayScheduled` / `MusicPrepare` /
+  `MusicSeek` / `MusicPause` / `MusicResumeAt` / `MusicStop` / `MusicSetLoop`)。
+  `SeSchedule`〜`MusicSeek` は M2-5 追加(予約発音・楽曲予約再生・楽曲シーク)。
+  楽曲制御4種(`MusicPause`/`MusicResumeAt`/`MusicStop`/`MusicSetLoop`)は M2-7 前半で
+  追加——§4.3 の楽曲制御 API を mw-ffi へ公開する下ごしらえとして、`MusicVoice` 側に
   既に実装済みだった `pause`/`resume_at`/`stop`/`set_loop` への配線をここで揃えた
   (`MusicVoice` 自体の変更は無し)。いずれも不連続の発生源(シーク・巻き戻し再開・
   停止)は `MusicRenderOutcome::discontinuity` 経由で `clock.rs` の世代カウンタへ
   そのまま乗るため、`mixer.rs::Mixer::render` 側に追加配線は要らなかった。
+  `MusicPrepare` は M2-7 後半(`mw_music_set` の実装)で追加——同様に `MusicVoice`
+  側に既にあった `prepare`(新しい曲として `Loading` から仕切り直す)への配線を
+  足しただけ。mw-ffi の `mw_music_set` が「デコーダ差し替え → `MusicPrepare` →
+  `MusicStop` → `MusicSeek{0}`」の順でコマンドを送ることで、前の曲が `Playing` 中
+  でも状態機械・ゲイン・リングバッファの3つを矛盾なく初期化できる
+  (`command.rs::Command::MusicPrepare` のドキュメント、`mixer.rs` の
+  `music_set_command_sequence_recovers_cleanly_from_a_song_still_playing` テスト参照)。
 - `mixer`: `Mixer::render(output, buffer_start_host_time_ns)` — 「コマンド消化 →
   楽曲ボイスのレンダリング(予約発火があればサンプル精度で分割) → イベント通知 →
   アクティブ SE ボイス合算 + 楽曲の Bgm バス適用 → Master → クリッパ → 音楽クロックの

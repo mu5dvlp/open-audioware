@@ -9,9 +9,15 @@ C ABI 境界。`mw-core` / `mw-backend` 両方に依存する唯一のクレー�
 
 - `src/result.rs` — `MwResult`(`#[repr(i32)]`)。全 FFI 関数の戻り値。`Ok = 0`、
   それ以外は負の整数のエラーコード(初期構築仕様 §4.8)。
-- `src/types.rs` — `MwSoundMode` / `MwBus`。FFI 境界の `i32` 引数を検証・復元する内部専用の
-  値型(`from_raw(i32) -> Option<Self>`)。**csbindgen の入力には含めない**
-  (下記「enum を FFI 引数に直接使わない理由」参照)。
+- `src/types.rs` — `MwSoundMode` / `MwBus`(FFI 境界の `i32` 引数を検証・復元する
+  内部専用の値型、`from_raw(i32) -> Option<Self>`)、`MwMusicState`
+  (`mw_music_state()` の実体。M2-7)、`MwMusicPosition`(`#[repr(C)]`、blittable。
+  `mw_music_get_position` の out 引数。M2-7)。**csbindgen の入力**(M2-7 で追加、
+  `build.rs` 参照)——`MwSoundMode`/`MwBus` はどの extern 関数シグネチャにも
+  直接現れないため相変わらず C# 側は生成されないが、`MwMusicPosition` が
+  `mw_music_get_position` の実引数型として現れ、そのフィールド `state:
+  MwMusicState` を辿って `MwMusicState` も生成される(`event.rs::MwEvent`/
+  `MwEventKind` と同じ仕掛け。詳細は `types.rs` の `MwMusicState` ドキュメント参照)。
 - `src/handle.rs` — init/shutdown のグローバルレジストリ(`OnceLock<Mutex<Option<Instance>>>`)。
   ハンドルは不透明な `u64`(ポインタを C# に渡さない)。二重 init は同一ハンドルを返す
   (冪等)、無効ハンドルの shutdown はエラーコードで検出する。`Instance` は M1 で
@@ -19,29 +25,44 @@ C ABI 境界。`mw-core` / `mw-backend` 両方に依存する唯一のクレー�
   ボイスシリアル採番器(`AtomicU64`)を持つ。M2-6 で `Arc<mw_core::EventQueue>`
   (`events` フィールド)を追加した——`mw_poll_events` がここから `drain` し、
   `CpalBackend::open` にも同じ `Arc` を渡してストリームのエラー通知経路
-  (非リアルタイムスレッド)から `push_side_channel` させる。
+  (非リアルタイムスレッド)から `push_side_channel` させる。M2-7 で楽曲再生
+  (`Arc<mw_core::MusicClockPublisher>`、楽曲バイト列ストレージ `music_bytes:
+  Mutex<HashMap<u64, Arc<Vec<u8>>>>`、デコードスレッドの送信ハンドル・停止フラグ・
+  join ハンドル)を追加した。**楽曲 ID は最上位ビット(`MUSIC_ID_FLAG`)を立てて
+  SE の ID(`mw_core::SoundStorage` 採番)と空間を分離してある**(`is_music_id`
+  で判別。理由は `MUSIC_ID_FLAG` のドキュメント参照)。
+- `src/decode_thread.rs` — 楽曲のデコードスレッド(M2-7)。`mw_core::stream` が
+  意図的に持たないスレッドをここで1本立て、`mw_init`〜`mw_shutdown` の間
+  生かし続ける。`mw_music_set` のたびに立て直すのではなく、
+  `mpsc::Sender<Box<dyn mw_core::MusicDecoder + Send>>` 経由でデコーダを
+  差し替える設計(理由・待ち方・ポーリング間隔・パニック安全性はモジュール doc
+  参照)。
 - `src/event.rs` — `MwEvent`(`#[repr(C)]`、blittable)/ `MwEventKind`(`#[repr(i32)]`)。
   初期構築仕様『§4.6 イベント通知』の C ABI 表現(M2-6)。`mw_core::Event` からの
   変換(`MwEvent::from_core`)をここに置く。**csbindgen の入力**(`build.rs` が
-  `ffi.rs`/`result.rs` と一緒にここも読む)——`types.rs` と違い、`MwEvent` は
-  `mw_poll_events` の引数型として実際に extern 関数シグネチャに現れるため、
-  C# 側の型を自動生成させる必要がある。
+  `ffi.rs`/`result.rs` と一緒にここも読む)——`MwEvent` は `mw_poll_events` の
+  引数型として実際に extern 関数シグネチャに現れるため、C# 側の型を自動生成
+  させる必要がある(`types.rs` が M2-7 で同じ仕組みに乗った経緯の先例)。
 - `src/ffi.rs` — `#[unsafe(no_mangle)] pub extern "C" fn mw_*` 本体。
-  **csbindgen の入力**(`build.rs` がここと `result.rs`/`event.rs` を読む)。
+  **csbindgen の入力**(`build.rs` がここと `result.rs`/`event.rs`/`types.rs` を読む)。
 - `build.rs` — csbindgen で `unity/Runtime/Generated/NativeMethods.g.cs` を生成する。
 
-## 現状の公開 API(M1: SE 再生 / M2-5: ホスト時刻・予約発音 / M2-6: イベント通知)
+## 現状の公開 API(M1: SE 再生 / M2-5: ホスト時刻・予約発音 / M2-6: イベント通知 /
+M2-7: 楽曲再生)
 
 ```
 mw_abi_version() -> u32                                          // 定数 1
 mw_host_time_ns() -> u64                                          // ホスト単調時刻(ns)。ハンドル不要
-mw_init(out_handle: *mut u64) -> MwResult                        // 冪等。既定出力デバイスにストリームを開く
-mw_shutdown(handle: u64) -> MwResult                              // 冪等ではない(無効ハンドルはエラー)。ストリームを閉じる
+mw_init(out_handle: *mut u64) -> MwResult                        // 冪等。既定出力デバイスにストリームを開く。デコードスレッドを1本立てる
+mw_shutdown(handle: u64) -> MwResult                              // 冪等ではない(無効ハンドルはエラー)。ストリームを閉じ、デコードスレッドを止めて join する
 
 mw_sound_load(handle, bytes: *const u8, len: usize, mode: i32, out_id: *mut u64) -> MwResult
-    // mode=0(SE)のみ実装。mode=1(Music)は ErrUnsupportedSoundMode(楽曲ロード API は未実装)
+    // mode=0(SE): wav を全デコードして常駐。mode=1(Music, M2-7): デコードせず圧縮バイト列のまま保持。
+    // 発行される ID は mode によって空間が分離される(下記「楽曲 ID の空間分離」参照)
 mw_sound_release(handle, id: u64) -> MwResult
-    // 再生中ボイスがあれば既定ランプ経由で即停止させたうえで解放する
+    // id のタグを見て SE/楽曲を自動振り分け。SE は再生中ボイスがあれば既定ランプ経由で
+    // 即停止させたうえで解放。楽曲は再生中でも拒否せず即座に解放する(理由は
+    // handle.rs::Instance::remove_music_bytes のドキュメント参照)
 
 mw_se_play(handle, id: u64, bus: i32, volume: f32, out_voice: *mut u64) -> MwResult
     // 次のオーディオコールバックで必ず発音される(初期構築仕様 §4.2)
@@ -53,11 +74,32 @@ mw_voice_set_volume(handle, voice: u64, volume: f32) -> MwResult  // 既定ラ�
 mw_bus_set_volume(handle, bus: i32, volume: f32) -> MwResult      // 既定ランプ経由
 mw_bus_fade(handle, bus: i32, target: f32, ms: f32) -> MwResult   // 呼び出し側指定の時間
 
+mw_music_set(handle, sound_id: u64) -> MwResult
+    // ストリーミング再生の準備(初期構築仕様 §4.3, M2-7)。sound_id は mode=Music の
+    // mw_sound_load が返した ID であること(SE の ID を渡すと ErrInvalidSoundId)。
+    // 非ブロッキング。プリロール完了は待たない——状態は Loading のままで、
+    // mw_music_state が Ready を返すまで C# 側がポーリングする契約。
+    // 内部で「デコーダ差し替え → MusicPrepare → MusicStop → MusicSeek{0}」の順に
+    // 処理する(前曲のリングバッファ内 PCM の掃除。順序厳守。ffi.rs のドキュメント参照)
+mw_music_state(handle, out_state: *mut i32) -> MwResult
+    // MwMusicState(Loading=0/Ready=1/Playing=2/Paused=3)の判別子を i32 で書き込む
+mw_music_pause(handle) -> MwResult                                // 既定ランプでフェードアウトして Paused へ
+mw_music_resume_at(handle, frames: u64) -> MwResult               // 巻き戻し付き再開(既定ランプでフェードイン)
+mw_music_seek(handle, frames: u64) -> MwResult                    // ランプを経由しない不連続。クロックの世代カウンタが進む
+mw_music_stop(handle) -> MwResult                                 // Playing はフェードアウト後 Ready へ、Paused は即座に Ready へ
+mw_music_set_loop(handle, begin_frames: u64, end_frames: u64) -> MwResult
+    // begin==0 && end==0 はループ解除(【仮】)。それ以外で begin>=end は
+    // ErrInvalidLoopRegion(mw_core::MusicVoice::set_loop は同じ状況を黙って
+    // ループ無しへ丸めるが、FFI 境界では明示的に拒否する)
+mw_music_get_position(handle, out: *mut MwMusicPosition) -> MwResult
+    // 音楽クロックのスナップショット(初期構築仕様 §4.4)。GC アロケーションゼロ。
+    // MwMusicPosition は blittable(is_playing は u8。bool の 4byte マーシャリング問題を回避)
 mw_music_play_scheduled(handle, host_time_ns: u64) -> MwResult
-    // 楽曲の予約再生(初期構築仕様 §4.3)。楽曲ロード API がまだ無いため、現状はコマンドが
-    // 素通りするだけで実際には鳴らない(楽曲ボイスは Loading のまま繰り下げ続ける)。
-    // プリロール未完了時の繰り下げは Rust 内部(`mw_core::Renderer::music_schedule_deferred`)
-    // からのみ問い合わせ可能——FFI 公開は後続作業
+    // 楽曲の予約再生(初期構築仕様 §4.3)。プリロール未完了時の繰り下げは Rust 内部
+    // (`mw_core::Renderer::music_schedule_deferred`)からのみ問い合わせ可能
+
+mw_get_output_latency_ns(handle, out_ns: *mut u64) -> MwResult
+    // 出力レイテンシの実測値(ns)。0 は「まだ不明」(コールバック未実行)
 
 mw_poll_events(handle, buf: *mut MwEvent, cap: i32, out_dropped: *mut u32) -> i32
     // 初期構築仕様 §4.6。C → C# のコールバックはしない(M4)——C# 側が毎フレーム
@@ -80,6 +122,22 @@ mw_poll_events(handle, buf: *mut MwEvent, cap: i32, out_dropped: *mut u32) -> i3
 `mw_bus_*` 系・`mw_sound_load` は `bus`/`mode` を素の `i32` として受け取り、
 `MwBus::from_raw` / `MwSoundMode::from_raw`(`src/types.rs`)で検証してから使う。
 範囲外の値は `MwResult::ErrInvalidBus` / `MwResult::ErrUnsupportedSoundMode` を返す。
+`mw_music_state` の `out_state` も同じ理由で `*mut i32`(`MwMusicState` を直接
+書き込ませない)——ただし出力専用引数なので C# 側が不正値を書けるわけではなく、
+あくまで既存の規約(「値は常に生の整数で FFI 境界を跨ぐ」)と揃えるための選択。
+一方 `MwMusicPosition::state` は `MwMusicState` を直接フィールドに持つ(理由は
+`types.rs` のドキュメント参照)。
+
+### 楽曲 ID の空間分離(`mw_sound_load(mode=Music)` / M2-7)
+
+SE の ID は `mw_core::SoundStorage` が採番し `Arc<SoundData>`(デコード済み PCM)を
+指す。楽曲は「圧縮のまま保持」なので置き場所が違い(`handle.rs::Instance::
+music_bytes`)、同じ ID 空間を共有すると `mw_sound_release` が誤って SE 側の
+エントリを消してしまいうる。そこで楽曲 ID は最上位ビット
+(`handle.rs::MUSIC_ID_FLAG`)を立てて空間を分離してあり、`mw_sound_load`/
+`mw_music_set`/`mw_sound_release` はこのビットで自動的に正しいストレージへ
+振り分ける。ID は C# から見て不透明な整数(初期構築仕様『§4.8』)なので、この
+ビット演算による分離は呼び出し側に副作用を持たない。
 
 ## 不変条件
 

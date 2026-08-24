@@ -17,7 +17,7 @@ use crate::event::MwEvent;
 use crate::handle as handle_registry;
 use crate::handle::{InitOutcome, ShutdownOutcome};
 use crate::result::MwResult;
-use crate::types::{MwBus, MwSoundMode};
+use crate::types::{MwBus, MwMusicPosition, MwMusicState, MwSoundMode};
 
 /// ABI バージョン。ABI 互換の破壊は semver メジャーバージョンでのみ許可する(§4.8)。
 const ABI_VERSION: u32 = 1;
@@ -149,16 +149,21 @@ pub extern "C" fn mw_shutdown(handle: u64) -> MwResult {
 // 代わりに素の `i32` として受け取り、`MwBus::from_raw` / `MwSoundMode::from_raw` で
 // 検証してから使う。
 
-/// wav バイト列から SE 用 PCM をロードする(初期構築仕様 §5.5, §4.2)。
+/// wav バイト列から SE 用 PCM を、または楽曲用の圧縮バイト列をロードする
+/// (初期構築仕様 §5.5, §4.2, §5.2)。
 ///
-/// M1 は `mode = 0`(SE、全デコード常駐)のみ実装する。`mode = 1`(Music、
-/// 圧縮のまま保持しストリーミングデコード)は M2 で実装予定であり、
-/// `MwResult::ErrUnsupportedSoundMode` を返す(初期構築仕様 §5.2)。
-///
-/// 対応フォーマットは 16bit PCM / モノラルまたはステレオの wav のみ
-/// (`crates/mw-core/src/wav.rs`)。サンプルレートは出力デバイスと一致しなくてよい
-/// (一致しない場合はロード時に一括でリサンプルする。初期構築仕様『§4.7』)。
-/// 非対応の場合は原因に応じたエラーコードを返す。
+/// - `mode = 0`(SE): wav を全デコードしてメモリ常駐させる(M1)。対応フォーマットは
+///   16bit PCM / モノラルまたはステレオの wav のみ(`crates/mw-core/src/wav.rs`)。
+///   サンプルレートは出力デバイスと一致しなくてよい(一致しない場合はロード時に
+///   一括でリサンプルする。初期構築仕様『§4.7』)。非対応の場合は原因に応じた
+///   エラーコードを返す。
+/// - `mode = 1`(Music, M2-7): デコードせず圧縮バイト列のまま保持する
+///   (初期構築仕様『§5.5』「Music(圧縮のまま保持)」)。フォーマットの妥当性検証は
+///   ここでは行わない——`mw_music_set` が実際にストリーミング準備を試みた時点で
+///   検出する。発行される ID は SE の ID とは空間が分離されている
+///   (`crate::handle::MUSIC_ID_FLAG` 参照。同じ ID を `mw_sound_release` に渡すと
+///   自動的に正しいストレージへ振り分けられる)。
+/// - それ以外の未知の `mode` は `MwResult::ErrUnsupportedSoundMode` を返す。
 ///
 /// # Safety
 /// `bytes` は `len` バイトの読み取り可能な領域を指す有効なポインタであるか、
@@ -183,10 +188,6 @@ pub unsafe extern "C" fn mw_sound_load(
         let Some(mode) = MwSoundMode::from_raw(mode) else {
             return MwResult::ErrUnsupportedSoundMode;
         };
-        if mode != MwSoundMode::Se {
-            // Music モードは M2(初期構築仕様 §5.2「楽曲のみストリーミングデコード」)。
-            return MwResult::ErrUnsupportedSoundMode;
-        }
 
         let slice: &[u8] = if len == 0 {
             &[]
@@ -196,54 +197,10 @@ pub unsafe extern "C" fn mw_sound_load(
             unsafe { std::slice::from_raw_parts(bytes, len) }
         };
 
-        // wav のサンプルレートと出力デバイスのレートが一致しない場合はロード時に
-        // 一括リサンプルして吸収する(初期構築仕様『§4.7』, `mw_core::wav::decode` 参照)。
-        // そのため出力レートを先に(ハンドル経由で)確定させておく必要がある。
-        let Some(output_sample_rate) =
-            handle_registry::with_instance(handle, |instance| instance.backend_sample_rate())
-        else {
-            return MwResult::ErrInvalidHandle;
-        };
-
-        let sound_data = match mw_core::wav::decode(slice, output_sample_rate) {
-            Ok(data) => data,
-            Err(err) => {
-                mw_backend::mw_log!("[mw-ffi] mw_sound_load: decode failed: {err}");
-                return match err {
-                    mw_core::WavError::InvalidSampleRate(_) => MwResult::ErrUnsupportedSampleRate,
-                    mw_core::WavError::Resample(_) => MwResult::ErrDecodeFailed,
-                    mw_core::WavError::UnsupportedFormatTag(_)
-                    | mw_core::WavError::UnsupportedBitsPerSample(_)
-                    | mw_core::WavError::UnsupportedChannelCount(_) => {
-                        MwResult::ErrUnsupportedFormat
-                    }
-                    mw_core::WavError::Truncated
-                    | mw_core::WavError::NotRiff
-                    | mw_core::WavError::NotWave
-                    | mw_core::WavError::MissingFmtChunk
-                    | mw_core::WavError::MissingDataChunk => MwResult::ErrDecodeFailed,
-                };
-            }
-        };
-
-        let assigned_id = handle_registry::with_instance(handle, |instance| {
-            instance.drain_reclaimed();
-            let mut sounds = instance
-                .sounds
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            sounds.insert(sound_data)
-        });
-
-        match assigned_id {
-            Some(id) => {
-                // SAFETY: 上で null チェック済み。
-                unsafe {
-                    *out_id = id.0;
-                }
-                MwResult::Ok
-            }
-            None => MwResult::ErrInvalidHandle,
+        match mode {
+            // SAFETY: `out_id` は呼び出し元(このすぐ上)で null チェック済み。
+            MwSoundMode::Se => unsafe { load_se(handle, slice, out_id) },
+            MwSoundMode::Music => unsafe { load_music(handle, slice, out_id) },
         }
     }));
 
@@ -253,52 +210,155 @@ pub unsafe extern "C" fn mw_sound_load(
     }
 }
 
-/// ロード済みサウンドを解放する(初期構築仕様 §5.5)。
+/// `mw_sound_load` の SE(`mode = 0`)経路。全デコードしてメモリ常駐させる(M1)。
 ///
-/// 再生中のボイスがあれば、既定ランプ(§4.1/M13)経由で即座に停止させたうえで解放する。
-/// PCM の実データ(`Arc<SoundData>`)の最終的な解放(デアロケーション)はこの呼び出し
-/// 自身(ゲームスレッド)か、あるいは音声スレッドがボイス終了時に回収キューへ送り出した
-/// ものをこの関数が(次回以降のこの種の呼び出しで)ドレインする経路のいずれかで起こる。
-/// いずれにせよ**音声コールバック内で `Arc` がドロップされることはない**
-/// (初期構築仕様「PCM データの所有権」)。
+/// # Safety
+/// `out_id` は書き込み可能な `u64` を指す有効なポインタであること
+/// (呼び出し元 `mw_sound_load` が null チェック済み)。
+unsafe fn load_se(handle: u64, slice: &[u8], out_id: *mut u64) -> MwResult {
+    // wav のサンプルレートと出力デバイスのレートが一致しない場合はロード時に
+    // 一括リサンプルして吸収する(初期構築仕様『§4.7』, `mw_core::wav::decode` 参照)。
+    // そのため出力レートを先に(ハンドル経由で)確定させておく必要がある。
+    let Some(output_sample_rate) =
+        handle_registry::with_instance(handle, |instance| instance.backend_sample_rate())
+    else {
+        return MwResult::ErrInvalidHandle;
+    };
+
+    let sound_data = match mw_core::wav::decode(slice, output_sample_rate) {
+        Ok(data) => data,
+        Err(err) => {
+            mw_backend::mw_log!("[mw-ffi] mw_sound_load: decode failed: {err}");
+            return match err {
+                mw_core::WavError::InvalidSampleRate(_) => MwResult::ErrUnsupportedSampleRate,
+                mw_core::WavError::Resample(_) => MwResult::ErrDecodeFailed,
+                mw_core::WavError::UnsupportedFormatTag(_)
+                | mw_core::WavError::UnsupportedBitsPerSample(_)
+                | mw_core::WavError::UnsupportedChannelCount(_) => MwResult::ErrUnsupportedFormat,
+                mw_core::WavError::Truncated
+                | mw_core::WavError::NotRiff
+                | mw_core::WavError::NotWave
+                | mw_core::WavError::MissingFmtChunk
+                | mw_core::WavError::MissingDataChunk => MwResult::ErrDecodeFailed,
+            };
+        }
+    };
+
+    let assigned_id = handle_registry::with_instance(handle, |instance| {
+        instance.drain_reclaimed();
+        let mut sounds = instance
+            .sounds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sounds.insert(sound_data)
+    });
+
+    match assigned_id {
+        Some(id) => {
+            // SAFETY: 呼び出し元の契約(この関数の Safety セクション)。
+            unsafe {
+                *out_id = id.0;
+            }
+            MwResult::Ok
+        }
+        None => MwResult::ErrInvalidHandle,
+    }
+}
+
+/// `mw_sound_load` の Music(`mode = 1`, M2-7)経路。デコードせず圧縮バイト列の
+/// まま保持する(初期構築仕様『§5.5』)。
+///
+/// # Safety
+/// `out_id` は書き込み可能な `u64` を指す有効なポインタであること
+/// (呼び出し元 `mw_sound_load` が null チェック済み)。
+unsafe fn load_music(handle: u64, slice: &[u8], out_id: *mut u64) -> MwResult {
+    let bytes = slice.to_vec();
+    let assigned_id =
+        handle_registry::with_instance(handle, |instance| instance.insert_music_bytes(bytes));
+
+    match assigned_id {
+        Some(id) => {
+            // SAFETY: 呼び出し元の契約(この関数の Safety セクション)。
+            unsafe {
+                *out_id = id;
+            }
+            MwResult::Ok
+        }
+        None => MwResult::ErrInvalidHandle,
+    }
+}
+
+/// ロード済みサウンド(SE または楽曲)を解放する(初期構築仕様 §5.5)。
+///
+/// `id` の最上位ビット(`crate::handle::MUSIC_ID_FLAG`)を見て、SE 用ストレージ
+/// (`mw_core::SoundStorage`)・楽曲用ストレージ(`Instance::music_bytes`)の
+/// どちらを解放すべきか自動的に振り分ける(呼び出し側が意識する必要はない)。
+///
+/// - SE: 再生中のボイスがあれば、既定ランプ(§4.1/M13)経由で即座に停止させたうえで
+///   解放する。PCM の実データ(`Arc<SoundData>`)の最終的な解放(デアロケーション)は
+///   この呼び出し自身(ゲームスレッド)か、あるいは音声スレッドがボイス終了時に
+///   回収キューへ送り出したものをこの関数が(次回以降のこの種の呼び出しで)
+///   ドレインする経路のいずれかで起こる。いずれにせよ**音声コールバック内で `Arc`
+///   がドロップされることはない**(初期構築仕様「PCM データの所有権」)。
+/// - 楽曲: 拒否せず即座に解放する。**再生中の楽曲を release した場合でも安全**
+///   (`crate::handle::Instance::remove_music_bytes` のドキュメント参照——
+///   `mw_music_set` はバイト列の複製をデコードスレッドへ渡す設計のため、
+///   ここでの解放はデコード中の再生に一切影響しない)。
 ///
 /// 未知の `id`(未ロード・二重解放)は `MwResult::ErrInvalidSoundId` を返す(クラッシュしない)。
 #[unsafe(no_mangle)]
 pub extern "C" fn mw_sound_release(handle: u64, id: u64) -> MwResult {
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-        let result = handle_registry::with_instance(handle, |instance| {
-            instance.drain_reclaimed();
-            let removed = {
-                let mut sounds = instance
-                    .sounds
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                sounds.remove(mw_core::SoundId(id))
-            };
-            match removed {
-                Some(arc) => {
-                    let sent = instance
-                        .command_sender
-                        .send(mw_core::Command::StopVoicesUsingSound { sound_id: id });
-                    // ストレージ側が保持していた複製をここ(ゲームスレッド)でドロップする。
-                    // 音声スレッド側の複製(再生中ボイスがあれば)はまだ生きている。
-                    drop(arc);
-                    if sent {
-                        MwResult::Ok
-                    } else {
-                        MwResult::ErrCommandQueueFull
-                    }
-                }
-                None => MwResult::ErrInvalidSoundId,
-            }
-        });
-        result.unwrap_or(MwResult::ErrInvalidHandle)
+        if handle_registry::is_music_id(id) {
+            release_music(handle, id)
+        } else {
+            release_se(handle, id)
+        }
     }));
 
     match outcome {
         Ok(result) => result,
         Err(_) => MwResult::ErrPanic,
     }
+}
+
+fn release_se(handle: u64, id: u64) -> MwResult {
+    let result = handle_registry::with_instance(handle, |instance| {
+        instance.drain_reclaimed();
+        let removed = {
+            let mut sounds = instance
+                .sounds
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            sounds.remove(mw_core::SoundId(id))
+        };
+        match removed {
+            Some(arc) => {
+                let sent = instance
+                    .command_sender
+                    .send(mw_core::Command::StopVoicesUsingSound { sound_id: id });
+                // ストレージ側が保持していた複製をここ(ゲームスレッド)でドロップする。
+                // 音声スレッド側の複製(再生中ボイスがあれば)はまだ生きている。
+                drop(arc);
+                if sent {
+                    MwResult::Ok
+                } else {
+                    MwResult::ErrCommandQueueFull
+                }
+            }
+            None => MwResult::ErrInvalidSoundId,
+        }
+    });
+    result.unwrap_or(MwResult::ErrInvalidHandle)
+}
+
+fn release_music(handle: u64, id: u64) -> MwResult {
+    let result =
+        handle_registry::with_instance(handle, |instance| match instance.remove_music_bytes(id) {
+            Some(_bytes) => MwResult::Ok,
+            None => MwResult::ErrInvalidSoundId,
+        });
+    result.unwrap_or(MwResult::ErrInvalidHandle)
 }
 
 /// SE を即時発音する(初期構築仕様 §4.2, §5.5)。
@@ -596,6 +656,411 @@ pub extern "C" fn mw_music_play_scheduled(handle: u64, host_time_ns: u64) -> MwR
     }
 }
 
+// --- M2-7: 楽曲再生 -----------------------------------------------------------
+//
+// 初期構築仕様『§4.3 楽曲再生』/ 『§4.4 音楽クロック』/ 『§5.5』。
+// デコードスレッドの設計(1本だけ立ててデコーダをチャネル越しに差し替える、
+// 待ち方・ポーリング間隔)は `crate::decode_thread` モジュール doc を参照。
+
+/// 楽曲のストリーミング再生を準備する(初期構築仕様『§4.3 楽曲再生』『§5.5』)。
+///
+/// `sound_id` は `mw_sound_load(mode = Music)` が返した ID であること(SE の ID を
+/// 渡すと `MwResult::ErrInvalidSoundId` を返す——`crate::handle::MUSIC_ID_FLAG` に
+/// よる ID 空間分離が効いている)。
+///
+/// デコーダ(`mw_core::SymphoniaDecoder::open`)は**この呼び出しの中、ゲームスレッドで
+/// 開く**。ヘッダ読み取りでアロケーションが発生するが、ここはゲームスレッド経路
+/// なので初期構築仕様『§5.3』のリアルタイム安全性規約には抵触しない(デコード
+/// スレッドへは構築済みのデコーダをそのまま渡すだけで、以後の実際のデコード作業
+/// ―パケット読み・リサンプル―はすべてデコードスレッド側で行われる)。
+///
+/// **プリロールが済むまで状態は `Loading` のまま。** `mw_music_set` はデコーダを
+/// 差し替えるだけで、プリロールの完了を待たずに `MwResult::Ok` を返す
+/// (非ブロッキング、初期構築仕様『§5.4』)。C# 側は [`mw_music_state`] が
+/// `Ready` を返すまでポーリングする、という契約になる。
+///
+/// ## 曲の切り替えで前曲の PCM が漏れる問題への対処
+///
+/// リングバッファに前曲の PCM が残ったまま新しい曲が始まると、曲頭に前の曲が
+/// 数フレーム鳴ってしまう(`rtrb` は**消費側しか pop できない**ため、生産側
+/// (デコードスレッド)は自分でリングバッファを掃除できない)。M2-3 で入れた
+/// シーク調停(エポック ack 方式、`mw_core::stream` モジュール doc「シークの
+/// 調停」参照)がそのまま使えるため、次の順序を**必ず**守って処理する:
+///
+/// 1. 先に**デコーダを差し替える**(`Instance::send_decoder`)
+/// 2. そのあとで `Command::MusicPrepare`(状態機械を `Loading` から仕切り直す。
+///    M2-7 で追加)→ `Command::MusicStop`(前の曲が `Playing` 中でも `Prepare`
+///    適用後は no-op になる)→ `Command::MusicSeek { frames: 0 }`(リングバッファの
+///    掃除と epoch 更新を駆動する本体)の順で送る
+///
+/// **順序が逆だとデコードスレッドが古いデコーダのまま新しい epoch を ack して
+/// しまい壊れる**(先にシークだけ送ってしまうと、デコードスレッドが古いデコーダを
+/// シークして ack した「あと」に新しいデコーダへ差し替わり、シーク後に古い曲の
+/// 続きが積まれてしまう)。`MusicSeek` は消費側の `request_seek` を駆動するので、
+/// リングの掃除(一次防御)と epoch 更新が走り、ack が揃うまで古い PCM を
+/// 読み捨てる二次防御も効く(`mw_core::stream` モジュール doc 参照)。
+///
+/// # Safety
+/// この関数はポインタを取らない(引数はすべて値渡し)。
+#[unsafe(no_mangle)]
+pub extern "C" fn mw_music_set(handle: u64, sound_id: u64) -> MwResult {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        if !handle_registry::is_music_id(sound_id) {
+            return MwResult::ErrInvalidSoundId;
+        }
+
+        let result = handle_registry::with_instance(handle, |instance| {
+            let Some(bytes) = instance.get_music_bytes(sound_id) else {
+                return MwResult::ErrInvalidSoundId;
+            };
+            let output_sample_rate = instance.backend_sample_rate();
+
+            // `SymphoniaDecoder::open` は `Vec<u8>` を値で要求するため複製する
+            // (`Instance::remove_music_bytes` のドキュメント参照——この複製により
+            // デコードスレッドはストレージと独立したメモリを持つことになる)。
+            let decoder =
+                match mw_core::SymphoniaDecoder::open((*bytes).clone(), output_sample_rate) {
+                    Ok(decoder) => decoder,
+                    Err(err) => {
+                        mw_backend::mw_log!("[mw-ffi] mw_music_set: decode open failed: {err}");
+                        return match err {
+                            mw_core::DecodeError::InvalidSampleRate(_) => {
+                                MwResult::ErrUnsupportedSampleRate
+                            }
+                            mw_core::DecodeError::UnsupportedChannelCount(_) => {
+                                MwResult::ErrUnsupportedFormat
+                            }
+                            mw_core::DecodeError::Symphonia(_)
+                            | mw_core::DecodeError::NoAudioTrack
+                            | mw_core::DecodeError::Resample(_)
+                            | mw_core::DecodeError::ResetRequired => MwResult::ErrDecodeFailed,
+                        };
+                    }
+                };
+
+            // 1) 先にデコーダを差し替える(このドキュメントの「曲の切り替えで
+            //    前曲の PCM が漏れる問題への対処」参照。順序は変えないこと)。
+            if !instance.send_decoder(Box::new(decoder)) {
+                // 実運用では起こらない(`Instance::send_decoder` のドキュメント
+                // 参照)防御的分岐。
+                return MwResult::ErrCommandQueueFull;
+            }
+
+            // 2) そのあとでコマンドを送る。2通で足りる:
+            //    - `MusicPrepare`: 新しい曲として状態機械を仕切り直す(`MusicVoice::prepare`
+            //      が状態・位置・ループ区間・ゲイン・保留中の遷移を無条件に初期化する)。
+            //      **`MusicStop` ではこれの代わりにならない** —— `stop` は再生中だと
+            //      フェードアウトを予約するだけで状態は `Playing` のまま残り、続く
+            //      `MusicSeek` がその予約(`pending_settle`)を破棄してしまうため、
+            //      ゲイン 0 のまま `Playing` に居座って新しい曲が永久に無音になる
+            //      (`mixer.rs` の再現テスト参照)。
+            //    - `MusicSeek { frames: 0 }`: リングバッファの掃除と位置 0 への巻き戻しを
+            //      駆動する(消費側の `request_seek` を通す唯一の経路)。
+            //
+            //    `MusicPrepare` の後に `MusicStop` を挟む必要は無い。コマンドは同一
+            //    コールバックの先頭で発行順に処理されるため、その時点の状態は必ず
+            //    `Loading` であり `stop` は定義上の no-op になる(送っても何も起きない
+            //    ぶん、コマンドキューの枠を1つ無駄に使うだけ)。
+            let sent = instance.command_sender.send(mw_core::Command::MusicPrepare)
+                && instance
+                    .command_sender
+                    .send(mw_core::Command::MusicSeek { frames: 0 });
+            if sent {
+                MwResult::Ok
+            } else {
+                MwResult::ErrCommandQueueFull
+            }
+        });
+        result.unwrap_or(MwResult::ErrInvalidHandle)
+    }));
+
+    match outcome {
+        Ok(result) => result,
+        Err(_) => MwResult::ErrPanic,
+    }
+}
+
+/// 楽曲ボイスの再生状態を取得する(初期構築仕様『§4.3』『§5.5』)。
+///
+/// `out_state` には [`crate::types::MwMusicState`] の判別子(`Loading=0` /
+/// `Ready=1` / `Playing=2` / `Paused=3`)を書き込む。素の `i32` として渡す理由は
+/// `crates/mw-ffi/CLAUDE.md`「enum を FFI 引数に直接使わない理由」を参照
+/// (`MwMusicState` 自体は csbindgen が C# enum を生成するので、呼び出し側は
+/// 受け取った `int` をそのままキャストして使える)。
+///
+/// `mw_music_set` の呼び出し後は `Ready` になるまでこれをポーリングすること
+/// (`mw_music_set` のドキュメント参照)。
+///
+/// # Safety
+/// `out_state` は書き込み可能な `i32` を指す有効なポインタであるか、null で
+/// なければならない(null は書き込みを行わず `MwResult::ErrNullPointer`)。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mw_music_state(handle: u64, out_state: *mut i32) -> MwResult {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        if out_state.is_null() {
+            return MwResult::ErrNullPointer;
+        }
+        let result = handle_registry::with_instance(handle, |instance| {
+            let state = instance.music_clock_snapshot().state;
+            MwMusicState::from_core(state) as i32
+        });
+        match result {
+            Some(value) => {
+                // SAFETY: 上で null チェック済み。
+                unsafe {
+                    *out_state = value;
+                }
+                MwResult::Ok
+            }
+            None => MwResult::ErrInvalidHandle,
+        }
+    }));
+
+    match outcome {
+        Ok(result) => result,
+        Err(_) => MwResult::ErrPanic,
+    }
+}
+
+/// 楽曲を一時停止する(初期構築仕様『§4.3』の `mw_music_pause` に相当)。
+///
+/// `MusicVoice::pause` は既定ランプでフェードアウトしてから `Paused` へ収束する
+/// (M13)。`Playing` 以外からの呼び出しは音声スレッド側で no-op として無視される
+/// (クラッシュしない)。
+#[unsafe(no_mangle)]
+pub extern "C" fn mw_music_pause(handle: u64) -> MwResult {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        let result = handle_registry::with_instance(handle, |instance| {
+            let sent = instance.command_sender.send(mw_core::Command::MusicPause);
+            if sent {
+                MwResult::Ok
+            } else {
+                MwResult::ErrCommandQueueFull
+            }
+        });
+        result.unwrap_or(MwResult::ErrInvalidHandle)
+    }));
+
+    match outcome {
+        Ok(result) => result,
+        Err(_) => MwResult::ErrPanic,
+    }
+}
+
+/// 巻き戻し付きで再開する(初期構築仕様『§4.3』の `mw_music_resume_at` に相当。
+/// テンプレート仕様「中断対応」の「数秒巻き戻し + カウントダウン再開」の受け皿)。
+///
+/// `frames` へ再位置決めしたうえで既定ランプでフェードインする。`Loading` 中は
+/// 音声スレッド側で無視される(クラッシュしない)。
+#[unsafe(no_mangle)]
+pub extern "C" fn mw_music_resume_at(handle: u64, frames: u64) -> MwResult {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        let result = handle_registry::with_instance(handle, |instance| {
+            let sent = instance
+                .command_sender
+                .send(mw_core::Command::MusicResumeAt { frames });
+            if sent {
+                MwResult::Ok
+            } else {
+                MwResult::ErrCommandQueueFull
+            }
+        });
+        result.unwrap_or(MwResult::ErrInvalidHandle)
+    }));
+
+    match outcome {
+        Ok(result) => result,
+        Err(_) => MwResult::ErrPanic,
+    }
+}
+
+/// 楽曲ボイスをシークする(初期構築仕様『§4.3』の `mw_music_seek` に相当)。
+///
+/// ランプを経由しない不連続そのもの(`mw_core::Command::MusicSeek` のドキュメント
+/// 参照)。音楽クロックの世代カウンタ(§4.4)が進む。
+#[unsafe(no_mangle)]
+pub extern "C" fn mw_music_seek(handle: u64, frames: u64) -> MwResult {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        let result = handle_registry::with_instance(handle, |instance| {
+            let sent = instance
+                .command_sender
+                .send(mw_core::Command::MusicSeek { frames });
+            if sent {
+                MwResult::Ok
+            } else {
+                MwResult::ErrCommandQueueFull
+            }
+        });
+        result.unwrap_or(MwResult::ErrInvalidHandle)
+    }));
+
+    match outcome {
+        Ok(result) => result,
+        Err(_) => MwResult::ErrPanic,
+    }
+}
+
+/// 楽曲を停止する(初期構築仕様『§4.3』の `mw_music_stop` に相当)。
+///
+/// `Playing` 中は既定ランプでフェードアウトしてから位置を 0 に戻し `Ready` へ、
+/// `Paused` 中はランプ無しでその場で `Ready` へ戻る(`mw_core::MusicVoice::stop`
+/// 参照)。
+#[unsafe(no_mangle)]
+pub extern "C" fn mw_music_stop(handle: u64) -> MwResult {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        let result = handle_registry::with_instance(handle, |instance| {
+            let sent = instance.command_sender.send(mw_core::Command::MusicStop);
+            if sent {
+                MwResult::Ok
+            } else {
+                MwResult::ErrCommandQueueFull
+            }
+        });
+        result.unwrap_or(MwResult::ErrInvalidHandle)
+    }));
+
+    match outcome {
+        Ok(result) => result,
+        Err(_) => MwResult::ErrPanic,
+    }
+}
+
+/// 楽曲のループ区間を設定・解除する(初期構築仕様『§4.3』の `mw_music_set_loop` に
+/// 相当。選曲プレビュー用、フェードイン/アウト付き)。
+///
+/// **`begin_frames == 0 && end_frames == 0` はループ解除を意味する**
+/// (オーケストレータの決定、【仮】。変更する場合は
+/// [`LOOP_CLEAR_SENTINEL`] の1箇所を直せばよい)。それ以外で `begin_frames >=
+/// end_frames` は不正な区間として `MwResult::ErrInvalidLoopRegion` を返す
+/// (`mw_core::MusicVoice::set_loop` は同じ状況を音声スレッド側で黙ってループ無しに
+/// 丸めるが——リアルタイム安全性のためパニックできない設計——FFI 境界では
+/// 黙って捨てず明示的に拒否する)。
+#[unsafe(no_mangle)]
+pub extern "C" fn mw_music_set_loop(handle: u64, begin_frames: u64, end_frames: u64) -> MwResult {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        let region = if (begin_frames, end_frames) == LOOP_CLEAR_SENTINEL {
+            None
+        } else if begin_frames >= end_frames {
+            return MwResult::ErrInvalidLoopRegion;
+        } else {
+            Some((begin_frames, end_frames))
+        };
+
+        let result = handle_registry::with_instance(handle, |instance| {
+            let sent = instance
+                .command_sender
+                .send(mw_core::Command::MusicSetLoop { region });
+            if sent {
+                MwResult::Ok
+            } else {
+                MwResult::ErrCommandQueueFull
+            }
+        });
+        result.unwrap_or(MwResult::ErrInvalidHandle)
+    }));
+
+    match outcome {
+        Ok(result) => result,
+        Err(_) => MwResult::ErrPanic,
+    }
+}
+
+/// [`mw_music_set_loop`] のループ解除を表す `(begin_frames, end_frames)` の組
+/// (【仮】、オーケストレータの決定)。ここ1箇所を書き換えれば規約全体が変わる。
+const LOOP_CLEAR_SENTINEL: (u64, u64) = (0, 0);
+
+/// 音楽クロックのスナップショットを取得する(初期構築仕様『§4.4 音楽クロック』
+/// 『§5.5』)。**毎フレーム呼ばれる関数なので GC アロケーションゼロ**
+/// (初期構築仕様『§5.4』)——呼び出し側が確保した `out` へ blittable な
+/// [`MwMusicPosition`] を直接書き込む(`mw_poll_events` と同じ設計方針)。
+///
+/// フィールドは `mw_core::MusicClockSnapshot` に対応する
+/// (`song_frames`/`host_time_ns`/`sample_rate`/`state`/`is_playing`/`generation`)。
+/// `bool` 相当のフィールド(`is_playing`)を `u8` にした理由は
+/// [`MwMusicPosition`] のドキュメントを参照。
+///
+/// # Safety
+/// `out` は書き込み可能な [`MwMusicPosition`] を指す有効なポインタであるか、
+/// null でなければならない(null は書き込みを行わず `MwResult::ErrNullPointer`)。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mw_music_get_position(handle: u64, out: *mut MwMusicPosition) -> MwResult {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        if out.is_null() {
+            return MwResult::ErrNullPointer;
+        }
+        let result = handle_registry::with_instance(handle, |instance| {
+            let snapshot = instance.music_clock_snapshot();
+            MwMusicPosition {
+                song_frames: snapshot.song_frames,
+                host_time_ns: snapshot.host_time_ns,
+                sample_rate: snapshot.sample_rate,
+                state: MwMusicState::from_core(snapshot.state),
+                is_playing: snapshot.is_playing as u8,
+                generation: snapshot.generation,
+            }
+        });
+        match result {
+            Some(position) => {
+                // SAFETY: 上で null チェック済み。
+                unsafe {
+                    *out = position;
+                }
+                MwResult::Ok
+            }
+            None => MwResult::ErrInvalidHandle,
+        }
+    }));
+
+    match outcome {
+        Ok(result) => result,
+        Err(_) => MwResult::ErrPanic,
+    }
+}
+
+/// 出力レイテンシ(ns)を取得する(初期構築仕様『§5.5』`mw_get_output_latency_ns`)。
+///
+/// `Backend::output_latency_ns` の実測値をそのまま返す。**0 は「まだ不明」を
+/// 意味する**(オーディオコールバックが1度も走っていない。実測上 0ns ちょうどに
+/// なることはまず無いため、この特殊値を「たまたま 0ns だった」と取り違える実害は
+/// 無い——`mw_backend::Backend::output_latency_ns` のドキュメント参照)。
+///
+/// あわせて、`CpalBackend::log_output_latency_once`(1インスタンスにつき1回だけ
+/// ログへ残す)をこのゲームスレッド経路から呼ぶ(**コールバック内から呼んでは
+/// いけない**——`mw_log!` はアロケーションとロックを伴うため、初期構築仕様
+/// 『§5.3』のリアルタイム安全性規約に抵触する。`Instance::log_buffer_info_once`
+/// と同じ配線パターン)。
+///
+/// # Safety
+/// `out_ns` は書き込み可能な `u64` を指す有効なポインタであるか、null で
+/// なければならない(null は書き込みを行わず `MwResult::ErrNullPointer`)。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mw_get_output_latency_ns(handle: u64, out_ns: *mut u64) -> MwResult {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        if out_ns.is_null() {
+            return MwResult::ErrNullPointer;
+        }
+        let result = handle_registry::with_instance(handle, |instance| {
+            instance.log_output_latency_once();
+            instance.output_latency_ns()
+        });
+        match result {
+            Some(ns) => {
+                // SAFETY: 上で null チェック済み。
+                unsafe {
+                    *out_ns = ns;
+                }
+                MwResult::Ok
+            }
+            None => MwResult::ErrInvalidHandle,
+        }
+    }));
+
+    match outcome {
+        Ok(result) => result,
+        Err(_) => MwResult::ErrPanic,
+    }
+}
+
 // --- M2-6: イベント通知 -----------------------------------------------------
 //
 // 初期構築仕様 §4.6(確定)/ §5.4(GC アロケーションゼロ)/ §2 M4(C → C# の
@@ -849,6 +1314,162 @@ mod tests {
         assert_eq!(invalid_load, MwResult::ErrUnsupportedSampleRate);
 
         run_event_poll_checks(handle);
+        run_music_lifecycle(handle);
+    }
+
+    /// M2-7: 楽曲再生の一連の流れ(実ハンドル越し)。`run_se_lifecycle` と同じ理由
+    /// (グローバルレジストリはプロセス全体で共有される単一インスタンス)でここに
+    /// 集約する——デコードスレッドは `mw_init` の中で1本しか立たないため、
+    /// 別の `#[test]` 関数として独立に `mw_init` するとレジストリ・デコード
+    /// スレッドの両方で競合しうる。
+    fn run_music_lifecycle(handle: u64) {
+        // Music モードは圧縮のまま保持するだけでロード時に妥当性検証をしない
+        // (`load_music` 参照)ため、実際に有効な wav バイト列を渡しておく
+        // (`mw_music_set` が `SymphoniaDecoder::open` でデコードを試みるため)。
+        // 短い素材でも、総フレーム数に達し次第 EOF 経由で `is_ready()` が true に
+        // なる(`mw_core::stream` の `is_ready` ドキュメント参照)ので十分。
+        let music_bytes = make_pcm16_wav(48_000, 2, &vec![12345i16; 400]);
+
+        let mut music_id: u64 = 0;
+        let load_result = unsafe {
+            mw_sound_load(
+                handle,
+                music_bytes.as_ptr(),
+                music_bytes.len(),
+                1, // MwSoundMode::Music
+                &mut music_id as *mut u64,
+            )
+        };
+        assert_eq!(load_result, MwResult::Ok);
+        assert_ne!(music_id, 0);
+        assert!(
+            handle_registry::is_music_id(music_id),
+            "an id issued for Music mode must have MUSIC_ID_FLAG set"
+        );
+
+        // SE も並行してロードしておき、ID 空間の分離を実ハンドル越しに確認する
+        // 土台にする(このあと楽曲 ID を release しても SE 側が無事であることを見る)。
+        let se_bytes = make_pcm16_wav(48_000, 2, &[1000, -1000]);
+        let mut se_id: u64 = 0;
+        let se_load_result = unsafe {
+            mw_sound_load(
+                handle,
+                se_bytes.as_ptr(),
+                se_bytes.len(),
+                0, // MwSoundMode::Se
+                &mut se_id as *mut u64,
+            )
+        };
+        assert_eq!(se_load_result, MwResult::Ok);
+        assert!(!handle_registry::is_music_id(se_id));
+
+        // 楽曲 ID を SE 専用の API へ渡すとエラーになる(ストレージが分かれている
+        // ため、SoundStorage 側には存在しない ID として自然に弾かれる)。
+        let mut out_voice = 0u64;
+        assert_eq!(
+            unsafe { mw_se_play(handle, music_id, 1, 1.0, &mut out_voice as *mut u64) },
+            MwResult::ErrInvalidSoundId,
+            "a music id must not be usable as an SE id"
+        );
+
+        // mw_music_set: ストリーミング準備を開始する(非ブロッキング、
+        // プリロール完了は待たない)。
+        assert_eq!(mw_music_set(handle, music_id), MwResult::Ok);
+
+        // Ready になるまでポーリングする(デコードスレッドが pump するのを待つ、
+        // `mw_music_set` のドキュメント「状態は Loading のまま」契約の検証)。
+        let mut state = -1i32;
+        let became_ready = wait_until(
+            || {
+                let r = unsafe { mw_music_state(handle, &mut state as *mut i32) };
+                r == MwResult::Ok && state == MwMusicState::Ready as i32
+            },
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            became_ready,
+            "must become Ready once preroll completes; last observed state={state}"
+        );
+
+        // 音楽クロックのスナップショット(GC アロケーションゼロの blittable 構造体)。
+        let mut position = MwMusicPosition {
+            song_frames: 0,
+            host_time_ns: 0,
+            sample_rate: 0,
+            state: MwMusicState::Loading,
+            is_playing: 0,
+            generation: 0,
+        };
+        assert_eq!(
+            unsafe { mw_music_get_position(handle, &mut position as *mut MwMusicPosition) },
+            MwResult::Ok
+        );
+        assert_eq!(position.state, MwMusicState::Ready);
+        assert_eq!(position.is_playing, 0);
+
+        // ループ区間: 不正な区間は拒否、有効な区間→解除で通る。
+        assert_eq!(
+            mw_music_set_loop(handle, 5, 3),
+            MwResult::ErrInvalidLoopRegion
+        );
+        assert_eq!(mw_music_set_loop(handle, 0, 200), MwResult::Ok);
+        assert_eq!(
+            mw_music_set_loop(handle, 0, 0),
+            MwResult::Ok,
+            "(0, 0) must be accepted as \"clear the loop\""
+        );
+
+        // 楽曲制御 API 一式(コマンドキューへ積めることのみを見る。サンプル精度の
+        // 数値的な検証は mw-core 側のオフラインレンダリングテストで実施済み)。
+        assert_eq!(
+            mw_music_play_scheduled(handle, mw_host_time_ns()),
+            MwResult::Ok
+        );
+        assert_eq!(mw_music_pause(handle), MwResult::Ok);
+        assert_eq!(mw_music_resume_at(handle, 0), MwResult::Ok);
+        assert_eq!(mw_music_seek(handle, 10), MwResult::Ok);
+        assert_eq!(mw_music_stop(handle), MwResult::Ok);
+
+        // 出力レイテンシ(実デバイスの有無に関わらず、書き込み自体は成功するはず。
+        // 0 は「まだ未計測」を意味するだけで失敗ではない)。
+        let mut latency_ns = 0u64;
+        assert_eq!(
+            unsafe { mw_get_output_latency_ns(handle, &mut latency_ns as *mut u64) },
+            MwResult::Ok
+        );
+
+        // 楽曲バイト列を release しても SE 側は無事(ID 空間分離が効いていることの
+        // 実ハンドル越しの確認、依頼書のテスト要件)。
+        assert_eq!(mw_sound_release(handle, music_id), MwResult::Ok);
+        assert_eq!(
+            mw_sound_release(handle, music_id),
+            MwResult::ErrInvalidSoundId,
+            "double release of a music id must be rejected, not crash"
+        );
+
+        let mut se_voice = 0u64;
+        assert_eq!(
+            unsafe { mw_se_play(handle, se_id, 2, 1.0, &mut se_voice as *mut u64) },
+            MwResult::Ok,
+            "releasing a music id must not affect unrelated SE storage"
+        );
+        assert_eq!(mw_sound_release(handle, se_id), MwResult::Ok);
+    }
+
+    /// `f` が `true` を返すまで短い間隔でポーリングする(タイムアウト付き)。
+    /// デコードスレッドのポーリング周期(`crate::decode_thread::POLL_INTERVAL`)に
+    /// 対して十分粗い間隔で待つことで、フレーク耐性を上げつつビジーループにしない。
+    fn wait_until(mut f: impl FnMut() -> bool, timeout: std::time::Duration) -> bool {
+        let start = std::time::Instant::now();
+        loop {
+            if f() {
+                return true;
+            }
+            if start.elapsed() > timeout {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     /// M2-6: `mw_poll_events` の一連の流れ(実ハンドル越し)。
@@ -1017,19 +1638,24 @@ mod tests {
     }
 
     #[test]
-    fn sound_load_rejects_music_mode_in_m1() {
+    fn sound_load_accepts_music_mode_but_still_requires_a_valid_handle() {
+        // M2-7 より前は mode=1(Music)自体が非対応で `ErrUnsupportedSoundMode` を
+        // 返していた(このテストの旧名 `sound_load_rejects_music_mode_in_m1` の由来)。
+        // 今は Music モードは認識される有効な mode 値なので、mode 検証自体は通り、
+        // 後続のハンドル検証(`load_music` 内の `with_instance`)で弾かれる
+        // ——`ErrUnsupportedSoundMode` ではなく `ErrInvalidHandle` になることを固定化する。
         let wav_bytes = make_pcm16_wav(48_000, 1, &[0]);
         let mut out_id = 0u64;
         let result = unsafe {
             mw_sound_load(
-                1, // ハンドルの有効性より先に mode 検証が行われる
+                0xDEAD_BEEF_u64,
                 wav_bytes.as_ptr(),
                 wav_bytes.len(),
                 1, // MwSoundMode::Music
                 &mut out_id as *mut u64,
             )
         };
-        assert_eq!(result, MwResult::ErrUnsupportedSoundMode);
+        assert_eq!(result, MwResult::ErrInvalidHandle);
     }
 
     #[test]
@@ -1157,6 +1783,142 @@ mod tests {
     fn music_play_scheduled_with_invalid_handle_is_invalid_handle_not_a_crash() {
         assert_eq!(
             mw_music_play_scheduled(0xDEAD_BEEF_u64, 0),
+            MwResult::ErrInvalidHandle
+        );
+    }
+
+    // --- M2-7: 楽曲再生(ハンドル無し/インスタンス無しで固定化できる契約) --------
+    //
+    // 実ハンドル越しの一連の流れ(mw_music_set → Ready ポーリング → 楽曲制御 API →
+    // release)は `run_music_lifecycle` に集約済み(理由はそちらのドキュメント参照)。
+    // ここでは「無効ハンドルで全新規関数がクラッシュせず ErrInvalidHandle を返す」
+    // 「null ポインタで ErrNullPointer を返す」「ID 空間分離が効いている」という、
+    // インスタンス無しでも固定化できる契約に絞る。
+
+    #[test]
+    fn music_set_rejects_an_se_shaped_id_before_touching_the_handle() {
+        // MUSIC_ID_FLAG が立っていない ID(SE 用の ID 空間)を渡すとエラーになる。
+        // ハンドルの有効性より先にこの検証が行われる(`sound_load_rejects_unknown_mode`
+        // と同じ流儀: 値の検証はハンドル探索より前)。
+        assert_eq!(mw_music_set(1, 42), MwResult::ErrInvalidSoundId);
+    }
+
+    #[test]
+    fn music_set_with_invalid_handle_is_invalid_handle_not_a_crash() {
+        // MUSIC_ID_FLAG は立っているが、ロードされていない(存在しない)楽曲 ID。
+        let unloaded_music_id = handle_registry::MUSIC_ID_FLAG | 1;
+        assert_eq!(
+            mw_music_set(0xDEAD_BEEF_u64, unloaded_music_id),
+            MwResult::ErrInvalidHandle
+        );
+    }
+
+    #[test]
+    fn music_state_rejects_null_out_state() {
+        let result = unsafe { mw_music_state(1, std::ptr::null_mut()) };
+        assert_eq!(result, MwResult::ErrNullPointer);
+    }
+
+    #[test]
+    fn music_state_with_invalid_handle_is_invalid_handle_not_a_crash() {
+        let mut state = 0i32;
+        let result = unsafe { mw_music_state(0xDEAD_BEEF_u64, &mut state as *mut i32) };
+        assert_eq!(result, MwResult::ErrInvalidHandle);
+    }
+
+    #[test]
+    fn music_get_position_rejects_null_out() {
+        let result = unsafe { mw_music_get_position(1, std::ptr::null_mut()) };
+        assert_eq!(result, MwResult::ErrNullPointer);
+    }
+
+    #[test]
+    fn music_get_position_with_invalid_handle_is_invalid_handle_not_a_crash() {
+        let mut position = MwMusicPosition {
+            song_frames: 0,
+            host_time_ns: 0,
+            sample_rate: 0,
+            state: MwMusicState::Loading,
+            is_playing: 0,
+            generation: 0,
+        };
+        let result = unsafe {
+            mw_music_get_position(0xDEAD_BEEF_u64, &mut position as *mut MwMusicPosition)
+        };
+        assert_eq!(result, MwResult::ErrInvalidHandle);
+    }
+
+    #[test]
+    fn music_pause_resume_seek_stop_with_invalid_handle_are_invalid_handle_not_a_crash() {
+        assert_eq!(mw_music_pause(0xDEAD_BEEF_u64), MwResult::ErrInvalidHandle);
+        assert_eq!(
+            mw_music_resume_at(0xDEAD_BEEF_u64, 0),
+            MwResult::ErrInvalidHandle
+        );
+        assert_eq!(
+            mw_music_seek(0xDEAD_BEEF_u64, 0),
+            MwResult::ErrInvalidHandle
+        );
+        assert_eq!(mw_music_stop(0xDEAD_BEEF_u64), MwResult::ErrInvalidHandle);
+    }
+
+    #[test]
+    fn music_set_loop_rejects_invalid_region_before_touching_the_handle() {
+        // begin >= end かつループ解除((0, 0))でもない場合は不正。ハンドルの
+        // 有効性より先にこの検証が行われる(無効ハンドルでも区間検証の結果が
+        // そのまま返ることで確認できる)。
+        assert_eq!(
+            mw_music_set_loop(0xDEAD_BEEF_u64, 10, 10),
+            MwResult::ErrInvalidLoopRegion
+        );
+        assert_eq!(
+            mw_music_set_loop(0xDEAD_BEEF_u64, 10, 5),
+            MwResult::ErrInvalidLoopRegion
+        );
+    }
+
+    #[test]
+    fn music_set_loop_zero_zero_is_treated_as_clear_not_as_an_invalid_region() {
+        // (0, 0) はループ解除として扱われ、不正区間の検証には引っかからない。
+        // ハンドルが無効なので最終的な戻り値は ErrInvalidHandle になるが、これが
+        // ErrInvalidLoopRegion では *ない* こと自体が「(0, 0) は解除として区間検証を
+        // 通過した」ことの証拠になる。
+        assert_eq!(
+            mw_music_set_loop(0xDEAD_BEEF_u64, 0, 0),
+            MwResult::ErrInvalidHandle
+        );
+    }
+
+    #[test]
+    fn music_set_loop_with_a_valid_region_and_invalid_handle_is_invalid_handle_not_a_crash() {
+        assert_eq!(
+            mw_music_set_loop(0xDEAD_BEEF_u64, 0, 100),
+            MwResult::ErrInvalidHandle
+        );
+    }
+
+    #[test]
+    fn get_output_latency_ns_rejects_null_out_ns() {
+        let result = unsafe { mw_get_output_latency_ns(1, std::ptr::null_mut()) };
+        assert_eq!(result, MwResult::ErrNullPointer);
+    }
+
+    #[test]
+    fn get_output_latency_ns_with_invalid_handle_is_invalid_handle_not_a_crash() {
+        let mut out_ns = 0u64;
+        let result = unsafe { mw_get_output_latency_ns(0xDEAD_BEEF_u64, &mut out_ns as *mut u64) };
+        assert_eq!(result, MwResult::ErrInvalidHandle);
+    }
+
+    #[test]
+    fn sound_release_with_a_music_shaped_id_does_not_crash_and_does_not_touch_se_storage() {
+        // ハンドル自体は無効なので、最終的には(SE 経路と同じく)ErrInvalidHandle が
+        // 先に返る。ここでの主眼は「楽曲 ID を渡した経路(`release_music`)が
+        // クラッシュしないこと」——`mw_sound_release` の分岐(`is_music_id`)が
+        // 正しく `release_music` 側へ振り分けていることの間接証拠でもある。
+        let music_shaped_id = handle_registry::MUSIC_ID_FLAG | 999;
+        assert_eq!(
+            mw_sound_release(0xDEAD_BEEF_u64, music_shaped_id),
             MwResult::ErrInvalidHandle
         );
     }

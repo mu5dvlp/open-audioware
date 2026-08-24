@@ -10,17 +10,47 @@
 //!
 //! M1 で `Instance` にゲームスレッド側ハンドル(`CommandSender` / `ReclaimReceiver`)と
 //! サウンドストレージ・ボイスシリアル採番器を追加した(§5.2「コマンド/イベントキュー」)。
+//!
+//! M2-7 で楽曲再生(初期構築仕様『§4.3』)の下ごしらえを追加した:
+//! - デコードスレッド(`crate::decode_thread`)を `init()` で1本立て、`shutdown()` で
+//!   確実に停止・join する。
+//! - 楽曲(圧縮バイト列)のストレージ `music_bytes` と、その ID 採番・空間分離
+//!   (`MUSIC_ID_FLAG`)。SE の ID(`mw_core::SoundStorage` が採番)とは別空間にする
+//!   理由は [`MUSIC_ID_FLAG`] のドキュメント参照。
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::JoinHandle;
 
 use mw_backend::{Backend, CpalBackend};
-use mw_core::{CommandSender, Config, EventQueue, ReclaimReceiver, Renderer, SoundStorage};
+use mw_core::{
+    CommandSender, Config, EventQueue, MusicClockPublisher, MusicClockSnapshot, MusicDecoder,
+    ReclaimReceiver, Renderer, SoundStorage,
+};
+
+use crate::decode_thread::{self, DecoderSender};
 
 /// 出力デバイスが実際にオープンされるまでの暫定サンプルレート(§4.7 推奨の 48kHz)。
 /// `CpalBackend::open` がデバイスとネゴシエートした実レートで上書きする
 /// (`Renderer::set_sample_rate`、コールバックが動き出す前)。
 const PROVISIONAL_SAMPLE_RATE: u32 = 48_000;
+
+/// 楽曲(Music モード)の ID に立てる目印ビット(オーケストレータの決定)。
+///
+/// SE の ID は `mw_core::SoundStorage` が採番し `Arc<SoundData>`(デコード済み PCM)を
+/// 指す。楽曲は「圧縮のまま保持」(初期構築仕様『§5.5』)なので置き場所が違い
+/// (`Instance::music_bytes`)、同じ ID 空間を共有すると `mw_sound_release` が
+/// 誤って SE 側のエントリを消してしまう事故が起こりうる。そこで楽曲 ID は
+/// 最上位ビットを立てて空間を分離する。ID は C# から見て不透明な整数
+/// (初期構築仕様『§4.8』)なので、このビット演算による分離は呼び出し側に副作用を
+/// 持たない。
+pub const MUSIC_ID_FLAG: u64 = 1 << 63;
+
+/// `id` が楽曲(Music モード)の ID かどうかを判定する([`MUSIC_ID_FLAG`] 参照)。
+pub fn is_music_id(id: u64) -> bool {
+    id & MUSIC_ID_FLAG != 0
+}
 
 pub struct Instance {
     handle: u64,
@@ -36,6 +66,24 @@ pub struct Instance {
     next_voice_serial: AtomicU64,
     /// I/O バッファ長の実測ログを既に出したか(1インスタンスにつき1回だけ出す)。
     logged_buffer_info: AtomicBool,
+    /// 音楽クロック(初期構築仕様『§4.4』)の読み手。`mw_music_get_position`/
+    /// `mw_music_state` はここから seqlock 経由でロック無しに読む
+    /// (`Renderer::build` が返す `Arc<MusicClockPublisher>` をそのまま保持する)。
+    music_clock: Arc<MusicClockPublisher>,
+    /// 楽曲(圧縮バイト列)のストレージ。`mw_core::SoundStorage` には持たせない
+    /// ——mw-core は「オフラインレンダリングだけで完結する層」という位置づけで、
+    /// 未デコードの圧縮バイト列(ファイル形式のパースすら済んでいないもの)は
+    /// そこに属さない(`crates/mw-core/CLAUDE.md` 参照)。
+    music_bytes: Mutex<HashMap<u64, Arc<Vec<u8>>>>,
+    next_music_serial: AtomicU64,
+    /// デコードスレッドへ新しいデコーダを渡すハンドル(`mw_music_set` から使う。
+    /// `crate::decode_thread` モジュール doc 参照)。
+    decoder_tx: DecoderSender,
+    /// デコードスレッドの停止フラグ。`shutdown()` がこれを立ててから join する。
+    decode_thread_stop: Arc<AtomicBool>,
+    /// デコードスレッドの join ハンドル。`shutdown()` で必ず取り出して join する
+    /// (`Option` なのは `shutdown()` が `&mut self` で `take` するため)。
+    decode_thread: Option<JoinHandle<()>>,
 }
 
 impl Instance {
@@ -89,6 +137,84 @@ impl Instance {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.drain();
     }
+
+    /// 音楽クロックのスナップショットを取得する(`mw_music_state`/
+    /// `mw_music_get_position` から使う)。ロック無し(seqlock、`snapshot()` 自体の
+    /// ドキュメント参照)。
+    pub fn music_clock_snapshot(&self) -> MusicClockSnapshot {
+        self.music_clock.snapshot()
+    }
+
+    /// 楽曲(圧縮バイト列)を登録し、SE とは ID 空間を分離した不透明 ID を発行する
+    /// ([`MUSIC_ID_FLAG`] 参照)。
+    pub fn insert_music_bytes(&self, bytes: Vec<u8>) -> u64 {
+        // voice serial 採番(`next_voice_serial`)と同じ流儀: 0 を「未割当」として
+        // 避けるため `.max(1)` する。`MUSIC_ID_FLAG` を OR するので実際にはこの
+        // `.max(1)` が無くても id が 0 になることは無いが、採番ロジックの見た目を
+        // 他の採番器と揃えておく。
+        let serial = self
+            .next_music_serial
+            .fetch_add(1, Ordering::Relaxed)
+            .max(1);
+        let id = serial | MUSIC_ID_FLAG;
+        let mut map = self
+            .music_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.insert(id, Arc::new(bytes));
+        id
+    }
+
+    /// `id` に対応する楽曲バイト列の `Arc` 複製を返す(`mw_music_set` が使う)。
+    pub fn get_music_bytes(&self, id: u64) -> Option<Arc<Vec<u8>>> {
+        let map = self
+            .music_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.get(&id).cloned()
+    }
+
+    /// `id` をストレージから取り除く(`mw_sound_release` の楽曲 ID 経路)。
+    ///
+    /// 再生中の楽曲を release した場合の挙動: 拒否せず即座に解放を受け付ける。
+    /// `mw_music_set` は `SymphoniaDecoder::open` にバイト列の**複製**を渡す
+    /// (`SymphoniaDecoder::open` が `Vec<u8>` を値で要求するため)ので、デコード
+    /// スレッドが実際に読んでいるメモリはここで管理する `Arc<Vec<u8>>` とは
+    /// 最初から独立している。したがって release してもデコードスレッド側の
+    /// 再生には一切影響しない(参照カウントが尽きるまで生かす、という `Arc` 由来の
+    /// 間接的な挙動ではなく、そもそも別々のメモリになっている、という単純な話)。
+    pub fn remove_music_bytes(&self, id: u64) -> Option<Arc<Vec<u8>>> {
+        let mut map = self
+            .music_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.remove(&id)
+    }
+
+    /// デコードスレッドへ新しいデコーダを渡す(`mw_music_set` が使う)。
+    ///
+    /// 送信が失敗する(`false` を返す)のは、デコードスレッドの受信側が既に
+    /// 終了している場合のみ——通常はデコードスレッドはパニックしても内部で
+    /// `catch_unwind` して生き続ける(`crate::decode_thread` 参照)ため、
+    /// `mw_shutdown` 済みのハンドルを使い回そうとした場合を除き実運用では
+    /// 起こらない防御的分岐。
+    pub fn send_decoder(&self, decoder: Box<dyn MusicDecoder + Send>) -> bool {
+        self.decoder_tx.send(decoder).is_ok()
+    }
+
+    /// 出力レイテンシの実測値([`Backend::output_latency_ns`])を取得する
+    /// (`mw_get_output_latency_ns` が使う)。
+    pub fn output_latency_ns(&self) -> u64 {
+        self.backend.output_latency_ns()
+    }
+
+    /// 出力レイテンシの実測値を1回だけログへ出す
+    /// (`CpalBackend::log_output_latency_once` へ委譲)。`mw_get_output_latency_ns`
+    /// (ゲームスレッド経路)から呼ぶこと。コールバック内から呼んではいけない
+    /// (`mw_log!` はアロケーションとロックを伴う)。
+    pub fn log_output_latency_once(&self) {
+        self.backend.log_output_latency_once();
+    }
 }
 
 /// ハンドルは 1 から始まる単調増加の不透明 ID。0 は「未割当」を意味する予約値として使わない
@@ -133,21 +259,12 @@ pub fn init() -> InitOutcome {
         return InitOutcome::AlreadyOpen(instance.handle);
     }
 
-    // `music_stream_producer`(楽曲PCM供給の生産側)と `_music_clock`(音楽クロックの
-    // 読み手)は M2-5 時点ではまだ使い道が無いため、ここで破棄する。
-    // - `music_stream_producer` を実際に駆動するデコードスレッドはまだ無い
-    //   (楽曲ロード API `mw_music_set` 自体が未実装。M2-5 のスコープ外)。
-    //   誰も `pump` しないぶん楽曲ボイスは `MusicState::Loading` のまま
-    //   ——「まだロードする手段が無い」という現状を正直に反映しているだけで、
-    //   欺瞞ではない。`rtrb` の `Producer`/`Consumer` は片方を先に drop しても安全
-    //   (`Mixer` 側が保持する `Consumer` は無害に「供給が来ない」状態になるだけ)。
-    // - `Arc<MusicClockPublisher>` を読む FFI(`mw_music_get_position` 相当)は
-    //   まだ無い(初期構築仕様『§4.4』が M4 に位置づけている状態問い合わせ API)。
-    //   両方とも `Instance` へ保持する配線は、それぞれの利用側 FFI を実装する
-    //   後続作業でまとめて行う。
-    // `events`(イベントキュー)は M2-6 でここから使い始める(`mw_poll_events` と
-    // `CpalBackend::open` の両方へ同じ `Arc` を配る)。
-    let (renderer, command_sender, reclaim_receiver, _music_stream_producer, _music_clock, events) =
+    // `events`(イベントキュー)は M2-6 からここで使う(`mw_poll_events` と
+    // `CpalBackend::open` の両方へ同じ `Arc` を配る)。`music_stream_producer`
+    // (楽曲PCM供給の生産側)と `music_clock`(音楽クロックの読み手)は M2-7 で
+    // 実際に使い道ができた——前者はデコードスレッドへムーブし、後者は `Instance`
+    // へ保持して `mw_music_get_position`/`mw_music_state` から読む。
+    let (renderer, command_sender, reclaim_receiver, music_stream_producer, music_clock, events) =
         Renderer::build(Config::default(), PROVISIONAL_SAMPLE_RATE);
 
     let mut backend = CpalBackend::new();
@@ -156,8 +273,20 @@ pub fn init() -> InitOutcome {
         // 具体的な BackendError を必ず残す(docs/measurement-m1.md §7.6-1)。
         // MwResult は粒度が粗い(ErrBackendOpenFailed 一種)ので、詳細はこのログが唯一の手がかりになる。
         mw_backend::mw_log!("[mw-ffi] mw_init: backend open failed: {err}");
+        // `music_stream_producer` はここで(誰にも渡されないまま)ドロップされる。
+        // デコードスレッドはまだ立てていない(下の spawn より前でここへ抜けるため)
+        // ので、スレッドリークの心配は無い。
         return InitOutcome::Failed;
     }
+
+    // M2-7: デコードスレッドを1本立てる(`mw_music_set` のたびに立て直さない設計の
+    // 理由・待ち方・ポーリング間隔の根拠は `crate::decode_thread` モジュール doc
+    // 参照)。**バックエンドのオープンに成功した後でのみ**立てる——先に立ててしまうと、
+    // このあと何らかの理由で `Instance` を作らずに抜けた場合(現状はここでしか
+    // 早期リターンしないが)、スレッドを止め・join する手段(`decode_thread_stop`/
+    // `JoinHandle`)がどこにも保持されないまま孤立してしまう。
+    let (decoder_tx, decode_thread_stop, decode_thread_handle) =
+        decode_thread::spawn(music_stream_producer, Arc::clone(&events));
 
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
     *guard = Some(Instance {
@@ -169,6 +298,12 @@ pub fn init() -> InitOutcome {
         events,
         next_voice_serial: AtomicU64::new(1),
         logged_buffer_info: AtomicBool::new(false),
+        music_clock,
+        music_bytes: Mutex::new(HashMap::new()),
+        next_music_serial: AtomicU64::new(1),
+        decoder_tx,
+        decode_thread_stop,
+        decode_thread: Some(decode_thread_handle),
     });
     InitOutcome::Opened(handle)
 }
@@ -198,10 +333,27 @@ pub fn shutdown(handle: u64) -> ShutdownOutcome {
     // 見つかったインスタンスをレジストリから外す。`close` が失敗しても状態は握ったままに
     // しない(二重 shutdown は次回呼び出しで ErrInvalidHandle として検出されるため)。
     match guard.take() {
-        Some(mut instance) => match instance.backend.close() {
-            Ok(()) => ShutdownOutcome::Closed,
-            Err(_) => ShutdownOutcome::CloseFailed,
-        },
+        Some(mut instance) => {
+            // M2-7: デコードスレッドを確実に停止・join する(`mw_init` で1本だけ
+            // 立てたぶん、`mw_shutdown` で確実に回収する。スレッドリーク防止)。
+            // 最大で `decode_thread::POLL_INTERVAL` 分だけこの呼び出しがブロックし
+            // うるが、`mw_shutdown` は毎フレーム呼ぶ関数ではない一度きりの終了処理
+            // なので、初期構築仕様『§5.4』の「全関数非ブロッキング」が要求する
+            // 粒度の対象外とみなす(既存の `backend.close()` も内部でストリームの
+            // 停止を同期的に待つ設計になっている)。
+            instance.decode_thread_stop.store(true, Ordering::Relaxed);
+            if let Some(join_handle) = instance.decode_thread.take() {
+                // デコードスレッド内部は catch_unwind で panic を握りつぶす設計
+                // (`crate::decode_thread` 参照)なので、ここでの `Err`(パニック伝播)
+                // は理論上起こらない。万一起きても shutdown 自体は続行する
+                // (join 失敗を理由にハンドルを不定状態のまま残さない)。
+                let _ = join_handle.join();
+            }
+            match instance.backend.close() {
+                Ok(()) => ShutdownOutcome::Closed,
+                Err(_) => ShutdownOutcome::CloseFailed,
+            }
+        }
         // 直前の `is_valid` チェックで Some を確認済みのため到達しない防御的分岐。
         None => ShutdownOutcome::InvalidHandle,
     }

@@ -71,6 +71,25 @@ pub enum Command {
     /// プリロール完了前(`MusicState::Loading`)に予約時刻が到来した場合はエラーにせず、
     /// 「準備完了後、可能な最速時刻」へ繰り下げる 【仮】(`mixer.rs::MusicSchedule` 参照)。
     MusicPlayScheduled { host_time_ns: u64 },
+    /// 新しい楽曲を準備する(初期構築仕様『§4.3』の「準備(プリロール込み)」/
+    /// `mw_music_set` に相当。M2-7)。
+    ///
+    /// `MusicVoice::prepare` は状態を `Loading` へ戻し、位置・ループ区間・保留中の
+    /// フェード遷移をすべて捨てて仕切り直す(目標音量だけは曲をまたいで保持する。
+    /// `MusicVoice::prepare` 自身のドキュメント参照)。以降の `render` で
+    /// `source.is_ready()` が true になった時点で自動的に `Ready` へ遷移する
+    /// ——`mw_music_state()` が最終的に `Ready` を返すまでのポーリング契約は
+    /// この遷移に乗っている。
+    ///
+    /// **リングバッファへ残った前曲の PCM を掃除する役目はこのコマンドには無い**
+    /// (`MusicVoice::prepare` は `MusicFrameSource` に一切触れない)。曲切り替え時の
+    /// 掃除は `mw-ffi::mw_music_set` が直後に送る `MusicSeek { frames: 0 }` が
+    /// `source.request_seek` 経由で行う(`stream.rs` モジュール doc「シークの調停」
+    /// 参照)。`MusicPrepare` を先に送っておくことで、直後の `MusicStop`(§4.3 の
+    /// 手順どおり送るが、`Loading` から見ると no-op になる)がまだ `Playing` だった
+    /// 前曲のフェードアウト中に割り込む余地を作らない——`prepare` が
+    /// `pending_settle`/`gain` を無条件に初期化してしまうため。
+    MusicPrepare,
     /// 楽曲ボイスをシークする(初期構築仕様『§4.3』の `mw_music_seek` に相当)。
     ///
     /// `MusicVoice::seek` はランプを経由しない不連続そのものであり、`MusicRenderOutcome`

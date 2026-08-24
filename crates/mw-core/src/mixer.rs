@@ -322,6 +322,9 @@ impl Mixer {
             Command::MusicPlayScheduled { host_time_ns } => {
                 self.music_schedule.schedule(host_time_ns);
             }
+            Command::MusicPrepare => {
+                self.music_voice.prepare();
+            }
             Command::MusicSeek { frames } => {
                 self.music_voice.seek(frames, &mut self.music_source);
             }
@@ -1531,5 +1534,106 @@ mod tests {
         let mut buf3 = vec![0.0; 4 * CHANNELS];
         mixer.render(&mut buf3, 200_000 * NS_PER_SAMPLE);
         assert_eq!(music_clock.snapshot().generation, 1);
+    }
+
+    // =====================================================================
+    // M2-7: 楽曲ロード(`Command::MusicPrepare`, `mw-ffi::mw_music_set` の下ごしらえ)
+    // =====================================================================
+
+    #[test]
+    fn music_prepare_command_resets_to_loading_and_clears_loop_region_even_while_playing() {
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+        make_music_ready(&mut mixer, &mut producer, 1.0);
+
+        // ループ終端(1000)をこのレンダリング範囲よりずっと先に置き、途中で
+        // 折り返さないようにする(このテストの主眼は「position が進んだこと」を
+        // 素直に確認することであり、折り返しの往復で偶然 0 に戻る余地を無くす)。
+        sender.send(Command::MusicSetLoop {
+            region: Some((0, 1_000)),
+        });
+        sender.send(Command::MusicPlayScheduled { host_time_ns: 0 });
+        let mut buf = vec![0.0; 50 * CHANNELS];
+        mixer.render(&mut buf, 0);
+        assert_eq!(mixer.music_state(), MusicState::Playing);
+        assert!(mixer.music_voice.position_frames() > 0);
+
+        sender.send(Command::MusicPrepare);
+        let mut after = vec![0.0; CHANNELS];
+        mixer.render(&mut after, 0);
+
+        // `MusicVoice::prepare` は `MusicFrameSource` に一切触れない(モジュール doc
+        // 参照)ため、リングバッファに前曲の PCM がまだ残っていれば `is_ready()` は
+        // 真のままで、`state` はこの同じ render 呼び出しの中で `Loading` から
+        // すぐ `Ready` へ戻ることがある(`MusicVoice::render` の自動遷移)。
+        // ここで固定化したいのは「二度と `Playing` には戻らない(ゲインが 0 で
+        // 固まったまま鳴り続ける事故が起きない)」ことと、位置・ループ区間が
+        // 確実にリセットされることの2点——リングバッファ自体の掃除
+        // (`is_ready()` を本当に偽へ戻す)は `MusicSeek` の役目であり、その
+        // 組み合わせは `music_set_command_sequence_recovers_cleanly_from_a_song_still_playing`
+        // で別途検証する。
+        assert_ne!(
+            mixer.music_state(),
+            MusicState::Playing,
+            "prepare must never leave the voice stuck in Playing with a frozen gain"
+        );
+        assert_eq!(mixer.music_voice.position_frames(), 0);
+        assert_eq!(mixer.music_voice.loop_region(), None);
+    }
+
+    /// `mw-ffi::mw_music_set` が送る3コマンドの並び(`MusicPrepare` → `MusicStop` →
+    /// `MusicSeek { frames: 0 }`)を実際に踏んだときの結果を固定化する回帰テスト。
+    ///
+    /// この順序が肝心な理由: 前の曲が `Playing` 中に曲を切り替えると、`MusicPrepare`
+    /// より先に `MusicStop` だけを送った場合は `pending_settle = Stop` を積んで
+    /// ゲインを 0 へ向けてランプさせる。そこへ`MusicSeek` が
+    /// `pending_settle = None`(位置の付け替えは保留中のフェードの前提を壊すため
+    /// 破棄する、`MusicVoice::seek` 参照)を上書きしてしまうと、`state` は
+    /// `Playing` のまま・ゲインは 0 へ向かったランプの target だけが残り、
+    /// 誰も戻さないまま鳴らなくなる(新しい曲が無音のまま「再生中」になる事故)。
+    /// `MusicPrepare` を先に送ることで `pending_settle`/`gain` を無条件で
+    /// 初期化しておき、直後の `MusicStop` を完全な no-op にしてこの事故を防ぐ。
+    #[test]
+    fn music_set_command_sequence_recovers_cleanly_from_a_song_still_playing() {
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+        make_music_ready(&mut mixer, &mut producer, 1.0);
+
+        sender.send(Command::MusicPlayScheduled { host_time_ns: 0 });
+        let mut buf = vec![0.0; 50 * CHANNELS];
+        mixer.render(&mut buf, 0);
+        assert_eq!(mixer.music_state(), MusicState::Playing);
+
+        // mw_music_set が実際に送る3コマンド(この順序で)。
+        sender.send(Command::MusicPrepare);
+        sender.send(Command::MusicStop);
+        sender.send(Command::MusicSeek { frames: 0 });
+        let mut after = vec![0.0; CHANNELS];
+        mixer.render(&mut after, 0);
+
+        assert_eq!(mixer.music_state(), MusicState::Loading);
+        assert_eq!(mixer.music_voice.position_frames(), 0);
+
+        // 新しい曲としてプリロールを満たせば、ゲインが固まったりせず正しく
+        // フェードインして聞こえる(固まっていたら振幅が 0 のまま伸びない)。
+        let mut decoder2 = ConstantDecoder {
+            cursor: 0,
+            value: 1.0,
+        };
+        producer.pump(&mut decoder2).expect("pump must succeed");
+        let mut warmup = vec![0.0; 4 * CHANNELS];
+        mixer.render(&mut warmup, 0);
+        assert_eq!(mixer.music_state(), MusicState::Ready);
+
+        sender.send(Command::MusicPlayScheduled { host_time_ns: 0 });
+        let ramp_len = ms_to_samples(Config::DEFAULT_RAMP_MS, TEST_SAMPLE_RATE) as usize;
+        let mut settle = vec![0.0; (ramp_len + 10) * CHANNELS];
+        mixer.render(&mut settle, 0);
+        assert_eq!(mixer.music_state(), MusicState::Playing);
+        let last = settle[(ramp_len + 9) * CHANNELS];
+        assert!(
+            (last - 1.0).abs() < 1e-4,
+            "must fade in to full volume, not stay stuck silent forever; got {last}"
+        );
     }
 }

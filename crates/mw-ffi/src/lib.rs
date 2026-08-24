@@ -11,6 +11,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod decode_thread;
 mod event;
 mod ffi;
 mod handle;
