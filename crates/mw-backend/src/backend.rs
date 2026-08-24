@@ -88,4 +88,36 @@ pub trait Backend {
     /// オープン時にデバイスとネゴシエートしたサンプルレート。未オープンなら 0。
     /// [`Backend::last_callback_frames`] をミリ秒へ換算するのに要る。
     fn sample_rate(&self) -> u32;
+
+    /// 直近のオーディオコールバックにおける出力レイテンシ(ns)。まだ1度もコールバックが
+    /// 走っていなければ 0(「まだ不明」を意味する。実測上 0ns ちょうどになることは
+    /// まず無いため、この特殊値と「たまたま 0ns だった」を取り違える実害は無い)。
+    ///
+    /// cpal の `OutputCallbackInfo::timestamp()` が返す `OutputStreamTimestamp` の
+    /// `playback`(このバッファが実際にスピーカー/DAC へ出力されると cpal が予測する
+    /// 時刻)と `callback`(このコールバックが呼ばれた時刻)の差、`playback - callback`。
+    /// 両フィールドの意味は cpal 0.18.1 のソース(`timestamp.rs` の
+    /// `OutputStreamTimestamp` doc)で確認済み。時計源はホストごとに異なる
+    /// (macOS/iOS の CoreAudio は `mach_absolute_time()`、Android の AAudio は
+    /// `AAudioStream_getTimestamp(CLOCK_MONOTONIC)` 等)が、`StreamInstant` のdocに
+    /// 「同一ストリーム内では全インスタントが同じ時計を共有する」とある通り、
+    /// 同一コールバック呼び出し内の `playback`/`callback` 同士の引き算は意味を持つ。
+    ///
+    /// **これが表すのは cpal/OS が申告する「バッファ→スピーカー」間の遅延だけ**であり、
+    /// `docs/measurement-m1.md` で実測している「タップ→音」のエンドツーエンド遅延
+    /// (画面の入力検出・タッチイベントのディスパッチ・OS ミキサ等も含む)とは別物。
+    /// 初期構築仕様 §5.5 `mw_get_output_latency_ns` の値の供給元だが、これ単体を
+    /// タップ→音の遅延と混同しないこと。
+    ///
+    /// **iOS では同じ落とし穴がある可能性がある。** [`Backend::last_callback_frames`]
+    /// のdocの通り、iOS の `AVAudioSession` は希望した I/O バッファ長をそのまま
+    /// 採用したかのように申告することがある(`crates/mw-ffi/src/handle.rs::Instance::
+    /// log_buffer_info_once` / `docs/measurement-m1.md` §8.7)。cpal が `playback`
+    /// タイムスタンプを算出する際に OS 側の「希望値」を額面通り使っていれば、この
+    /// 差分も実測ではなく申告上の値になりうる。実機では
+    /// [`Backend::last_callback_frames`] の実測値と突き合わせて裏取りすること。
+    ///
+    /// 音声スレッドがアトミックに書き、ゲームスレッドが読む(コールバック側の追加コストは
+    /// 減算1回+アトミックストア1回。リアルタイム安全性規約に抵触しない)。
+    fn output_latency_ns(&self) -> u64;
 }

@@ -6,7 +6,7 @@
 
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig, SupportedStreamConfig};
@@ -24,6 +24,12 @@ pub struct CpalBackend {
     /// 音声スレッドが書き、ゲームスレッドが読む「直近のコールバックのフレーム数」。
     /// 詳細は [`Backend::last_callback_frames`]。
     callback_frames: Arc<AtomicU32>,
+    /// 音声スレッドが書き、ゲームスレッドが読む「直近の出力レイテンシ(ns)」。
+    /// 詳細は [`Backend::output_latency_ns`]。
+    output_latency_ns: Arc<AtomicU64>,
+    /// [`CpalBackend::log_output_latency_once`] が既にログを出したか。
+    /// 1オープンにつき1回だけ出す(`close` でリセットする)。
+    logged_output_latency: AtomicBool,
     /// オープン時にネゴシエートしたサンプルレート(未オープンなら 0)。
     sample_rate: u32,
 }
@@ -33,8 +39,37 @@ impl CpalBackend {
         Self {
             stream: None,
             callback_frames: Arc::new(AtomicU32::new(0)),
+            output_latency_ns: Arc::new(AtomicU64::new(0)),
+            logged_output_latency: AtomicBool::new(false),
             sample_rate: 0,
         }
+    }
+
+    /// 出力レイテンシの実測値([`Backend::output_latency_ns`])を、1オープンにつき
+    /// 1回だけログへ出す。実機デバッグで「実際にどれだけの出力レイテンシが申告されて
+    /// いるか」を起動ログから追えるようにするため
+    /// (`crates/mw-ffi/src/handle.rs::Instance::log_buffer_info_once` と同じ動機・設計)。
+    ///
+    /// コールバックがまだ1度も走っておらず [`Backend::output_latency_ns`] が 0(未計測)
+    /// を返す間は何もせず、次に呼ばれた機会に持ち越す。
+    ///
+    /// **ゲームスレッドから呼ぶこと。** `mw_log!` は `format!` によるヒープアロケーションと
+    /// stderr/logcat のロックを伴うため、音声コールバック経路(音声スレッド)からは
+    /// 呼んではならない(`crates/mw-core/CLAUDE.md` のリアルタイム安全性規約)。
+    pub fn log_output_latency_once(&self) {
+        if self.logged_output_latency.load(Ordering::Relaxed) {
+            return;
+        }
+        let latency_ns = self.output_latency_ns();
+        if latency_ns == 0 {
+            return;
+        }
+        self.logged_output_latency.store(true, Ordering::Relaxed);
+        let latency_ms = latency_ns as f64 / 1_000_000.0;
+        crate::mw_log!(
+            "[mw-backend] output latency (measured, cpal playback - callback timestamp): \
+             {latency_ns} ns = {latency_ms:.3} ms"
+        );
     }
 }
 
@@ -94,6 +129,7 @@ impl Backend for CpalBackend {
             &config,
             renderer,
             Arc::clone(&self.callback_frames),
+            Arc::clone(&self.output_latency_ns),
             events,
         )?;
         stream
@@ -115,6 +151,8 @@ impl Backend for CpalBackend {
                 drop(stream);
                 self.sample_rate = 0;
                 self.callback_frames.store(0, Ordering::Relaxed);
+                self.output_latency_ns.store(0, Ordering::Relaxed);
+                self.logged_output_latency.store(false, Ordering::Relaxed);
                 Ok(())
             }
             None => Err(BackendError::NotOpen),
@@ -131,6 +169,10 @@ impl Backend for CpalBackend {
 
     fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    fn output_latency_ns(&self) -> u64 {
+        self.output_latency_ns.load(Ordering::Relaxed)
     }
 }
 
@@ -254,6 +296,7 @@ fn build_output_stream(
     config: &StreamConfig,
     mut renderer: Renderer,
     callback_frames: Arc<AtomicU32>,
+    output_latency_ns: Arc<AtomicU64>,
     events: Arc<EventQueue>,
 ) -> Result<cpal::Stream, BackendError> {
     let err_fn = move |err: cpal::Error| {
@@ -276,6 +319,8 @@ fn build_output_stream(
                 // ロック・IO をしないためリアルタイム安全性規約(§5.3)に抵触しない。
                 callback_frames.store((data.len() / CHANNELS) as u32, Ordering::Relaxed);
 
+                let timestamp = info.timestamp();
+
                 // このバッファの先頭フレームが実際に DAC から出力される(と cpal が
                 // 予測する)ホスト単調時刻(初期構築仕様『§4.4』の「デバイスのタイムスタンプ
                 // API」に相当)。`StreamInstant::as_nanos()` は `crate::host_time::host_time_ns`
@@ -283,14 +328,28 @@ fn build_output_stream(
                 // 調査結果を記載済み)ため、直接比較可能な ns 値としてそのまま渡せる。
                 // `u128 → u64` の切り捨ては現実的な稼働時間では発生しない(u64 ns は
                 // 約584年ぶん表現できる)。
-                let buffer_start_host_time_ns = info.timestamp().playback.as_nanos() as u64;
+                let buffer_start_host_time_ns = timestamp.playback.as_nanos() as u64;
+
+                // 出力レイテンシの実測用(`Backend::output_latency_ns` のdoc参照)。
+                // `playback`(このバッファがスピーカーへ出る予測時刻)と `callback`
+                // (このコールバックが呼ばれた時刻)は同一コールバック呼び出し内の
+                // 値なので同じ時計を共有しており、引き算に意味がある(cpal
+                // `StreamInstant` のdoc参照)。時刻が逆転してもパニックしないよう
+                // `saturating_sub` を使う——実機ではまず起こらないはずだが、ホスト側の
+                // タイムスタンプ実装のバグ・精度不足で `callback > playback` になった
+                // 場合に音声スレッドを絶対にパニックさせないための保険。
+                let callback_host_time_ns = timestamp.callback.as_nanos() as u64;
+                output_latency_ns.store(
+                    buffer_start_host_time_ns.saturating_sub(callback_host_time_ns),
+                    Ordering::Relaxed,
+                );
 
                 // ここが音声スレッド上のオーディオコールバック本体。`renderer` はこの
                 // クロージャへムーブ済みで、以後は音声スレッドの単一の書き手が
                 // `&mut` で触るだけ(ロックも `Arc` 共有も無い。§5.3)。呼ぶのは
                 // `Renderer::render` のみに保つ(`crates/mw-backend/CLAUDE.md` の設計意図。
-                // 上の2行は cpal が既に計算済みの構造体を読むだけで、mw-core の別関数を
-                // 追加で呼んではいない)。
+                // 上の数行は cpal が既に計算済みの構造体を読んでアトミックストアするだけで、
+                // mw-core の別関数を追加で呼んではいない)。
                 // `Renderer::render` はリアルタイム安全性規約(§5.3)を満たす実装である前提。
                 renderer.render(data, buffer_start_host_time_ns);
             },
