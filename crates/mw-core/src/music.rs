@@ -52,6 +52,38 @@ pub enum MusicState {
     Paused,
 }
 
+impl MusicState {
+    /// `clock.rs::MusicClockPublisher` が seqlock 内で保持する数値表現との対応。
+    ///
+    /// `MusicState` 自体を `AtomicU8` に直接乗せることはできない(enum は atomic 型ではない)
+    /// ため、seqlock の内側でだけ使う安定した数値表現をここに固定する。FFI 境界
+    /// (`mw_music_state()` / `MwMusicPosition`)でも同じ並び(Loading=0 / Ready=1 /
+    /// Playing=2 / Paused=3、初期構築仕様『§5.5』に列挙された順序のまま)を C# 側の
+    /// enum へ csbindgen で生成する想定。
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            MusicState::Loading => 0,
+            MusicState::Ready => 1,
+            MusicState::Playing => 2,
+            MusicState::Paused => 3,
+        }
+    }
+
+    /// [`Self::to_u8`] の逆変換。
+    ///
+    /// 未知の値(本来起こらないが、seqlock の再試行上限到達などで理論上ありうる)は
+    /// `Loading` にフォールバックする——パニックしない(§5.3)ことを優先し、
+    /// 「まだ鳴らせない」という最も安全側の状態に倒す。
+    pub const fn from_u8(value: u8) -> Self {
+        match value {
+            1 => MusicState::Ready,
+            2 => MusicState::Playing,
+            3 => MusicState::Paused,
+            _ => MusicState::Loading,
+        }
+    }
+}
+
 /// 楽曲 PCM の供給元(初期構築仕様『§4.7 デコードとリサンプリング』)。
 ///
 /// 後続作業で Symphonia のストリーミングデコーダ(専用デコードスレッド + リングバッファ)が
@@ -1001,5 +1033,25 @@ mod tests {
             "chunked bulk reads must stay far below one read per frame, got {}",
             fresh_source.read_calls
         );
+    }
+
+    /// `clock.rs::MusicClockPublisher` の seqlock が乗せる数値表現の往復が壊れていないこと
+    /// (初期構築仕様『§5.5』の `mw_music_state()` / `MwMusicPosition` が使う対応表)。
+    #[test]
+    fn state_to_u8_round_trips_for_all_variants() {
+        for state in [
+            MusicState::Loading,
+            MusicState::Ready,
+            MusicState::Playing,
+            MusicState::Paused,
+        ] {
+            assert_eq!(MusicState::from_u8(state.to_u8()), state);
+        }
+    }
+
+    /// 未知の数値は(パニックせず)最も安全側の `Loading` にフォールバックする。
+    #[test]
+    fn state_from_u8_falls_back_to_loading_for_unknown_values() {
+        assert_eq!(MusicState::from_u8(255), MusicState::Loading);
     }
 }

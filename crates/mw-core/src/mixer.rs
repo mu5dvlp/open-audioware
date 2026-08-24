@@ -325,6 +325,18 @@ impl Mixer {
             Command::MusicSeek { frames } => {
                 self.music_voice.seek(frames, &mut self.music_source);
             }
+            Command::MusicPause => {
+                self.music_voice.pause();
+            }
+            Command::MusicResumeAt { frames } => {
+                self.music_voice.resume_at(frames, &mut self.music_source);
+            }
+            Command::MusicStop => {
+                self.music_voice.stop();
+            }
+            Command::MusicSetLoop { region } => {
+                self.music_voice.set_loop(region);
+            }
         }
     }
 
@@ -516,7 +528,7 @@ impl Mixer {
             self.music_voice.position_frames(),
             buffer_end_ns,
             self.sample_rate,
-            self.music_voice.state() == MusicState::Playing,
+            self.music_voice.state(),
         );
     }
 
@@ -1333,5 +1345,191 @@ mod tests {
         } else {
             assert!(!out.contains(&Event::ClipperEngaged));
         }
+    }
+
+    // =====================================================================
+    // M2-7: 楽曲制御コマンドの拡充(pause/resume_at/stop/set_loop)
+    // =====================================================================
+    //
+    // `MusicVoice` 自体の状態機械(フェード・ループ折り返し・不連続フラグ)は
+    // `music.rs` のユニットテストで既に検証済み。ここでは「`Command` 経由でコマンド
+    // キューを通しても同じ結果になること」(= このファイルの配線が正しいこと)に絞る。
+
+    #[test]
+    fn music_pause_command_freezes_position_then_resume_at_command_restarts_from_given_frame() {
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+        make_music_ready(&mut mixer, &mut producer, 1.0);
+
+        sender.send(Command::MusicPlayScheduled { host_time_ns: 0 });
+        let mut buf = vec![0.0; 50 * CHANNELS];
+        mixer.render(&mut buf, 0);
+        assert_eq!(mixer.music_state(), MusicState::Playing);
+
+        sender.send(Command::MusicPause);
+        // 既定ランプが尽きるだけの余裕を与える(`music.rs::tests::pause_fades_out_...`
+        // と同じ考え方)。
+        let ramp_len = ms_to_samples(Config::DEFAULT_RAMP_MS, TEST_SAMPLE_RATE) as usize;
+        let mut settle = vec![0.0; (ramp_len + 10) * CHANNELS];
+        mixer.render(&mut settle, 0);
+        assert_eq!(mixer.music_state(), MusicState::Paused);
+
+        let frozen = mixer.music_voice.position_frames();
+        let mut idle = vec![0.0; 20 * CHANNELS];
+        mixer.render(&mut idle, 0);
+        assert_eq!(
+            mixer.music_voice.position_frames(),
+            frozen,
+            "a paused voice must not advance while no command arrives"
+        );
+
+        sender.send(Command::MusicResumeAt { frames: 3 });
+        let mut resumed = vec![0.0; CHANNELS];
+        mixer.render(&mut resumed, 0);
+        assert_eq!(mixer.music_state(), MusicState::Playing);
+        assert_eq!(
+            mixer.music_voice.position_frames(),
+            3,
+            "resume_at must reposition immediately, not after the fade-in settles"
+        );
+    }
+
+    #[test]
+    fn music_stop_command_returns_to_ready_and_resets_position_to_zero() {
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+        make_music_ready(&mut mixer, &mut producer, 1.0);
+
+        sender.send(Command::MusicPlayScheduled { host_time_ns: 0 });
+        let mut buf = vec![0.0; 50 * CHANNELS];
+        mixer.render(&mut buf, 0);
+        assert!(
+            mixer.music_voice.position_frames() > 0,
+            "test setup must actually have advanced before stopping"
+        );
+
+        sender.send(Command::MusicStop);
+        // `Playing` からの stop はフェードアウト経由(`MusicVoice::stop` 参照)なので、
+        // 既定ランプが尽きるだけの余裕を与える。
+        let ramp_len = ms_to_samples(Config::DEFAULT_RAMP_MS, TEST_SAMPLE_RATE) as usize;
+        let mut settle = vec![0.0; (ramp_len + 10) * CHANNELS];
+        mixer.render(&mut settle, 0);
+
+        assert_eq!(mixer.music_state(), MusicState::Ready);
+        assert_eq!(mixer.music_voice.position_frames(), 0);
+    }
+
+    #[test]
+    fn music_set_loop_command_wraps_at_region_end_then_none_clears_it() {
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, events) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+        make_music_ready(&mut mixer, &mut producer, 1.0);
+
+        // `MusicSetLoop` と `MusicPlayScheduled` は同じコマンドキュー上にあるので、
+        // 両方を送ってから1回 render すれば同じコールバックでまとめて消化される
+        // (`drain_commands` はコールバック先頭で溜まっている分を全部処理する)。
+        sender.send(Command::MusicSetLoop {
+            region: Some((0, 8)),
+        });
+        sender.send(Command::MusicPlayScheduled { host_time_ns: 0 });
+        let mut buf = vec![0.0; 64 * CHANNELS];
+        mixer.render(&mut buf, 0);
+        assert_eq!(mixer.music_voice.loop_region(), Some((0, 8)));
+
+        let (out, dropped) = drain_events(&events, 10);
+        assert_eq!(dropped, 0);
+        assert!(
+            out.contains(&Event::MusicLooped { restart_frame: 0 }),
+            "the loop region must actually wrap and report restart_frame=0, got {out:?}"
+        );
+
+        sender.send(Command::MusicSetLoop { region: None });
+        let mut after = vec![0.0; CHANNELS];
+        mixer.render(&mut after, 0);
+        assert_eq!(
+            mixer.music_voice.loop_region(),
+            None,
+            "MusicSetLoop{{ region: None }} must clear the loop"
+        );
+    }
+
+    /// 依頼書のテスト要件4: `mw_music_state()` の実体になるクロックスナップショットが
+    /// Loading → Ready → Playing → Paused の4状態すべてを正しく反映すること。
+    #[test]
+    fn music_clock_snapshot_reflects_all_four_states_through_the_playback_lifecycle() {
+        let (mut mixer, sender, _reclaim, mut producer, music_clock, _events) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+
+        // Loading: まだ pump していない。
+        let mut loading_buf = vec![0.0; 4 * CHANNELS];
+        mixer.render(&mut loading_buf, 0);
+        let snap_loading = music_clock.snapshot();
+        assert_eq!(snap_loading.state, MusicState::Loading);
+        assert!(!snap_loading.is_playing);
+
+        // Ready: プリロールを満たす。
+        let mut decoder = ConstantDecoder {
+            cursor: 0,
+            value: 1.0,
+        };
+        producer.pump(&mut decoder).expect("pump must succeed");
+        let mut warmup = vec![0.0; 4 * CHANNELS];
+        mixer.render(&mut warmup, 0);
+        assert_eq!(mixer.music_state(), MusicState::Ready);
+        let snap_ready = music_clock.snapshot();
+        assert_eq!(snap_ready.state, MusicState::Ready);
+        assert!(!snap_ready.is_playing);
+
+        // Playing。
+        sender.send(Command::MusicPlayScheduled { host_time_ns: 0 });
+        let mut playing_buf = vec![0.0; 20 * CHANNELS];
+        mixer.render(&mut playing_buf, 0);
+        assert_eq!(mixer.music_state(), MusicState::Playing);
+        let snap_playing = music_clock.snapshot();
+        assert_eq!(snap_playing.state, MusicState::Playing);
+        assert!(snap_playing.is_playing);
+
+        // Paused。
+        sender.send(Command::MusicPause);
+        let ramp_len = ms_to_samples(Config::DEFAULT_RAMP_MS, TEST_SAMPLE_RATE) as usize;
+        let mut settle = vec![0.0; (ramp_len + 10) * CHANNELS];
+        mixer.render(&mut settle, 0);
+        assert_eq!(mixer.music_state(), MusicState::Paused);
+        let snap_paused = music_clock.snapshot();
+        assert_eq!(snap_paused.state, MusicState::Paused);
+        assert!(!snap_paused.is_playing);
+    }
+
+    /// 依頼書のテスト要件5: seek だけでなく resume_at でも世代カウンタが進むこと
+    /// (`render_bumps_generation_exactly_once_on_seek_discontinuity` の resume_at 版)。
+    #[test]
+    fn render_bumps_generation_on_resume_at_discontinuity() {
+        let (mut mixer, sender, _reclaim, mut producer, music_clock, _events) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+        make_music_ready(&mut mixer, &mut producer, 1.0);
+
+        sender.send(Command::MusicPlayScheduled { host_time_ns: 0 });
+        let mut buf = vec![0.0; 20 * CHANNELS];
+        mixer.render(&mut buf, 0);
+        assert_eq!(music_clock.snapshot().generation, 0);
+
+        sender.send(Command::MusicResumeAt { frames: 500 });
+        let mut buf2 = vec![0.0; 4 * CHANNELS];
+        mixer.render(&mut buf2, 100_000 * NS_PER_SAMPLE);
+
+        let snap = music_clock.snapshot();
+        assert_eq!(
+            snap.generation, 1,
+            "resume_at must bump the generation exactly once"
+        );
+        assert_eq!(
+            snap.song_frames, 500,
+            "the post-resume position must be reflected immediately"
+        );
+
+        // 追加の render では世代がさらに進まない(不連続はそのバッファだけの出来事)。
+        let mut buf3 = vec![0.0; 4 * CHANNELS];
+        mixer.render(&mut buf3, 200_000 * NS_PER_SAMPLE);
+        assert_eq!(music_clock.snapshot().generation, 1);
     }
 }

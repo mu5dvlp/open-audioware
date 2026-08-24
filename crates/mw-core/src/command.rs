@@ -71,9 +71,34 @@ pub enum Command {
     /// プリロール完了前(`MusicState::Loading`)に予約時刻が到来した場合はエラーにせず、
     /// 「準備完了後、可能な最速時刻」へ繰り下げる 【仮】(`mixer.rs::MusicSchedule` 参照)。
     MusicPlayScheduled { host_time_ns: u64 },
-    /// 楽曲ボイスをシークする(内部配線専用。初期構築仕様『§4.3』の `mw_music_seek` に
-    /// 相当するが、M2-5 時点では FFI には未公開——楽曲制御 API 全体の公開は後続作業。
-    /// ここでは音楽クロックの世代カウンタ(§4.4)が不連続で正しく進むことをオフライン
-    /// テストで検証するための最小の配線として用意した)。
+    /// 楽曲ボイスをシークする(初期構築仕様『§4.3』の `mw_music_seek` に相当)。
+    ///
+    /// `MusicVoice::seek` はランプを経由しない不連続そのものであり、`MusicRenderOutcome`
+    /// の `discontinuity` 経由で音楽クロックの世代カウンタ(§4.4)を進める
+    /// (`mixer.rs::Mixer::render` 参照)。
     MusicSeek { frames: u64 },
+    /// 楽曲を一時停止する(初期構築仕様『§4.3』の `mw_music_pause` に相当)。
+    ///
+    /// `MusicVoice::pause` は既定ランプでフェードアウトしてから `Paused` へ収束する
+    /// (M13: 音量変化・停止はランプを経由する)。`Playing` 以外からの呼び出しは
+    /// `MusicVoice` 側で no-op として無視される。
+    MusicPause,
+    /// 巻き戻し付きで再開する(初期構築仕様『§4.3』の `mw_music_resume_at` に相当。
+    /// テンプレート仕様「中断対応」の「数秒巻き戻し + カウントダウン再開」の受け皿)。
+    ///
+    /// `MusicVoice::resume_at` は指定フレームへ再位置決めしたうえで既定ランプで
+    /// フェードインする。位置の付け替え自体は不連続としてクロックの世代カウンタを進める。
+    MusicResumeAt { frames: u64 },
+    /// 楽曲を停止する(初期構築仕様『§4.3』の `mw_music_stop` に相当)。
+    ///
+    /// `Playing` 中は既定ランプでフェードアウトしてから位置を 0 に戻し `Ready` へ、
+    /// `Paused` 中はランプ無しでその場で `Ready` へ戻る(`MusicVoice::stop` 参照)。
+    MusicStop,
+    /// 楽曲のループ区間を設定・解除する(初期構築仕様『§4.3』の `mw_music_set_loop` に
+    /// 相当。選曲プレビュー用、フェードイン/アウト付き)。
+    ///
+    /// `None` はループ解除。`Some((start, end))` で `start >= end` の不正な区間は
+    /// `MusicVoice::set_loop` 側でループ無しとして扱われる(リアルタイム安全性のため
+    /// パニックしない)。
+    MusicSetLoop { region: Option<(u64, u64)> },
 }

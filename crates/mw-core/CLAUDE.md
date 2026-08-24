@@ -24,10 +24,18 @@ OS 非依存・デバイス非依存のコア。ミキサ、ボイス管理、�
   サンプルレートは出力デバイスに追従(将来変わりうる前提は `AudioFormat` に閉じ込めてある)。
 - `clock`: `RenderedFrameCounter`(音声コールバックが送出したフレーム数を数える
   `AtomicU64` カウンタ)と `MusicClockPublisher`(§4.4 の心臓部。曲位置 × ホスト単調時刻の
-  相関点・世代カウンタ・is_playing を seqlock で公開する。書き手は音声スレッドの
-  `Mixer::render` のみ、読み手はロック無しで任意スレッドから `snapshot()` できる。
-  Release/Acquire が片方向の制約にしかならない理由は `write`/`snapshot` のコメントに
-  必ず残してある——読み飛ばして単純な `Ordering::Release`/`Acquire` ロードに戻さないこと)。
+  相関点・世代カウンタ・楽曲状態(`state: MusicState`)・`is_playing` を seqlock で
+  公開する。書き手は音声スレッドの `Mixer::render` のみ、読み手はロック無しで任意スレッドから
+  `snapshot()` できる。Release/Acquire が片方向の制約にしかならない理由は
+  `write`/`snapshot` のコメントに必ず残してある——読み飛ばして単純な
+  `Ordering::Release`/`Acquire` ロードに戻さないこと)。`state` は `mw_music_state()`
+  (§5.5)の実体そのもの——`MusicVoice::state()` は音声スレッド排他所有の `Mixer` の
+  内部にしかないため、ゲームスレッドから読める唯一の経路がこの seqlock 経由になる
+  (M2-7)。`MusicState` 自体は atomic に乗らないので `MusicState::to_u8`/`from_u8`
+  で数値表現に変換してから `AtomicU8` へ格納する。`is_playing` は `state ==
+  MusicState::Playing` から `publish` の中で導出する冗長フィールド(食い違うスナップショットが
+  観測されないよう、必ず同じ seqlock 書き込み区間の中で `state` と一緒に計算する。
+  残してある理由は `MusicClockSnapshot::is_playing` のコメント参照)。
   `mixer::build` が返す `Arc<MusicClockPublisher>` を経由してゲームスレッド側へ渡す(M2-5)。
 - `schedule`: 予約発音(§4.5)のソート済みキュー `ScheduleQueue<T>` と、
   ホスト時刻→バッファ内オフセットの変換(`offset_within_buffer`。切り捨て、
@@ -76,9 +84,15 @@ OS 非依存・デバイス非依存のコア。ミキサ、ボイス管理、�
   必ずランプを経由し、自然終了(PCM 終端到達)はランプ不要としてただちに回収する。
 - `command`: `Command` — ゲームスレッド→音声スレッドのコマンド列挙
   (`PlaySe` / `StopVoice` / `SetVoiceVolume` / `StopVoicesUsingSound` /
-  `SetBusVolume` / `BusFade` / `SeSchedule` / `MusicPlayScheduled` / `MusicSeek`)。
-  後ろ3つは M2-5 追加(予約発音・楽曲予約再生。`MusicSeek` は楽曲制御 API 全体の
-  公開〔M2-6 以降〕を待たずに世代カウンタの不連続をテストで検証するための内部配線)。
+  `SetBusVolume` / `BusFade` / `SeSchedule` / `MusicPlayScheduled` / `MusicSeek` /
+  `MusicPause` / `MusicResumeAt` / `MusicStop` / `MusicSetLoop`)。`SeSchedule`〜
+  `MusicSeek` は M2-5 追加(予約発音・楽曲予約再生・楽曲シーク)。楽曲制御4種
+  (`MusicPause`/`MusicResumeAt`/`MusicStop`/`MusicSetLoop`)は M2-7 追加——
+  §4.3 の楽曲制御 API を mw-ffi へ公開する下ごしらえとして、`MusicVoice` 側に
+  既に実装済みだった `pause`/`resume_at`/`stop`/`set_loop` への配線をここで揃えた
+  (`MusicVoice` 自体の変更は無し)。いずれも不連続の発生源(シーク・巻き戻し再開・
+  停止)は `MusicRenderOutcome::discontinuity` 経由で `clock.rs` の世代カウンタへ
+  そのまま乗るため、`mixer.rs::Mixer::render` 側に追加配線は要らなかった。
 - `mixer`: `Mixer::render(output, buffer_start_host_time_ns)` — 「コマンド消化 →
   楽曲ボイスのレンダリング(予約発火があればサンプル精度で分割) → イベント通知 →
   アクティブ SE ボイス合算 + 楽曲の Bgm バス適用 → Master → クリッパ → 音楽クロックの

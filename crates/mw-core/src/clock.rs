@@ -11,7 +11,9 @@
 //! この値は音声スレッド(書き込み)とゲームスレッド(読み取り)の双方から
 //! ロック無しでアクセスできる必要があるため、最初から `AtomicU64` で持つ。
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering, fence};
+
+use crate::music::MusicState;
 
 /// 音声コールバックがこれまでにレンダリングしたフレーム数を数えるカウンタ。
 ///
@@ -105,6 +107,11 @@ mod tests {
         assert_eq!(snapshot.song_frames, 0);
         assert_eq!(snapshot.host_time_ns, 0);
         assert_eq!(snapshot.sample_rate, 0);
+        assert_eq!(
+            snapshot.state,
+            MusicState::Loading,
+            "before the first publish, state must default to Loading (matches MusicVoice::new)"
+        );
         assert!(!snapshot.is_playing);
         assert_eq!(snapshot.generation, 0);
     }
@@ -112,20 +119,41 @@ mod tests {
     #[test]
     fn music_clock_publisher_publish_is_reflected_in_snapshot() {
         let publisher = MusicClockPublisher::new();
-        publisher.publish(48_000, 123_456_789, 48_000, true);
+        publisher.publish(48_000, 123_456_789, 48_000, MusicState::Playing);
 
         let snapshot = publisher.snapshot();
         assert_eq!(snapshot.song_frames, 48_000);
         assert_eq!(snapshot.host_time_ns, 123_456_789);
         assert_eq!(snapshot.sample_rate, 48_000);
+        assert_eq!(snapshot.state, MusicState::Playing);
         assert!(snapshot.is_playing);
         assert_eq!(snapshot.generation, 0);
+    }
+
+    /// `is_playing` は `state` から `publish` 内で導出される冗長フィールドだが、
+    /// `Playing` 以外の3状態すべてで `false` になることを別途固定化しておく
+    /// (`Playing` だけの1点比較では「Playing 以外は全部 true になる」ような
+    /// 実装ミスを検出できないため)。
+    #[test]
+    fn music_clock_publisher_is_playing_is_true_only_for_playing_state() {
+        let publisher = MusicClockPublisher::new();
+        for state in [
+            MusicState::Loading,
+            MusicState::Ready,
+            MusicState::Playing,
+            MusicState::Paused,
+        ] {
+            publisher.publish(0, 0, 48_000, state);
+            let snapshot = publisher.snapshot();
+            assert_eq!(snapshot.state, state);
+            assert_eq!(snapshot.is_playing, state == MusicState::Playing);
+        }
     }
 
     #[test]
     fn music_clock_publisher_bump_generation_increments_and_preserves_other_fields() {
         let publisher = MusicClockPublisher::new();
-        publisher.publish(1_000, 2_000, 44_100, true);
+        publisher.publish(1_000, 2_000, 44_100, MusicState::Playing);
 
         publisher.bump_generation();
         let snapshot = publisher.snapshot();
@@ -135,6 +163,7 @@ mod tests {
         assert_eq!(snapshot.song_frames, 1_000);
         assert_eq!(snapshot.host_time_ns, 2_000);
         assert_eq!(snapshot.sample_rate, 44_100);
+        assert_eq!(snapshot.state, MusicState::Playing);
         assert!(snapshot.is_playing);
 
         publisher.bump_generation();
@@ -177,7 +206,7 @@ mod tests {
             let publisher = Arc::clone(&publisher);
             std::thread::spawn(move || {
                 for song_frames in 0..ITERATIONS {
-                    publisher.publish(song_frames, song_frames * 2, 48_000, true);
+                    publisher.publish(song_frames, song_frames * 2, 48_000, MusicState::Playing);
                     // 実運用では書き手(音声コールバック)は1コールバックにつき1回、
                     // 数ミリ秒間隔でしか publish しない。ここで一切待たずに全力で
                     // publish し続けると、読み手側の再試行(MAX_READ_RETRIES)より
@@ -237,7 +266,7 @@ mod tests {
             let publisher = Arc::clone(&publisher);
             std::thread::spawn(move || {
                 for song_frames in 0..ITERATIONS {
-                    publisher.publish(song_frames, song_frames * 2, 48_000, true);
+                    publisher.publish(song_frames, song_frames * 2, 48_000, MusicState::Playing);
                     // 実運用では書き手(音声コールバック)は1コールバックにつき1回、
                     // 数ミリ秒間隔でしか publish しない。ここで一切待たずに全力で
                     // publish し続けると、読み手側の再試行(MAX_READ_RETRIES)より
@@ -300,7 +329,24 @@ pub struct MusicClockSnapshot {
     pub host_time_ns: u64,
     /// 出力サンプルレート [Hz]。0 は「まだ確定していない」。
     pub sample_rate: u32,
+    /// 楽曲ボイスの再生状態(初期構築仕様『§4.3』の4状態。`mw_music_state()` の実体)。
+    ///
+    /// `MusicVoice::state()` は音声スレッドの排他所有物である `Mixer` の内部にしか無く、
+    /// 他スレッド(ゲームスレッド)からロック無しで読めるのはこの seqlock 経由の値だけ
+    /// (`mixer.rs::Mixer::render` が毎コールバック末尾でここへ publish する)。
+    pub state: MusicState,
     /// 楽曲が進行中か。ポーズ中・停止中は false。
+    ///
+    /// `state == MusicState::Playing` から機械的に導出できる冗長フィールドだが、
+    /// あえて残してある。理由は2つ: (1) 後段の FFI で `MwMusicPosition` として
+    /// C# へそのまま渡す blittable 構造体になる予定で、C# 側が毎回 enum 比較をせずに
+    /// 直接 bool として読めた方が呼び出し側にとって扱いやすい、(2) `state` は
+    /// `MusicState::from_u8` を経由するため理論上の未知値フォールバック
+    /// (`Loading` 扱い)が起こりうるが、`is_playing` は `publish` 時点で
+    /// `state == Playing` から直接計算してそのまま格納するため、そのフォールバックの
+    /// 影響を受けない独立した bool として振る舞う。**導出元は常に `publish` 呼び出し時の
+    /// `state` 引数**であり、両者が食い違うスナップショットが観測されることはない
+    /// (同じ seqlock の書き込み区間で両方を計算・格納するため)。
     pub is_playing: bool,
     /// 世代カウンタ。不連続のたびに 1 増える。
     pub generation: u32,
@@ -330,6 +376,11 @@ pub struct MusicClockPublisher {
     song_frames: AtomicU64,
     host_time_ns: AtomicU64,
     sample_rate: AtomicU32,
+    /// `MusicState` の数値表現(`MusicState::to_u8`/`from_u8`)。enum 自体は atomic に
+    /// できないため、seqlock の内側で保護する本体フィールドとしてはこの形で持つ
+    /// (`is_playing` と食い違うスナップショットを作らないため、必ず `state` と同じ
+    /// `write` 区間の中で一緒に書く。`MusicClockSnapshot::is_playing` のドキュメント参照)。
+    state: AtomicU8,
     is_playing: AtomicBool,
     generation: AtomicU32,
 }
@@ -367,20 +418,34 @@ impl MusicClockPublisher {
             song_frames: AtomicU64::new(0),
             host_time_ns: AtomicU64::new(0),
             sample_rate: AtomicU32::new(0),
+            state: AtomicU8::new(MusicState::Loading.to_u8()),
             is_playing: AtomicBool::new(false),
             generation: AtomicU32::new(0),
         }
     }
 
-    /// 相関点を公開する。**音声スレッドから、レンダリング後に呼ぶ。**
+    /// 相関点と楽曲状態を公開する。**音声スレッドから、レンダリング後に呼ぶ。**
+    ///
+    /// `is_playing` は引数に取らず、ここで `state == MusicState::Playing` から導出して
+    /// 一緒に格納する(`MusicClockSnapshot::is_playing` のドキュメント参照。
+    /// 呼び出し側が state と is_playing を別々に指定できると食い違いうるため、
+    /// 単一の入力値から両方を計算する設計にしてある)。
     ///
     /// リアルタイム安全: アロケーションもロックも行わない(atomic ストアのみ)。
-    pub fn publish(&self, song_frames: u64, host_time_ns: u64, sample_rate: u32, is_playing: bool) {
+    pub fn publish(
+        &self,
+        song_frames: u64,
+        host_time_ns: u64,
+        sample_rate: u32,
+        state: MusicState,
+    ) {
         self.write(|| {
             self.song_frames.store(song_frames, Ordering::Relaxed);
             self.host_time_ns.store(host_time_ns, Ordering::Relaxed);
             self.sample_rate.store(sample_rate, Ordering::Relaxed);
-            self.is_playing.store(is_playing, Ordering::Relaxed);
+            self.state.store(state.to_u8(), Ordering::Relaxed);
+            self.is_playing
+                .store(state == MusicState::Playing, Ordering::Relaxed);
         });
     }
 
@@ -408,6 +473,7 @@ impl MusicClockPublisher {
             song_frames: 0,
             host_time_ns: 0,
             sample_rate: 0,
+            state: MusicState::Loading,
             is_playing: false,
             generation: 0,
         };
@@ -423,6 +489,7 @@ impl MusicClockPublisher {
                 song_frames: self.song_frames.load(Ordering::Relaxed),
                 host_time_ns: self.host_time_ns.load(Ordering::Relaxed),
                 sample_rate: self.sample_rate.load(Ordering::Relaxed),
+                state: MusicState::from_u8(self.state.load(Ordering::Relaxed)),
                 is_playing: self.is_playing.load(Ordering::Relaxed),
                 generation: self.generation.load(Ordering::Relaxed),
             };
