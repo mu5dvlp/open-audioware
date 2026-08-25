@@ -366,6 +366,37 @@ namespace Mw.Native
             return ToPublicResult(native);
         }
 
+        /// <summary>
+        /// SE を<b>サンプル精度で予約発音</b>する(初期構築仕様『§4.5 スケジュール発音』, M2-5)。
+        /// <para>
+        /// 用途はメトロノームとキャリブレーション用クリック。該当バッファのレンダリング時に
+        /// <b>バッファ内オフセットのサンプル位置</b>から発音する(バッファ境界へ丸めない)ため、
+        /// <see cref="PlaySe"/> の「次のコールバックで鳴る」より細かく置ける。
+        /// </para>
+        /// <para>
+        /// <paramref name="hostTimeNs"/> は <see cref="HostTimeNs"/> と<b>同じ時計</b>の値を渡すこと。
+        /// Unity 側の <c>AudioSettings.dspTime</c> とは別の時計なので、混ぜると鳴る位置がずれる。
+        /// </para>
+        /// <para>
+        /// 予約時刻が既に過去だった場合は取りこぼさず、そのバッファの先頭で即座に発音する。
+        /// また予約キューは固定容量で、<b>この呼び出しが成功しても音声スレッド側で満杯だった予約は
+        /// 発音されない</b>(<c>se_schedule_overflow_count</c> で検知できる)。
+        /// </para>
+        /// </summary>
+        /// <param name="handle"><see cref="Init"/> が返したハンドル。</param>
+        /// <param name="id"><see cref="LoadSound"/> が返したサウンド ID(<see cref="SoundMode.Se"/>)。</param>
+        /// <param name="bus">再生先バス。</param>
+        /// <param name="volume">再生音量(linear)。</param>
+        /// <param name="hostTimeNs">発音時刻(<see cref="HostTimeNs"/> と同じ時計)。</param>
+        /// <param name="voice">成功時、以後 <see cref="VoiceStop"/> / <see cref="VoiceSetVolume"/> に渡す不透明 ID。</param>
+        public static unsafe MwResult ScheduleSe(ulong handle, ulong id, Bus bus, float volume, ulong hostTimeNs, out ulong voice)
+        {
+            ulong outVoice = 0;
+            Generated.MwResult native = NativeMethods.mw_se_schedule(handle, id, (int)bus, volume, hostTimeNs, &outVoice);
+            voice = outVoice;
+            return ToPublicResult(native);
+        }
+
         /// <summary>ボイスを停止する(既定ランプ経由。初期構築仕様 M13/§4.2)。</summary>
         public static MwResult VoiceStop(ulong handle, ulong voice)
         {
