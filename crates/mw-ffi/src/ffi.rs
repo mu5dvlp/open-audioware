@@ -689,9 +689,10 @@ pub extern "C" fn mw_music_play_scheduled(handle: u64, host_time_ns: u64) -> MwR
 ///
 /// 1. 先に**デコーダを差し替える**(`Instance::send_decoder`)
 /// 2. そのあとで `Command::MusicPrepare`(状態機械を `Loading` から仕切り直す。
-///    M2-7 で追加)→ `Command::MusicStop`(前の曲が `Playing` 中でも `Prepare`
-///    適用後は no-op になる)→ `Command::MusicSeek { frames: 0 }`(リングバッファの
-///    掃除と epoch 更新を駆動する本体)の順で送る
+///    M2-7 で追加)→ `Command::MusicSeek { frames: 0 }`(リングバッファの
+///    掃除と epoch 更新を駆動する本体)の順で送る。**`MusicStop` は挟まない**
+///    (理由は下の実装内コメントを参照——`Prepare` 済みなら常に no-op であり、
+///    かつ `Prepare` 無しで `Stop` → `Seek` と送ると無音のまま `Playing` に居座る)
 ///
 /// **順序が逆だとデコードスレッドが古いデコーダのまま新しい epoch を ack して
 /// しまい壊れる**(先にシークだけ送ってしまうと、デコードスレッドが古いデコーダを

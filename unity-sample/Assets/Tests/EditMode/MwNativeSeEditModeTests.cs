@@ -21,7 +21,7 @@ namespace Mw.Native.Tests
 
             try
             {
-                byte[] wavBytes = BuildPcm16Wav(sampleRate: 48_000, channels: 2, samples: new short[]
+                byte[] wavBytes = TestWavBuilder.BuildPcm16Wav(sampleRate: 48_000, channels: 2, samples: new short[]
                 {
                     0, 0,
                     8000, -8000,
@@ -55,7 +55,7 @@ namespace Mw.Native.Tests
 
             try
             {
-                byte[] monoWav = BuildPcm16Wav(sampleRate: 48_000, channels: 1, samples: new short[] { 1000, -1000, 2000 });
+                byte[] monoWav = TestWavBuilder.BuildPcm16Wav(sampleRate: 48_000, channels: 1, samples: new short[] { 1000, -1000, 2000 });
                 MwResult loadResult = MwNative.LoadSound(handle, monoWav, SoundMode.Se, out ulong soundId);
                 Assert.AreEqual(MwResult.Ok, loadResult, "mono 48kHz/16bit wav must decode via equal-power stereo expansion");
 
@@ -67,17 +67,25 @@ namespace Mw.Native.Tests
             }
         }
 
+        /// <summary>
+        /// M1 では 48kHz 以外を明示的に拒否していたが、M2-4 でロード時のリサンプル(rubato)が
+        /// 入ったため 44.1kHz は通るようになった。<see cref="MwResult.ErrUnsupportedSampleRate"/>
+        /// が残っているのは「サンプルレートとして解釈できない値」を弾くためで、
+        /// リサンプルできない壊れた wav とは区別される。
+        /// </summary>
         [Test]
-        public void LoadNon48kWav_ReturnsUnsupportedSampleRate()
+        public void LoadNon48kWav_IsResampledOnLoad()
         {
             MwResult initResult = MwNative.Init(out ulong handle);
             Assert.AreEqual(MwResult.Ok, initResult);
 
             try
             {
-                byte[] wav44k = BuildPcm16Wav(sampleRate: 44_100, channels: 2, samples: new short[] { 0, 0 });
+                byte[] wav44k = TestWavBuilder.BuildPcm16Wav(sampleRate: 44_100, channels: 2, samples: new short[] { 0, 0, 1000, -1000 });
                 MwResult loadResult = MwNative.LoadSound(handle, wav44k, SoundMode.Se, out ulong soundId);
-                Assert.AreEqual(MwResult.ErrUnsupportedSampleRate, loadResult, "44.1kHz must be rejected explicitly (M1 does not resample; see M2/rubato)");
+                Assert.AreEqual(MwResult.Ok, loadResult, "44.1kHz is resampled to the output rate at load time since M2-4");
+                Assert.AreNotEqual(0ul, soundId);
+                Assert.AreEqual(MwResult.Ok, MwNative.ReleaseSound(handle, soundId));
             }
             finally
             {
@@ -86,16 +94,16 @@ namespace Mw.Native.Tests
         }
 
         [Test]
-        public void LoadMusicMode_ReturnsUnsupportedSoundMode()
+        public void LoadZeroSampleRateWav_ReturnsUnsupportedSampleRate()
         {
             MwResult initResult = MwNative.Init(out ulong handle);
             Assert.AreEqual(MwResult.Ok, initResult);
 
             try
             {
-                byte[] wavBytes = BuildPcm16Wav(sampleRate: 48_000, channels: 2, samples: new short[] { 0, 0 });
-                MwResult loadResult = MwNative.LoadSound(handle, wavBytes, SoundMode.Music, out ulong soundId);
-                Assert.AreEqual(MwResult.ErrUnsupportedSoundMode, loadResult, "Music mode is not implemented until M2");
+                byte[] wavZeroRate = TestWavBuilder.BuildPcm16Wav(sampleRate: 0, channels: 2, samples: new short[] { 0, 0 });
+                MwResult loadResult = MwNative.LoadSound(handle, wavZeroRate, SoundMode.Se, out ulong soundId);
+                Assert.AreEqual(MwResult.ErrUnsupportedSampleRate, loadResult, "a sample rate of 0 cannot be resampled from; it must be rejected explicitly");
             }
             finally
             {
@@ -104,44 +112,28 @@ namespace Mw.Native.Tests
         }
 
         /// <summary>
-        /// テスト専用の最小 RIFF/WAVE(PCM16)バイト列ビルダ。バイナリ資産をコミットしない方針
-        /// (初期構築仕様 §8)に合わせ、波形は常にコードで生成する。
+        /// M2-7 で <see cref="SoundMode.Music"/> が実装されたため、
+        /// <see cref="MwResult.ErrUnsupportedSoundMode"/> が返るのは 0 / 1 以外を渡した場合だけになった。
+        /// 楽曲モードそのものの検証は <see cref="MwNativeMusicEditModeTests"/> 側にある。
         /// </summary>
-        private static byte[] BuildPcm16Wav(uint sampleRate, ushort channels, short[] samples)
+        [Test]
+        public void LoadUnknownMode_ReturnsUnsupportedSoundMode()
         {
-            const ushort bitsPerSample = 16;
-            ushort blockAlign = (ushort)(channels * (bitsPerSample / 8));
-            uint byteRate = sampleRate * blockAlign;
-            uint dataSize = (uint)(samples.Length * sizeof(short));
-            const uint fmtSize = 16;
-            uint riffSize = 4 + (8 + fmtSize) + (8 + dataSize);
+            MwResult initResult = MwNative.Init(out ulong handle);
+            Assert.AreEqual(MwResult.Ok, initResult);
 
-            using (var stream = new System.IO.MemoryStream())
-            using (var writer = new System.IO.BinaryWriter(stream))
+            try
             {
-                writer.Write(new[] { 'R', 'I', 'F', 'F' });
-                writer.Write(riffSize);
-                writer.Write(new[] { 'W', 'A', 'V', 'E' });
-
-                writer.Write(new[] { 'f', 'm', 't', ' ' });
-                writer.Write(fmtSize);
-                writer.Write((ushort)1); // PCM
-                writer.Write(channels);
-                writer.Write(sampleRate);
-                writer.Write(byteRate);
-                writer.Write(blockAlign);
-                writer.Write(bitsPerSample);
-
-                writer.Write(new[] { 'd', 'a', 't', 'a' });
-                writer.Write(dataSize);
-                foreach (short sample in samples)
-                {
-                    writer.Write(sample);
-                }
-
-                writer.Flush();
-                return stream.ToArray();
+                byte[] wavBytes = TestWavBuilder.BuildPcm16Wav(sampleRate: 48_000, channels: 2, samples: new short[] { 0, 0 });
+                MwResult loadResult = MwNative.LoadSound(handle, wavBytes, (SoundMode)99, out ulong soundId);
+                Assert.AreEqual(MwResult.ErrUnsupportedSoundMode, loadResult, "an unknown sound mode must be rejected with a dedicated code");
+                Assert.AreEqual(0ul, soundId, "a rejected load must not hand out an id");
+            }
+            finally
+            {
+                Assert.AreEqual(MwResult.Ok, MwNative.Shutdown(handle));
             }
         }
+
     }
 }
