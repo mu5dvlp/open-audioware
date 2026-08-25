@@ -79,27 +79,6 @@ pub unsafe extern "C" fn mw_init(out_handle: *mut u64) -> MwResult {
     }
 }
 
-/// Android のライブラリロード時に JavaVM を受け取る。
-///
-/// cpal(AAudio)が Java 側を参照するため、`ndk_context` の初期化に JavaVM が要る
-/// (`mw_backend::android_context` のモジュール doc 参照)。ここで控えておき、実際の初期化は
-/// バックエンドを開く直前に行う。
-///
-/// **`System.loadLibrary` 経由でロードされた場合にのみ呼ばれる。** `dlopen` で直接開かれた
-/// 場合は呼ばれないため、そのときは `ndk_context` を初期化できない旨がログに出る。
-#[cfg(target_os = "android")]
-#[unsafe(no_mangle)]
-pub extern "system" fn JNI_OnLoad(
-    vm: *mut std::ffi::c_void,
-    _reserved: *mut std::ffi::c_void,
-) -> i32 {
-    mw_backend::android_context::set_java_vm(vm);
-    mw_backend::mw_log!("[mw-ffi] JNI_OnLoad: JavaVM を受け取った");
-
-    // JNI_VERSION_1_6
-    0x0001_0006
-}
-
 /// panic の内容をログへ出すフックを1度だけ入れる。
 ///
 /// `catch_unwind` は panic を `MwResult::ErrPanic` に畳んでしまうため、**何が起きたのかは

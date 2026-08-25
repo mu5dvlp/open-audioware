@@ -10,6 +10,12 @@ fn main() {
     println!("cargo:rerun-if-changed=src/result.rs");
     println!("cargo:rerun-if-changed=src/event.rs");
     println!("cargo:rerun-if-changed=src/types.rs");
+    // 注意: `src/jni_entry.rs` は**意図的に入力へ含めない**。csbindgen は `cfg` を評価せず
+    // ソースを走査して `#[no_mangle] pub extern` を拾うため、Android 専用の `JNI_OnLoad` に
+    // 対しても全プラットフォーム向けの `DllImport` 宣言を生成してしまう。iOS は静的リンク
+    // (`__Internal`)なので、その宣言がマネージドコードに残ったまま IL2CPP ビルドすると
+    // `Undefined symbol: _JNI_OnLoad` でリンクに失敗する(テンプレート側の iOS ビルドで実際に発生)。
+    // プラットフォーム条件付きのエクスポートを足すときは同じ扱いにすること。
 
     let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../unity/Runtime/Generated/NativeMethods.g.cs");

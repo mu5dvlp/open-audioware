@@ -15,5 +15,8 @@ mod decode_thread;
 mod event;
 mod ffi;
 mod handle;
+// Android の JNI エントリポイント。**csbindgen の入力に含めない**
+// (理由はモジュール doc と build.rs のコメントを参照)。
+mod jni_entry;
 mod result;
 mod types;
