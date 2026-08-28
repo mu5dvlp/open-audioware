@@ -69,6 +69,51 @@
 //!   実際には音声セッションを中断しないため、無条件に `pause()`→`play()` すると
 //!   通常プレイ中に不要な音切れを生む(このガードが必要な理由)。
 //!
+//! ## 追記: ルート変化(Bluetooth 切断で SE が無音になる、2026-08-28)
+//!
+//! ユーザー実機報告その2:「Bluetooth で繋いで、Bluetooth を解除したら SE が鳴らなくなる」。
+//! 根は同じ(cpal 0.18.1 の `Stream::play()` の内部 `playing` フラグが OS 主導の停止に
+//! 追随しない)だが、上記2つの通知だけでは塞げない——**ルート変化は割り込み
+//! (`AVAudioSessionInterruptionNotification`)とは別の通知
+//! (`AVAudioSessionRouteChangeNotification`)で飛んでくる**ため。
+//!
+//! **cpal 自身がルート変化時に何をしているかをソースで確認した**
+//! (`coreaudio::ios::session_event_manager.rs::route_change_error` /
+//! `host/error_emit.rs::emit_error`/`try_emit_error`)。結論: **cpal はルート変化の
+//! `reason` を分類して `error_callback`(＝このクレートが `build_output_stream` に渡した
+//! `err_fn`)を呼ぶだけ**で、`AudioUnit` にも `StreamInner.playing` フラグにも一切触れない
+//! (`emit_error`/`try_emit_error` の実装はユーザーのコールバックを呼ぶ1行だけ)。
+//! つまり cpal はストリームの作り直しも `stop`/`start` の呼び直しも一切しておらず、
+//! **二重処理の心配は無い**——復帰(`pause()`→`play()`)は完全にこちら側の責務。
+//! (この経路は元々 `err_fn` → `Event::StreamError` として M2-6 の時点から動いており、
+//! これ自体は変更していない。今回追加するのは別の observer から見た「復帰を試みるか」の
+//! 判断だけ)。
+//!
+//! **`AVAudioSessionRouteChangeReason::OldDeviceUnavailable` のときだけ復帰を試みる**
+//! ([`RouteChangeReason::requires_recovery`] 参照)。判断根拠:
+//!
+//! - Apple のドキュメント上 `OldDeviceUnavailable` は「直前まで使っていたデバイスが
+//!   無くなった(例: ヘッドフォンが抜かれた)」——BT 切断はまさにこれで、実機報告と一致する。
+//!   cpal 自身もこの reason だけを他(`CategoryChange`/`Override`/
+//!   `RouteConfigurationChange`)と別グループ(`ErrorKind::DeviceChanged`)に分類している
+//! - `NewDeviceAvailable`(BT 接続・イヤホン挿し込み)や `Override`
+//!   は音が途切れず自動的に継続するのが通例。ここで復帰を試みると**正常なルート切替の
+//!   たびに不要な音切れを生む**(`on_app_became_active` と同じ配慮。依頼書の警告どおり)
+//! - `CategoryChange` には反応しない——`ios_session::configure()` 自身が
+//!   `setCategory_error` を呼ぶため、復帰処理が自分自身のカテゴリ再設定をトリガーに
+//!   拾ってしまう自己誘発ループの懸念がある(実機で確認できていないため、疑わしきは
+//!   反応しない側に倒した)
+//! - `NoSuitableRouteForCategory`(そもそも鳴らせるルートが無い)は `pause()`→`play()`
+//!   をしても改善しない。`RouteConfigurationChange`/`WakeFromSleep`/`Unknown` は
+//!   今回の実機報告に対応する根拠が無いため見送り(将来別の報告が来たら再検討する)
+//!
+//! **`Event::RouteChanged` はルート変化なら reason を問わず毎回発火する**
+//! (`requires_recovery` の判定とは独立)。これは初期構築仕様『§6 テンプレートとの連携
+//! ポイント』が元々予定していた「ルート変化イベントの経路」(テンプレート側のオフセット
+//! 自動再較正用)で、このモジュールが新設されるまで型だけ予約されて発火していなかった
+//! (`mw_core::event::Event::RouteChanged` のドキュメント参照)。今回そのまま繋いだ——
+//! 復帰(`AudioInterruptionEnded`)とは別軸の情報なので、混ぜずに両方積む。
+//!
 //! ## パニック安全性
 //!
 //! Objective-C ランタイムから直接呼ばれるブロックの内部で panic が Rust スタックを
@@ -83,10 +128,13 @@
 //! (OS が送る通知、`AudioUnit` の実際の再始動はどちらもシミュレートできない)。
 //! そのため復帰ロジックは [`InterruptionState`](OS API 呼び出しを一切含まない純粋な
 //! 状態機械)として切り出し、遷移だけをこのファイル末尾の `tests` で固定化している。
-//! 「割り込みで止まった → 再開要求 → 実際に再開できた」の一連の流れと、
-//! 「ベニンな(実際には中断していない)アクティブ化では何もしない」ガードの両方を
-//! カバーする。OS 通知が実機で本当に発火するか、`pause()`→`play()` の順序で
-//! `AudioOutputUnitStart` が実際に音を復活させるかは実機検証でしか確認できない。
+//! 「割り込みで止まった → 再開要求 → 実際に再開できた」の一連の流れ、
+//! 「ベニンな(実際には中断していない)アクティブ化では何もしない」ガード、
+//! そして「`OldDeviceUnavailable` だけが復帰を要求し、それ以外のルート変化 reason は
+//! 状態を一切変えない」ガード([`RouteChangeReason::requires_recovery`] /
+//! [`InterruptionState::on_route_changed`])の3つをカバーする。OS 通知が実機で本当に
+//! 発火するか、`pause()`→`play()` の順序で `AudioOutputUnitStart` が実際に音を復活
+//! させるかは実機検証でしか確認できない。
 
 use std::sync::Arc;
 
@@ -153,6 +201,23 @@ impl InterruptionState {
         }
     }
 
+    /// ルート変化(`AVAudioSessionRouteChangeNotification`)。`reason` は
+    /// [`RouteChangeReason::requires_recovery`] で復帰要否を判断済みの値を渡す。
+    ///
+    /// 復帰が要る reason(`OldDeviceUnavailable` のみ、モジュール doc「追記: ルート変化」
+    /// 参照)ならどの状態からでも `RecoveryPending` へ(割り込み中に新しい割り込みが来る
+    /// のと同じ「最新の事実を優先」設計)。**要らない reason は現状を一切変えない**
+    /// (`self` をそのまま返す)——正常なルート切替(ヘッドフォン挿し込み等)のたびに
+    /// `Interrupted`/`RecoveryFailed` を握りつぶして未解決の割り込みを覆い隠さないため、
+    /// かつ `Running`/`Recovered` を無意味に触らないため。
+    pub fn on_route_changed(self, reason: RouteChangeReason) -> Self {
+        if reason.requires_recovery() {
+            Self::RecoveryPending
+        } else {
+            self
+        }
+    }
+
     /// 復帰(セッション再アクティブ化 + ストリーム再始動)を試みた結果。
     pub fn on_recovery_attempted(self, success: bool) -> Self {
         if success {
@@ -175,9 +240,44 @@ impl Default for InterruptionState {
     }
 }
 
-/// `AVAudioSessionInterruptionNotification` / `UIApplicationDidBecomeActiveNotification` の
-/// 監視・復帰処理。iOS / tvOS 以外では何もしない no-op(`ios_session::configure` と同じ
-/// 「常に呼んでよい・非対応 OS では素通り」の設計)。
+/// `AVAudioSessionRouteChangeReason` を薄く写した、OS 非依存の値(テストのため)。
+///
+/// imp 側(iOS/tvOS のみ)が実際の `AVAudioSessionRouteChangeReason`(objc2 型)から
+/// これへ変換する橋渡し役——判定ロジック本体([`Self::requires_recovery`])はここに置き、
+/// objc2 型に依存せず単体テストできるようにする(`InterruptionState` と同じ設計)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteChangeReason {
+    /// 直前まで使っていたデバイスが無くなった(例: Bluetooth 切断・イヤホン抜け)。
+    /// 実機報告「Bluetooth を解除すると SE が鳴らなくなる」に対応する reason。
+    OldDeviceUnavailable,
+    /// 新しいデバイスが使えるようになった(例: Bluetooth 接続・イヤホン挿し込み)。
+    NewDeviceAvailable,
+    /// オーディオカテゴリが変わった。`ios_session::configure()` 自身が
+    /// `setCategory_error` 経由で引き起こしうる。
+    CategoryChange,
+    /// ルートが明示的にオーバーライドされた。
+    Override,
+    /// 上記以外(`Unknown`/`WakeFromSleep`/`NoSuitableRouteForCategory`/
+    /// `RouteConfigurationChange` 等)。
+    Other,
+}
+
+impl RouteChangeReason {
+    /// この reason で復帰(セッション再アクティブ化 + `pause()`→`play()`)を試みるべきか。
+    ///
+    /// **`OldDeviceUnavailable` のみ `true`。** 判断根拠はモジュール doc「追記: ルート変化」
+    /// に詳述——要約すると、これだけが Apple のドキュメント上「直前まで使えていたものが
+    /// 無くなった」ことを意味し、他の reason(`NewDeviceAvailable`/`Override` は自動的に
+    /// 継続するのが通例、`CategoryChange` は自己誘発の懸念、それ以外は復帰しても改善しない)
+    /// では復帰を試みても効果が無いか、正常なルート切替のたびに不要な音切れを生む。
+    pub fn requires_recovery(self) -> bool {
+        matches!(self, Self::OldDeviceUnavailable)
+    }
+}
+
+/// `AVAudioSessionInterruptionNotification` / `UIApplicationDidBecomeActiveNotification` /
+/// `AVAudioSessionRouteChangeNotification` の監視・復帰処理。iOS / tvOS 以外では何もしない
+/// no-op(`ios_session::configure` と同じ「常に呼んでよい・非対応 OS では素通り」の設計)。
 pub struct Watcher {
     // 読み出さない(`Drop` 経由で observer を確実に `removeObserver` させるためだけに
     // 保持する RAII ハンドル)。
@@ -221,11 +321,12 @@ mod imp {
     use objc2_avf_audio::{
         AVAudioSessionInterruptionNotification, AVAudioSessionInterruptionOptionKey,
         AVAudioSessionInterruptionOptions, AVAudioSessionInterruptionType,
-        AVAudioSessionInterruptionTypeKey,
+        AVAudioSessionInterruptionTypeKey, AVAudioSessionRouteChangeNotification,
+        AVAudioSessionRouteChangeReason, AVAudioSessionRouteChangeReasonKey,
     };
     use objc2_foundation::{NSNotification, NSNotificationCenter, NSNumber, NSString, ns_string};
 
-    use super::InterruptionState;
+    use super::{InterruptionState, RouteChangeReason};
 
     pub(super) struct Watcher {
         observers: Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
@@ -310,6 +411,47 @@ mod imp {
                 observers.push(observer);
             }
 
+            {
+                let state = Arc::clone(&state);
+                let stream = Arc::clone(&stream);
+                let events = Arc::clone(&events);
+                let block = RcBlock::new(move |notif: NonNull<NSNotification>| {
+                    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                        // SAFETY: OS が有効な NSNotification を渡してくる(この block の契約)。
+                        let notif = unsafe { notif.as_ref() };
+                        handle_route_change_notification(notif, &state, &stream, &events);
+                    }));
+                    if outcome.is_err() {
+                        crate::mw_log!(
+                            "[mw-backend] ios_interruption: panic while handling \
+                             AVAudioSessionRouteChangeNotification (caught at the boundary)"
+                        );
+                    }
+                });
+                // SAFETY: `AVAudioSessionRouteChangeNotification` はプロセス生存中変化しない
+                // 静的な通知名。cpal 自身も同じ通知を独立した observer で監視しているが
+                // (`session_event_manager.rs`)、NSNotificationCenter は同一通知に対する
+                // 複数 observer を問題なく許容する(モジュール doc「追記: ルート変化」で
+                // 確認済み——cpal 側は `error_callback` を呼ぶだけで `AudioUnit`/`playing`
+                // フラグには一切触れないため、二重処理にはならない)。
+                if let Some(name) = unsafe { AVAudioSessionRouteChangeNotification } {
+                    let observer = unsafe {
+                        nc.addObserverForName_object_queue_usingBlock(
+                            Some(name),
+                            None,
+                            None,
+                            &block,
+                        )
+                    };
+                    observers.push(observer);
+                } else {
+                    crate::mw_log!(
+                        "[mw-backend] ios_interruption: AVAudioSessionRouteChangeNotification \
+                         is unavailable"
+                    );
+                }
+            }
+
             Self { observers }
         }
     }
@@ -379,6 +521,57 @@ mod imp {
         }
     }
 
+    fn handle_route_change_notification(
+        notif: &NSNotification,
+        state: &Mutex<InterruptionState>,
+        stream: &cpal::Stream,
+        events: &EventQueue,
+    ) {
+        let Some(reason) = route_change_reason(notif) else {
+            return;
+        };
+        crate::mw_log!("[mw-backend] AVAudioSession route changed (reason={reason:?})");
+
+        // `Event::RouteChanged` は reason を問わず毎回発火する(モジュール doc「追記:
+        // ルート変化」参照。テンプレート側のオフセット再較正用で、復帰要否とは別軸)。
+        events.push_side_channel(Event::RouteChanged);
+
+        let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+        *guard = guard.on_route_changed(reason);
+        let attempt = guard.needs_recovery_attempt();
+        drop(guard);
+        if attempt {
+            attempt_recovery(state, stream, events);
+        }
+    }
+
+    fn classify_route_change_reason(raw: AVAudioSessionRouteChangeReason) -> RouteChangeReason {
+        match raw {
+            AVAudioSessionRouteChangeReason::OldDeviceUnavailable => {
+                RouteChangeReason::OldDeviceUnavailable
+            }
+            AVAudioSessionRouteChangeReason::NewDeviceAvailable => {
+                RouteChangeReason::NewDeviceAvailable
+            }
+            AVAudioSessionRouteChangeReason::CategoryChange => RouteChangeReason::CategoryChange,
+            AVAudioSessionRouteChangeReason::Override => RouteChangeReason::Override,
+            _ => RouteChangeReason::Other,
+        }
+    }
+
+    fn route_change_reason(notif: &NSNotification) -> Option<RouteChangeReason> {
+        let user_info = notif.userInfo()?;
+        let key = unsafe { AVAudioSessionRouteChangeReasonKey }?;
+        // SAFETY: cpal 自身の `session_event_manager.rs::route_change_error` と同じ
+        // reinterpret(`cast_unchecked`)。
+        let dict = unsafe { user_info.cast_unchecked::<NSString, AnyObject>() };
+        let value = dict.objectForKey(key)?;
+        let number = value.downcast_ref::<NSNumber>()?;
+        Some(classify_route_change_reason(
+            AVAudioSessionRouteChangeReason(number.unsignedIntegerValue()),
+        ))
+    }
+
     /// セッション再アクティブ化 + ストリーム再始動を試みる。
     ///
     /// `stream.play()` だけでは復帰しない(モジュール doc の「実機バグの原因」参照:
@@ -432,7 +625,7 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
-    use super::InterruptionState;
+    use super::{InterruptionState, RouteChangeReason};
 
     /// 依頼書が明示した最小シナリオ:「停止した → 再開要求 → 再開した」。
     #[test]
@@ -515,5 +708,73 @@ mod tests {
     #[test]
     fn default_state_is_running() {
         assert_eq!(InterruptionState::default(), InterruptionState::Running);
+    }
+
+    /// 実機報告その2の最小シナリオ:「Bluetooth を切断すると SE が鳴らなくなる」——
+    /// `OldDeviceUnavailable` はどの状態からでも復帰要求(`RecoveryPending`)へ遷移する。
+    #[test]
+    fn route_changed_with_old_device_unavailable_requests_recovery_from_any_state() {
+        for state in [
+            InterruptionState::Running,
+            InterruptionState::Interrupted,
+            InterruptionState::RecoveryPending,
+            InterruptionState::Recovered,
+            InterruptionState::RecoveryFailed,
+        ] {
+            assert_eq!(
+                state.on_route_changed(RouteChangeReason::OldDeviceUnavailable),
+                InterruptionState::RecoveryPending
+            );
+        }
+    }
+
+    /// 依頼書の警告どおり:正常なルート切替(BT/イヤホン接続・カテゴリ変更・
+    /// オーバーライド等)では状態を一切変えない——毎回 `pause()`→`play()` すると
+    /// 通常プレイ中に不要な音切れを生むため。
+    #[test]
+    fn route_changed_with_benign_reasons_does_not_change_state() {
+        for reason in [
+            RouteChangeReason::NewDeviceAvailable,
+            RouteChangeReason::CategoryChange,
+            RouteChangeReason::Override,
+            RouteChangeReason::Other,
+        ] {
+            for state in [
+                InterruptionState::Running,
+                InterruptionState::Interrupted,
+                InterruptionState::RecoveryPending,
+                InterruptionState::Recovered,
+                InterruptionState::RecoveryFailed,
+            ] {
+                assert_eq!(
+                    state.on_route_changed(reason),
+                    state,
+                    "reason {reason:?} must not change state {state:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_old_device_unavailable_requires_recovery() {
+        assert!(RouteChangeReason::OldDeviceUnavailable.requires_recovery());
+        assert!(!RouteChangeReason::NewDeviceAvailable.requires_recovery());
+        assert!(!RouteChangeReason::CategoryChange.requires_recovery());
+        assert!(!RouteChangeReason::Override.requires_recovery());
+        assert!(!RouteChangeReason::Other.requires_recovery());
+    }
+
+    /// ルート変化による復帰要求と、割り込みによる復帰要求は同じ `RecoveryPending` へ
+    /// 合流する——復帰失敗後の再試行(`on_app_became_active`)がどちらの経路から来た
+    /// 場合でも同じように働くことを固定化する。
+    #[test]
+    fn route_change_recovery_failure_can_be_retried_when_the_app_becomes_active_again() {
+        let state = InterruptionState::Running
+            .on_route_changed(RouteChangeReason::OldDeviceUnavailable)
+            .on_recovery_attempted(false);
+        assert_eq!(state, InterruptionState::RecoveryFailed);
+
+        let state = state.on_app_became_active();
+        assert_eq!(state, InterruptionState::RecoveryPending);
     }
 }

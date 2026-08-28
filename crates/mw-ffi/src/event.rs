@@ -5,9 +5,10 @@
 
 /// イベント種別。値は csbindgen が生成する C# 側 `enum MwEventKind : int` と一致する。
 ///
-/// `RouteChanged` は**検知そのものが M3 の範囲**(初期構築仕様『§6 テンプレートとの
-/// 連携ポイント』)なので、値だけ予約してあり、現時点ではどこからも発火しない
-/// (`mw_core::Event::RouteChanged` のドキュメント参照)。
+/// `RouteChanged`(初期構築仕様『§6 テンプレートとの連携ポイント』)は iOS / tvOS で
+/// `crates/mw-backend/src/ios_interruption.rs` が発火させる(M3。reason を問わず
+/// ルート変化のたびに1回。詳細は `mw_core::Event::RouteChanged` のドキュメント参照)。
+/// Android では未配線。
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MwEventKind {

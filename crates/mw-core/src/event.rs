@@ -94,11 +94,13 @@ impl StreamErrorReason {
 /// (mw-ffi 側の blittable 表現 `MwEvent` への変換は `mw-ffi/src/event.rs` を参照)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
-    /// 出力ルートの変化。
+    /// 出力ルートの変化(初期構築仕様『§6 テンプレートとの連携ポイント』
+    /// 「ルート変化イベントの経路」)。テンプレート側のオフセット自動再較正用。
     ///
-    /// **検知そのものは M3 の範囲**(初期構築仕様『§6 テンプレートとの連携ポイント』
-    /// 「ルート変化イベントの経路」)。ここでは型だけ用意し、発火は繋がない
-    /// (依頼書のとおり——新たな検知ロジックは作らない)。
+    /// iOS / tvOS では `crates/mw-backend/src/ios_interruption.rs` が
+    /// `AVAudioSessionRouteChangeNotification` を監視して積む(reason を問わず毎回、
+    /// M3)。付随データは持たない(reason で復帰要否を判断するロジックは
+    /// `ios_interruption.rs` 側に閉じている)。Android では未配線(M3 未着手)。
     RouteChanged,
     /// アンダーラン。`frames` は集約後のフレーム数(`mixer.rs::Mixer::report_underrun`
     /// のコメント参照。1コールバックごとではなく、連続するアンダーランをまとめて

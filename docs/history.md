@@ -12,7 +12,7 @@
 | Milestone | 状態 |
 |---|---|
 | M0 基盤 / M1 SE 再生 / M2 楽曲とクロック | **完了** |
-| M3 実運用耐性 | **着手**(iOS の割り込み・バックグラウンド復帰は実装済み。ルート変化検知・Android の AAudio disconnect 再オープン・アンダーラン検知テレメトリは未着手) |
+| M3 実運用耐性 | **着手**(iOS の割り込み・バックグラウンド復帰・ルート変化〔OldDeviceUnavailable〕は実装済み。Android の AAudio disconnect 再オープン・アンダーラン検知テレメトリは未着手) |
 | M4 仕上げ機能 | **着手中**(M4-1 予約発音の C# ラッパ 完了 / M4-2 キャリブレーション連携 完了) |
 | M5 ハードニング | 未着手 |
 
@@ -21,6 +21,68 @@
 ユーザー方針「AudioSource には頼らず全面 middleware へ移行したい」に沿って順序を入れ替えた。
 
 ## 作業記録
+
+#### 2026-08-28(middleware: M3 追撃 —— iOS 実機バグ修正その2「Bluetooth 解除で SE が無音になる」)
+
+**症状**(ユーザー実機報告その2): Bluetooth で接続してから Bluetooth を解除すると SE が
+鳴らなくなる。前回の割り込み対応(`ios_interruption.rs`)では塞げていなかった。
+
+**なぜ前回の修正で直らなかったか**: 前回監視したのは
+`AVAudioSessionInterruptionNotification`(電話着信等)と
+`UIApplicationDidBecomeActiveNotification`(安全網)の2つ。**ルート変化は別の通知
+(`AVAudioSessionRouteChangeNotification`)で飛んでくる**ため対象外だった。
+
+**cpal がルート変化時に何をしているか(ソースを読んで確認)**:
+`coreaudio::ios::session_event_manager.rs::route_change_error` は reason を分類して
+`host/error_emit.rs::emit_error`/`try_emit_error` 経由でユーザーの `error_callback`
+(＝このクレートが渡した `err_fn`)を呼ぶだけ。`emit_error`/`try_emit_error` の実装は
+コールバックを呼ぶ1行のみで、**`AudioUnit` にも `Stream::play()` が見る
+`playing` フラグにも一切触れない**。つまり cpal はルート変化時にストリームの作り直しも
+`stop`/`start` の呼び直しも一切せず、二重処理の心配は無い——復帰は完全にこちら側の責務、
+かつ前回発見した「`playing` フラグが OS 主導の停止に追随しない」問題がルート変化にも
+そのまま当てはまる(cpal が一切関与しないので当然)。
+
+**復帰を走らせる reason は `AVAudioSessionRouteChangeReason::OldDeviceUnavailable` のみ**
+(BT 切断・イヤホン抜け相当。Apple のドキュメント上「直前まで使っていたデバイスが
+無くなった」で実機報告と一致し、cpal 自身もこの reason だけを他と別グループに分類して
+いる)。`NewDeviceAvailable`(BT 接続等)・`Override` は音が途切れず自動継続するのが通例
+のため復帰を試みない(依頼書の警告どおり、正常なルート切替のたびに音切れを生むのを
+避ける)。`CategoryChange` は `ios_session::configure()` 自身が引き起こしうるため
+自己誘発ループを避けて反応しない。`NoSuitableRouteForCategory` 等は復帰しても
+改善しないため見送り。判断根拠は `ios_interruption.rs` のモジュール doc
+「追記: ルート変化」に詳述。
+
+**実装**: 同じ `ios_interruption.rs` に3つ目の observer
+(`AVAudioSessionRouteChangeNotification`)を追加。`InterruptionState` に
+`on_route_changed(RouteChangeReason)` を追加し(復帰要求 reason ならどの状態からでも
+`RecoveryPending` へ、それ以外は状態を一切変えない)、判定ロジック自体は
+`RouteChangeReason::requires_recovery`(OS 呼び出しを含まない純粋な値型、imp 側が実際の
+`AVAudioSessionRouteChangeReason` から変換するだけ)に切り出した。復帰処理
+(`pause()`→`play()`)は既存の `attempt_recovery` をそのまま再利用。
+
+**ついでに初期構築仕様『§6』の宿題を1つ片付けた**: `mw_core::Event::RouteChanged` は
+M1 の時点で「型だけ用意し発火は繋がない」と明記されていた予約済みイベント
+(テンプレート側のオフセット自動再較正用)。今回ルート変化の検知経路ができたので、
+reason を問わずルート変化のたびに(`requires_recovery` の判定とは独立に)これも
+発火させるようにした。**既存の `MwEventKind::RouteChanged = 0` の値は変えていない**
+(元々予約されていた判別子をそのまま使うだけなので、新しい列挙子の追加すら不要だった)。
+
+**テスト**: `ios_interruption.rs` に4件追加(`OldDeviceUnavailable` はどの状態からでも
+`RecoveryPending` へ / それ以外の reason(`NewDeviceAvailable`/`CategoryChange`/
+`Override`/`Other`)はどの状態も変えない/`requires_recovery` は `OldDeviceUnavailable`
+だけ true / ルート変化経由の復帰失敗もアクティブ化での再試行に乗る)。
+`realtime_safety.rs` は今回も無変更。
+
+自動テストで守れるのは reason ごとの状態遷移ロジックのみ。**実機で BT 接続→切断の
+シーケンスを試し、SE が復帰することの確認は依頼書のとおり実機検証でしか確認できない。**
+
+検証: `cargo fmt --check` 緑 / `cargo clippy --workspace --all-targets -- -D warnings`
+警告0(ホスト・`aarch64-apple-ios` の両ターゲット) / `cargo test --workspace`
+**219/219 緑**(前回基準 215 から +4 = 今回追加した単体テスト4件ぶん。内訳
+mw-backend 13 / mw-core 153 / mw-core realtime_safety 1 / mw-ffi 52) /
+`cargo build --workspace --release`(ホスト)・`cargo build -p mw-ffi --release
+--target aarch64-apple-ios` いずれも成功。C ABI の関数シグネチャ・列挙子の値は
+無変更(doc コメント更新のみ)。
 
 #### 2026-08-28(middleware: M3 着手 —— iOS 実機バグ修正「バックグラウンドから戻ると SE だけ無音になる」)
 
