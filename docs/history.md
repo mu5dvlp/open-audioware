@@ -22,6 +22,48 @@
 
 ## 作業記録
 
+#### 2026-08-28(middleware: バグ修正 —— キャリブレーション画面キャンセルでメトロノームが鳴り続ける退行)
+
+**症状**(ユーザー実機報告): キャリブレーション画面でキャンセルを押してもメトロノームが
+鳴り続ける。
+
+**原因**: 予約された SE は `Mixer.voices`(いま鳴っているボイス)と
+`Mixer.se_schedule`(`ScheduleQueue<ScheduledSe>`、これから鳴る未発火の予約)の
+2箇所に分かれて存在するが、`Command::StopVoice`/`Command::StopVoicesUsingSound` の
+処理が `voices` 側しか止めておらず、`se_schedule` に積まれた未発火の予約が
+素通りしていた。既定実装(Unity `AudioSource`)では `Destroy` で予約ごと消えるため、
+ミドルウェア導入で初めて顕在化した退行。呼び出し側(Unity/C#)のロジックは正しかった。
+
+**修正**:
+
+- `crates/mw-core/src/schedule.rs`: `ScheduleQueue<T>` に `remove_where(matches, on_removed)`
+  を追加。取り除いた要素は `on_removed` へそのまま渡す(その場で drop しない)契約にし、
+  `entries.remove(i)` の詰め直しだけで昇順不変条件を保ったまま任意条件の削除ができるようにした
+  (`Vec::remove` は再アロケーションを起こさないため §5.3 に抵触しない)。
+- `crates/mw-core/src/mixer.rs`: `Command::StopVoice`/`Command::StopVoicesUsingSound` の
+  処理で、`voices.stop()`/`voices.stop_all_using_sound()` に加えて
+  `se_schedule.remove_where(...)` も呼ぶようにした。取り除いた `ScheduledSe` が保持する
+  `Arc<SoundData>` は既存の回収キュー(`ReclaimSender::send_or_leak`)へそのまま渡し、
+  音声コールバック内での Arc ドロップを発生させない(`voice.rs` の Arc 所有権設計を
+  そのまま踏襲。実際のデアロケーションはゲームスレッド側の `ReclaimReceiver::drain` で
+  起こる)。
+- `crates/mw-core/tests/realtime_safety.rs`: 既存のカウンティングアロケータ統合テストへ
+  「予約 → 直後に StopVoice/StopVoicesUsingSound でキャンセル」のシナリオを追加し、
+  この削除経路も0アロケーション/0デアロケーションであることを実測で固定化した。
+
+**テスト**(`crates/mw-core`、依頼書の5要件に対応): `schedule.rs` に `remove_where` 自体の
+単体テスト4件(一致要素のみ削除して `on_removed` へ渡す/昇順の生存者が壊れない/
+不一致時は無変更/全削除で空になる)、`mixer.rs` に発火前キャンセルで鳴らない・
+別 voice は巻き添えにならない・発火済み voice への `StopVoice` は従来どおり効く(退行なし)・
+`StopVoicesUsingSound` で同一音源の未発火予約も消える・削除後も `fire_due_se` が
+正しいオフセットで発火する(昇順不変条件の保持)・キャンセル分の `Arc` が回収キュー経由で
+渡ること、の計6件を追加。
+
+検証: `cargo fmt --check` 緑 / `cargo clippy --workspace --all-targets -- -D warnings` 警告0 /
+`cargo test --workspace` **208/208 緑**(内訳 mw-backend 2 / mw-core 153 / mw-core
+realtime_safety 1 / mw-ffi 52。着手前基準 198 から +10 = 新規ユニットテスト10件ぶん)。
+公開 API(C ABI)のシグネチャは無変更のため `make bindgen` は不要。
+
 #### 2026-08-24〜25(middleware: M2-7 完了 —— 楽曲制御 API を FFI へ公開)
 
 3コミットに分けた。下から上へ積む形で、各コミット単体でもビルドが通る。

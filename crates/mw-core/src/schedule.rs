@@ -101,6 +101,43 @@ impl<T> ScheduleQueue<T> {
         }
     }
 
+    /// `matches` に一致する未発火の予約をすべて取り除く(`StopVoice`/`StopVoicesUsingSound` によるキャンセル用途)。
+    ///
+    /// 取り除いた要素の所有権は捨てずに `on_removed` へそのまま渡す——
+    /// 呼び出し元(`Mixer::apply_command`)はここで `T`(`ScheduledSe`、内部に
+    /// `Arc<SoundData>` を持つ)を直接 drop してはならない。音声スレッド上での
+    /// Arc ドロップは §5.3 のリアルタイム安全性規約違反になるため、`on_removed` の中で
+    /// 回収キュー(`ReclaimSender::send_or_leak`)へ転送する契約(`mixer.rs` 参照)。
+    ///
+    /// # リアルタイム安全性
+    ///
+    /// `Vec::remove` は要素のシフトのみで再アロケーションを起こさない
+    /// (`try_insert` と同じ根拠、モジュール doc 参照)。一致した要素をその場で
+    /// 取り除きながら前へ詰めるだけなので、`entries` の相対順序(= `host_time_ns` 昇順)は
+    /// 保たれる——挿入と違って新しい順序判断が要らないため、この操作自体が不変条件を
+    /// 崩すことはない。件数は固定容量(`capacity`)で頭打ちのため、最悪 O(capacity^2) の
+    /// シフトコストも音声コールバック1回あたりでは無視できる規模に収まる。
+    pub(crate) fn remove_where<F, R>(&mut self, mut matches: F, mut on_removed: R)
+    where
+        F: FnMut(&T) -> bool,
+        R: FnMut(T),
+    {
+        let mut i = 0;
+        while i < self.entries.len() {
+            let hit = self
+                .entries
+                .get(i)
+                .is_some_and(|(_, payload)| matches(payload));
+            if hit {
+                let (_, payload) = self.entries.remove(i);
+                on_removed(payload);
+                // 後続要素が index i へ詰まるので i は進めない。
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
@@ -203,5 +240,76 @@ mod tests {
         assert_eq!(q.front(), Some(&(100, 1)));
         assert_eq!(q.front(), Some(&(100, 1)));
         assert_eq!(q.len(), 1);
+    }
+
+    // --- remove_where (StopVoice / StopVoicesUsingSound のキャンセル用途) ---
+
+    #[test]
+    fn remove_where_removes_only_matching_entries_and_hands_them_to_on_removed() {
+        let mut q: ScheduleQueue<u32> = ScheduleQueue::with_capacity(8);
+        q.try_insert(100, 1);
+        q.try_insert(200, 2);
+        q.try_insert(300, 3);
+        q.try_insert(400, 2); // 同じ payload 値が複数回一致してもよい
+
+        let mut removed = Vec::new();
+        q.remove_where(|payload| *payload == 2, |payload| removed.push(payload));
+
+        assert_eq!(
+            removed,
+            vec![2, 2],
+            "both matching entries must be handed to on_removed"
+        );
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.pop_front(), Some((100, 1)));
+        assert_eq!(q.pop_front(), Some((300, 3)));
+        assert_eq!(q.pop_front(), None);
+    }
+
+    #[test]
+    fn remove_where_preserves_ascending_order_of_survivors() {
+        let mut q: ScheduleQueue<u32> = ScheduleQueue::with_capacity(8);
+        for (t, v) in [(100, 1), (200, 2), (300, 3), (400, 4), (500, 5)] {
+            assert!(q.try_insert(t, v));
+        }
+        // 先頭・中間・末尾の混在パターンで取り除く(不変条件が壊れやすい境界)。
+        q.remove_where(|payload| matches!(payload, 1 | 3 | 5), |_| {});
+
+        assert_eq!(q.len(), 2);
+        // 生き残った要素が host_time_ns 昇順のままであることを直接検証する
+        // (削除後に fire_due_se が「先頭が未来なら打ち切る」最適化を続けて安全に使える条件)。
+        assert_eq!(q.pop_front(), Some((200, 2)));
+        assert_eq!(q.pop_front(), Some((400, 4)));
+        assert_eq!(q.pop_front(), None);
+    }
+
+    #[test]
+    fn remove_where_with_no_match_leaves_queue_untouched() {
+        let mut q: ScheduleQueue<u32> = ScheduleQueue::with_capacity(8);
+        q.try_insert(100, 1);
+        q.try_insert(200, 2);
+
+        let mut removed = Vec::new();
+        q.remove_where(|payload| *payload == 999, |payload| removed.push(payload));
+
+        assert!(removed.is_empty());
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.pop_front(), Some((100, 1)));
+        assert_eq!(q.pop_front(), Some((200, 2)));
+    }
+
+    #[test]
+    fn remove_where_can_empty_the_queue_entirely() {
+        let mut q: ScheduleQueue<u32> = ScheduleQueue::with_capacity(4);
+        q.try_insert(100, 1);
+        q.try_insert(200, 1);
+        q.try_insert(300, 1);
+
+        let mut removed_count = 0;
+        q.remove_where(|_| true, |_| removed_count += 1);
+
+        assert_eq!(removed_count, 3);
+        assert_eq!(q.len(), 0);
+        assert_eq!(q.front(), None);
     }
 }

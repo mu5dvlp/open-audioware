@@ -288,6 +288,16 @@ impl Mixer {
             }
             Command::StopVoice { voice_serial } => {
                 self.voices.stop(voice_serial, default_ramp);
+                // 既に発火して `voices` へ移った分はこれで止まるが、まだ発火していない
+                // 予約(`se_schedule`)は `voices` の外にあるため別途取り消す(依頼書
+                // 「症状」参照——キャリブレーション画面のキャンセルでメトロノームが
+                // 鳴り続ける退行の直接原因)。取り除いた `Arc<SoundData>` はここで
+                // drop せず回収キューへ回す(§5.3、`ScheduleQueue::remove_where` 参照)。
+                let reclaim = &mut self.reclaim;
+                self.se_schedule.remove_where(
+                    |se| se.voice_serial == voice_serial,
+                    |se| reclaim.send_or_leak(se.sound),
+                );
             }
             Command::SetVoiceVolume {
                 voice_serial,
@@ -297,6 +307,14 @@ impl Mixer {
             }
             Command::StopVoicesUsingSound { sound_id } => {
                 self.voices.stop_all_using_sound(sound_id, default_ramp);
+                // `voices` 側だけでは不十分: `se_schedule` に残る同じ音源への未発火予約は
+                // 解放済み `SoundData` を後から鳴らそうとしてしまう(依頼書参照)。
+                // ここでも取り除いた分は回収キュー経由でのみ解放する。
+                let reclaim = &mut self.reclaim;
+                self.se_schedule.remove_where(
+                    |se| se.sound_id == sound_id,
+                    |se| reclaim.send_or_leak(se.sound),
+                );
             }
             Command::SetBusVolume { bus, volume } => {
                 self.buses
@@ -1016,6 +1034,214 @@ mod tests {
             "the third schedule must be dropped-but-counted, not silently accepted"
         );
         assert_eq!(mixer.se_schedule_len(), 2);
+    }
+
+    // =====================================================================
+    // バグ修正: StopVoice / StopVoicesUsingSound による未発火予約 SE のキャンセル
+    // (キャリブレーション画面キャンセル後もメトロノームが鳴り続ける退行の修正)
+    // =====================================================================
+
+    /// 依頼書のテスト要件1: 予約した SE を発火前に `StopVoice` すると鳴らない。
+    #[test]
+    fn stop_voice_cancels_an_unfired_scheduled_se() {
+        let (mut mixer, sender, _reclaim, _mp, _mc, _events) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+        assert!(sender.send(Command::SeSchedule {
+            host_time_ns: 5 * NS_PER_SAMPLE,
+            entry: se_entry(1, 1.0),
+        }));
+        assert!(sender.send(Command::StopVoice { voice_serial: 1 }));
+
+        let mut buf = vec![-1.0; 16 * CHANNELS];
+        mixer.render(&mut buf, 0);
+
+        assert!(
+            buf.iter().all(|&s| s == 0.0),
+            "a scheduled voice cancelled before it fired must never make sound"
+        );
+        assert_eq!(
+            mixer.se_schedule_len(),
+            0,
+            "the cancelled entry must actually be removed from the queue, not just skipped"
+        );
+    }
+
+    /// 依頼書のテスト要件2: 別の voice の予約は巻き添えで消えない。
+    #[test]
+    fn stop_voice_does_not_cancel_a_different_voices_unfired_schedule() {
+        let (mut mixer, sender, _reclaim, _mp, _mc, _events) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+        assert!(sender.send(Command::SeSchedule {
+            host_time_ns: 5 * NS_PER_SAMPLE,
+            entry: se_entry(1, 0.4),
+        }));
+        assert!(sender.send(Command::SeSchedule {
+            host_time_ns: 5 * NS_PER_SAMPLE,
+            entry: se_entry(2, 0.7),
+        }));
+        assert!(sender.send(Command::StopVoice { voice_serial: 1 }));
+
+        let mut buf = vec![0.0; 16 * CHANNELS];
+        mixer.render(&mut buf, 0);
+
+        // voice 1 は消えているので、鳴っているのは voice 2 の音量(0.7)のみのはず。
+        assert!(
+            (buf[5 * CHANNELS] - 0.7).abs() < 1e-6,
+            "the untouched voice's schedule must still fire at its exact offset"
+        );
+    }
+
+    /// 依頼書のテスト要件3: 既に発火済みの voice への `StopVoice` が従来どおり効く
+    /// (退行が無いこと——`se_schedule` 側の新しい削除ロジックが `voices.stop()` の
+    /// 既存経路を壊していないことの直接確認)。
+    #[test]
+    fn stop_voice_on_an_already_fired_voice_still_stops_it_via_the_ramp() {
+        let (mut mixer, sender, _reclaim, _mp, _mc, _events) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+        // 過去時刻を予約 → 最初の render の先頭フレームで即座に発火して `voices` へ移る。
+        assert!(sender.send(Command::SeSchedule {
+            host_time_ns: 0,
+            entry: se_entry(7, 1.0),
+        }));
+        let mut buf1 = vec![0.0; 4 * CHANNELS];
+        mixer.render(&mut buf1, 0);
+        assert!((buf1[0] - 1.0).abs() < 1e-6, "must have already fired");
+        assert_eq!(mixer.se_schedule_len(), 0, "queue must be empty once fired");
+
+        // 発火済みの同じ voice_serial へ StopVoice を送る(従来どおりの経路)。
+        assert!(sender.send(Command::StopVoice { voice_serial: 7 }));
+        let ramp_len = ms_to_samples(Config::DEFAULT_RAMP_MS, TEST_SAMPLE_RATE) as usize;
+        let mut buf2 = vec![-1.0; ramp_len * CHANNELS];
+        mixer.render(&mut buf2, 4 * NS_PER_SAMPLE);
+
+        let last_l = buf2[(ramp_len - 1) * CHANNELS];
+        assert!(
+            last_l.abs() < 1e-6,
+            "an already-active voice must still ramp down to silence on StopVoice, got {last_l}"
+        );
+    }
+
+    /// 依頼書のテスト要件4: `StopVoicesUsingSound` で、その音源の未発火予約も消える
+    /// (`mw_sound_release` が解放済み音源を後から鳴らしてしまう退行の修正)。
+    #[test]
+    fn stop_voices_using_sound_cancels_unfired_schedules_referencing_that_sound() {
+        let (mut mixer, sender, _reclaim, _mp, _mc, _events) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+        let released_sound_id = 100u64;
+        let other_sound_id = 200u64;
+        assert!(sender.send(Command::SeSchedule {
+            host_time_ns: 5 * NS_PER_SAMPLE,
+            entry: ScheduledSe {
+                voice_serial: 1,
+                sound_id: released_sound_id,
+                sound: constant_sound(1_000, 0.9),
+                bus: BusId::Se,
+                volume: 1.0,
+            },
+        }));
+        assert!(sender.send(Command::SeSchedule {
+            host_time_ns: 5 * NS_PER_SAMPLE,
+            entry: ScheduledSe {
+                voice_serial: 2,
+                sound_id: other_sound_id,
+                sound: constant_sound(1_000, 0.5),
+                bus: BusId::Se,
+                volume: 1.0,
+            },
+        }));
+        assert!(sender.send(Command::StopVoicesUsingSound {
+            sound_id: released_sound_id,
+        }));
+
+        let mut buf = vec![0.0; 16 * CHANNELS];
+        mixer.render(&mut buf, 0);
+
+        // released_sound_id の予約は消え、other_sound_id の予約(0.5)だけが鳴る。
+        assert!(
+            (buf[5 * CHANNELS] - 0.5).abs() < 1e-6,
+            "only the schedule referencing the still-alive sound must fire"
+        );
+        assert_eq!(mixer.se_schedule_len(), 0);
+    }
+
+    /// 依頼書のテスト要件5: 削除後も昇順の不変条件が保たれ、`fire_due_se` の
+    /// 「先頭が未来なら打ち切る」最適化が引き続き正しく動く(生き残った予約が
+    /// 正しい順序・正しいオフセットで発火する)。
+    #[test]
+    fn removal_preserves_ascending_order_so_remaining_schedules_still_fire_correctly() {
+        let (mut mixer, sender, _reclaim, _mp, _mc, _events) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+        // 1フレームだけ鳴る短い音にして、後続フレームへ音が持ち越されないようにする
+        // (`se_entry` の既定 1000 フレームだと発火後ずっと鳴り続けてしまい、
+        // 「中間だけ鳴らない」ことを1サンプル単位で検証できないため)。
+        let short_entry = |voice_serial: u64, value: f32| ScheduledSe {
+            voice_serial,
+            sound_id: voice_serial,
+            sound: constant_sound(1, value),
+            bus: BusId::Se,
+            volume: 1.0,
+        };
+        // 先頭・中間・末尾の3件を仕込み、中間だけ StopVoice でキャンセルする。
+        assert!(sender.send(Command::SeSchedule {
+            host_time_ns: 3 * NS_PER_SAMPLE,
+            entry: short_entry(1, 0.1),
+        }));
+        assert!(sender.send(Command::SeSchedule {
+            host_time_ns: 6 * NS_PER_SAMPLE,
+            entry: short_entry(2, 0.2),
+        }));
+        assert!(sender.send(Command::SeSchedule {
+            host_time_ns: 9 * NS_PER_SAMPLE,
+            entry: short_entry(3, 0.3),
+        }));
+        assert!(sender.send(Command::StopVoice { voice_serial: 2 }));
+
+        let mut buf = vec![0.0; 16 * CHANNELS];
+        mixer.render(&mut buf, 0);
+
+        assert!(
+            (buf[3 * CHANNELS] - 0.1).abs() < 1e-6,
+            "the earlier survivor must still fire at its own offset"
+        );
+        assert_eq!(
+            buf[6 * CHANNELS],
+            0.0,
+            "the cancelled middle entry must not fire"
+        );
+        assert!(
+            (buf[9 * CHANNELS] - 0.3).abs() < 1e-6,
+            "the later survivor must still fire at its own offset, proving ordering was not corrupted"
+        );
+        assert_eq!(
+            mixer.se_schedule_len(),
+            0,
+            "all three must have been consumed (2 fired, 1 cancelled)"
+        );
+    }
+
+    /// キャンセルされた予約の `Arc<SoundData>` は回収キュー経由でのみ解放される
+    /// ことを確認する(音声コールバック内での Arc ドロップ禁止、§5.3)。
+    #[test]
+    fn stop_voice_routes_the_cancelled_arc_through_the_reclaim_queue_not_an_inline_drop() {
+        let (mut mixer, sender, mut reclaim, _mp, _mc, _events) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+        assert!(sender.send(Command::SeSchedule {
+            host_time_ns: 5 * NS_PER_SAMPLE,
+            entry: se_entry(1, 1.0),
+        }));
+        assert!(sender.send(Command::StopVoice { voice_serial: 1 }));
+
+        assert_eq!(reclaim.pending_len(), 0);
+        let mut buf = vec![0.0; 8 * CHANNELS];
+        mixer.render(&mut buf, 0);
+
+        assert_eq!(
+            reclaim.pending_len(),
+            1,
+            "the cancelled schedule's Arc<SoundData> must be handed to the reclaim queue"
+        );
+        reclaim.drain();
+        assert_eq!(reclaim.pending_len(), 0);
     }
 
     // --- 楽曲の予約再生 ---

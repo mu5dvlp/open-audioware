@@ -198,6 +198,37 @@ fn render_path_never_allocates_or_deallocates() {
         },
     }));
 
+    // バグ修正: `StopVoice`/`StopVoicesUsingSound` による未発火予約のキャンセル
+    // (`ScheduleQueue::remove_where`)もこの経路(`Mixer::apply_command`)から呼ばれる
+    // ため、ここで検証対象に含める。取り除いた `Arc<SoundData>` を回収キュー経由へ
+    // 転送するだけでその場では drop しない設計(§5.3)なので、これも 0 アロケーション/
+    // デアロケーションのはず。コマンドは同じキューへ FIFO で積まれるため、最初の
+    // 計測対象 `render` 呼び出しの中で「予約 → 即キャンセル」の両方が消化される。
+    assert!(sender.send(Command::SeSchedule {
+        host_time_ns: buffer_duration_ns * 80,
+        entry: ScheduledSe {
+            voice_serial: 9_004,
+            sound_id: 9_004,
+            sound: constant_sound(64, 0.3),
+            bus: mw_core::BusId::Se,
+            volume: 1.0,
+        },
+    }));
+    assert!(sender.send(Command::StopVoice {
+        voice_serial: 9_004,
+    }));
+    assert!(sender.send(Command::SeSchedule {
+        host_time_ns: buffer_duration_ns * 90,
+        entry: ScheduledSe {
+            voice_serial: 9_005,
+            sound_id: 9_005,
+            sound: constant_sound(64, 0.3),
+            bus: mw_core::BusId::Se,
+            volume: 1.0,
+        },
+    }));
+    assert!(sender.send(Command::StopVoicesUsingSound { sound_id: 9_005 }));
+
     let mut buffer = vec![0.0f32; buffer_frames as usize * CHANNELS];
 
     // `EventQueue::drain`/`push_side_channel` が内部で使う `Mutex` は、プラットフォーム
