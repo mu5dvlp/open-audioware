@@ -358,13 +358,16 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 name = "mw-backend"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "cpal",
  "jni",
  "libc",
  "mach2 0.6.0",
  "mw-core",
  "ndk-context",
+ "objc2",
  "objc2-avf-audio",
+ "objc2-foundation",
 ]
 
 [[package]]

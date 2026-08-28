@@ -53,6 +53,20 @@
   cpal 0.18 が `objc2-avf-audio` を持ち込むため Rust から直接設定している(詳細は同ファイルの
   モジュールコメント)。設定値はすべて【仮】で、変更が要るのはこのファイル1枚。
 
+- `ios_interruption`(M3)— iOS / tvOS の `AVAudioSessionInterruptionNotification` /
+  `UIApplicationDidBecomeActiveNotification` を監視し、割り込み終了時・アプリのアクティブ化時に
+  セッション再アクティブ化 + ストリーム再始動(`pause()`→`play()`)を試みる。実機報告
+  「バックグラウンドから戻ると SE だけ無音になる」の修正(cpal 0.18.1 の iOS 実装は
+  interruption 通知を監視しておらず、`Stream::play()` の内部フラグも OS 主導の停止に
+  追随しないため、単純な再呼び出しでは復帰しない——詳細はモジュール doc)。`CpalBackend`
+  はストリームを `Arc<cpal::Stream>` として持ち、この監視の復帰ハンドラと共有する。
+  復帰ロジックは `InterruptionState`(OS 呼び出しを含まない純粋な状態機械)として切り出し、
+  単体テストで遷移を固定化してある(実機の割り込みそのものは自動テスト不可のため)。
+  `mw_core::Event::AudioInterruptionBegan`/`AudioInterruptionEnded { recovered }`
+  として `mw_poll_events` 経由で C# 側からも観測できる。iOS / tvOS 以外では no-op。
+  Android の AAudio disconnect は同じ経路では塞げていない(`docs/history.md` 2026-08-28
+  「M3 着手」参照——`Renderer` の再構築が要るため今回は見送り)。
+
 ## 設計意図
 
 - 初期構築仕様 M6(【仮】): 立ち上げは cpal で macOS Editor / iOS / Android を1系統に揃える。

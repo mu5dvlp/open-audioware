@@ -9,6 +9,7 @@ pub mod android_context;
 pub mod backend;
 pub mod cpal_backend;
 pub mod host_time;
+pub mod ios_interruption;
 pub mod ios_session;
 pub mod platform_log;
 

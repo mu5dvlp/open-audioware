@@ -13,6 +13,7 @@ use cpal::{SampleFormat, StreamConfig, SupportedStreamConfig};
 use mw_core::{CHANNELS, Event, EventQueue, Renderer, StreamErrorReason};
 
 use crate::backend::{Backend, BackendError};
+use crate::ios_interruption;
 
 /// 既定の出力デバイスに f32 ステレオストリームを開く `Backend` 実装。
 ///
@@ -20,7 +21,17 @@ use crate::backend::{Backend, BackendError};
 /// `BackendError::NoOutputDevice` を返す。パニックはしない。
 #[derive(Default)]
 pub struct CpalBackend {
-    stream: Option<cpal::Stream>,
+    /// `Arc` で持つ理由: iOS の割り込み監視([`ios_interruption::Watcher`])が
+    /// OS 通知ハンドラ(非リアルタイムスレッド)から同じストリームの `pause()`/`play()`
+    /// を呼び直せるよう、参照を共有する必要があるため(`ios_interruption.rs` の
+    /// モジュール doc「実装方針」参照)。iOS / tvOS 以外では単なる所有権共有としてのみ
+    /// 使う(`Watcher` は no-op)。
+    stream: Option<Arc<cpal::Stream>>,
+    /// iOS / tvOS: `AVAudioSessionInterruptionNotification` /
+    /// `UIApplicationDidBecomeActiveNotification` の監視・復帰処理(M3)。
+    /// それ以外の OS では no-op(`ios_interruption.rs` 参照)。`stream` と1対1で
+    /// 生成・破棄する(`open`/`close` を参照)。
+    ios_interruption: Option<ios_interruption::Watcher>,
     /// 音声スレッドが書き、ゲームスレッドが読む「直近のコールバックのフレーム数」。
     /// 詳細は [`Backend::last_callback_frames`]。
     callback_frames: Arc<AtomicU32>,
@@ -38,6 +49,7 @@ impl CpalBackend {
     pub fn new() -> Self {
         Self {
             stream: None,
+            ios_interruption: None,
             callback_frames: Arc::new(AtomicU32::new(0)),
             output_latency_ns: Arc::new(AtomicU64::new(0)),
             logged_output_latency: AtomicBool::new(false),
@@ -130,13 +142,20 @@ impl Backend for CpalBackend {
             renderer,
             Arc::clone(&self.callback_frames),
             Arc::clone(&self.output_latency_ns),
-            events,
+            // `events` はこの後 `ios_interruption::Watcher::new` へも渡すため、ここでは
+            // clone を渡す(`err_fn` クロージャへムーブされる分)。
+            Arc::clone(&events),
         )?;
         stream
             .play()
             .map_err(|e| BackendError::PlayStreamFailed(e.to_string()))?;
 
         crate::mw_log!("[mw-backend] output stream started");
+
+        // ストリームを `Arc` で共有する理由・`ios_interruption` の役割は `CpalBackend` の
+        // フィールド doc を参照。iOS / tvOS 以外では no-op(`ios_interruption.rs`)。
+        let stream = Arc::new(stream);
+        self.ios_interruption = Some(ios_interruption::Watcher::new(Arc::clone(&stream), events));
 
         self.sample_rate = config.sample_rate;
         self.stream = Some(stream);
@@ -146,6 +165,9 @@ impl Backend for CpalBackend {
     fn close(&mut self) -> Result<(), BackendError> {
         match self.stream.take() {
             Some(stream) => {
+                // ストリームを実際に止める前に割り込み監視を止める(観測を続けたまま
+                // 止まりかけのストリームへ `pause()`/`play()` を呼び直すのを避ける)。
+                self.ios_interruption = None;
                 // `pause` はベストエフォート。stream の drop で確実にコールバックは止まる。
                 let _ = stream.pause();
                 drop(stream);

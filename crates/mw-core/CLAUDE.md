@@ -10,9 +10,11 @@ OS 非依存・デバイス非依存のコア。ミキサ、ボイス管理、�
 ## 現状(M1: SE 再生)
 
 - `event`: `Event`(§4.6 イベント通知。`RouteChanged`/`Underrun`/`MusicEnded`/
-  `MusicLooped`/`StreamError`/`ClipperEngaged` の6種。可変長データは持たず、
-  バリアントごとの付随データは固定サイズの数値のみ)と `EventQueue`(固定容量、
-  【仮】既定64。溢れたら古いものから破棄し、破棄数を読み手側で逆算する、M2-6)。
+  `MusicLooped`/`StreamError`/`ClipperEngaged`/`AudioInterruptionBegan`/
+  `AudioInterruptionEnded`(M3。`crates/mw-backend/src/ios_interruption.rs` が積む)の8種。
+  可変長データは持たず、バリアントごとの付随データは固定サイズの数値のみ)と
+  `EventQueue`(固定容量、【仮】既定64。溢れたら古いものから破棄し、破棄数を読み手側で
+  逆算する、M2-6)。
   書き込み経路が2系統ある: 音声スレッド(唯一の書き手 `Mixer`)専用の
   `push_realtime`(ロック・アロケーション無し。各スロットを1本の `AtomicU64` に
   タグ+ペイロードで詰め、`write_index` の Release/Acquire だけで公開する——

@@ -114,6 +114,21 @@ pub enum Event {
     /// Master 段のソフトクリッパが動作した。**開発ビルドのみ発火**
     /// (呼び出し元の `mixer.rs::Mixer::render` が `cfg!(debug_assertions)` で判定する)。
     ClipperEngaged,
+    /// OS 主導のオーディオ割り込みが始まった(M3)。iOS の
+    /// `AVAudioSessionInterruptionNotification`(`AVAudioSessionInterruptionTypeBegan`)
+    /// 相当——電話着信・Siri・他アプリの音声に加え、Background Audio 機能を持たない
+    /// アプリがバックグラウンドへ遷移した場合もここに含まれる(実機報告「ホームに
+    /// 戻ると SE だけ無音になる」の原因。`crates/mw-backend/src/ios_interruption.rs`
+    /// のモジュール doc 参照)。この時点で出力ストリームは(OS 側の都合で)鳴らなく
+    /// なっている可能性が高い。
+    AudioInterruptionBegan,
+    /// 割り込みが終わった、またはミドルウェアが独自に(アプリのアクティブ化を契機に)
+    /// 復帰を試みた(M3)。`recovered` はストリーム再開(AVAudioSession 再アクティブ化 +
+    /// 出力ユニット再始動)を試みて成功したかどうか。**割り込み終了時に OS が
+    /// 再開不要(`AVAudioSessionInterruptionOptionShouldResume` 無し)と判断した場合は
+    /// 復帰を試みず `recovered: false` で積む**(何もしていないので「成功していない」
+    /// が正確)。
+    AudioInterruptionEnded { recovered: bool },
 }
 
 /// スロット1件のペイロードに使えるビット数(残り8bitは種別タグ)。
@@ -131,6 +146,8 @@ impl Event {
             Event::MusicLooped { restart_frame } => (3, restart_frame & PAYLOAD_MASK),
             Event::StreamError { reason } => (4, reason as u64),
             Event::ClipperEngaged => (5, 0),
+            Event::AudioInterruptionBegan => (6, 0),
+            Event::AudioInterruptionEnded { recovered } => (7, recovered as u64),
         };
         ((tag as u64) << PAYLOAD_BITS) | (payload & PAYLOAD_MASK)
     }
@@ -150,9 +167,13 @@ impl Event {
             4 => Event::StreamError {
                 reason: StreamErrorReason::from_raw(payload as u32),
             },
-            // 5、および理論上到達しない値(このスロットへ書き込むのは常にこのモジュール
-            // 自身の `to_bits` だけなので tag は 0..=5 のいずれかのはず)の防御的既定。
-            _ => Event::ClipperEngaged,
+            5 => Event::ClipperEngaged,
+            6 => Event::AudioInterruptionBegan,
+            // 7、および理論上到達しない値(このスロットへ書き込むのは常にこのモジュール
+            // 自身の `to_bits` だけなので tag は 0..=7 のいずれかのはず)の防御的既定。
+            _ => Event::AudioInterruptionEnded {
+                recovered: payload != 0,
+            },
         }
     }
 }
@@ -315,6 +336,9 @@ mod tests {
                 reason: StreamErrorReason::DeviceUnavailable,
             },
             Event::ClipperEngaged,
+            Event::AudioInterruptionBegan,
+            Event::AudioInterruptionEnded { recovered: true },
+            Event::AudioInterruptionEnded { recovered: false },
         ];
         for v in variants {
             assert_eq!(

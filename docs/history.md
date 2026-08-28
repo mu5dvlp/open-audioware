@@ -12,7 +12,7 @@
 | Milestone | 状態 |
 |---|---|
 | M0 基盤 / M1 SE 再生 / M2 楽曲とクロック | **完了** |
-| M3 実運用耐性 | **未着手**(⚠️ 実機運用に入る前には必須。ルート変化・割り込み・アンダーラン検知) |
+| M3 実運用耐性 | **着手**(iOS の割り込み・バックグラウンド復帰は実装済み。ルート変化検知・Android の AAudio disconnect 再オープン・アンダーラン検知テレメトリは未着手) |
 | M4 仕上げ機能 | **着手中**(M4-1 予約発音の C# ラッパ 完了 / M4-2 キャリブレーション連携 完了) |
 | M5 ハードニング | 未着手 |
 
@@ -21,6 +21,85 @@
 ユーザー方針「AudioSource には頼らず全面 middleware へ移行したい」に沿って順序を入れ替えた。
 
 ## 作業記録
+
+#### 2026-08-28(middleware: M3 着手 —— iOS 実機バグ修正「バックグラウンドから戻ると SE だけ無音になる」)
+
+**症状**(ユーザー実機報告。iPhone 14 / iOS): タスクをキルせずホームへ戻り、ゲームへ戻ると
+SE だけ無音になる。ボイス(Unity `AudioSource` 経由)は鳴る。
+
+**原因**: `crates/mw-backend/` にオーディオ割り込み・アプリライフサイクルの処理が一切無かった。
+cpal 0.18.1 の iOS 実装(`coreaudio::ios::session_event_manager`。ソースを確認済み)は
+ルート変化とメディアサービスの喪失/リセットしか監視しておらず、
+**`AVAudioSessionInterruptionNotification` を一切監視していない**。iOS はアプリが
+(Background Audio 機能を持たないまま)バックグラウンドへ行くと `AVAudioSession` を
+非アクティブ化して RemoteIO の出力ユニットを止めるが、この通知が来ないため
+ミドルウェア側は何も気づかず、`cpal::Stream` は「鳴っているつもり」のまま固まる。SE は
+このストリーム経由なので鳴らなくなり、Unity 自身が管理するボイスだけ生き残る——
+「SE だけ鳴らない」という報告と正確に一致する。
+
+さらに、cpal 0.18.1 の `Stream::play()`(iOS 実装)は内部の `playing` フラグが既に `true`
+なら `AudioOutputUnitStart` を呼ばずに即 return する。OS が横から止めても cpal 側はそれを
+検知しないため**このフラグは追随せず、単純に `play()` を呼び直すだけでは復帰しない**
+(先に `pause()` でフラグを倒す必要がある。詳細は `ios_interruption.rs` のモジュール doc)。
+
+**実装方針**(検討した3案のうち3を採用。理由は `ios_interruption.rs` 冒頭に詳述):
+
+1. cpal の `Stream`/`Backend` を閉じて再オープン —— `Renderer` を値渡し(ムーブ)で
+   音声コールバックへ排他所有させる現行設計(M1)では、一度ムーブした `Renderer`
+   (=全ボイス・バス音量・楽曲再生位置)を取り戻す経路が無く、再オープンすると
+   まるごと失われる。これを直すには `mw-ffi::handle::Instance` 側の大きな再設計が要る
+   (初期構築仕様§14 の「AAudio 再オープンは M3 で必須実装」の本丸そのもの)。今回の
+   スコープ(実機報告の再現・修正)を超えるため見送った
+2. 最小の Obj-C シムを xcframework に同梱 —— cpal 0.18 は既に `objc2` 系クレートを
+   iOS 実装の依存に持ち込んでおり(`ios_session.rs` が既に利用中)、Obj-C ファイルを
+   増やすと「Obj-C シムは薄く保つ」方針にも反する
+3. **(採用)同じ `cpal::Stream` を維持したまま、`objc2-foundation::NSNotificationCenter`
+   へ Rust から直接 observer を登録し、復帰時に `pause()`→`play()` を呼び直す。**
+   cpal 自身の `session_event_manager.rs` が全く同じパターン(ブロックベースの
+   observer 登録)を使っており実績がある。`Renderer` の所有権を一切動かさないため、
+   ボイス・バス音量・楽曲位置は割り込みを跨いで自然に保持される(最小の変更で
+   実機報告のバグそのものを直せる)
+
+監視する通知は2つ: `AVAudioSessionInterruptionNotification`(電話着信等の「真の」割り込み。
+Ended の `userInfo` の `AVAudioSessionInterruptionOptionShouldResume` を見て復帰要否を判断)と、
+`UIApplicationDidBecomeActiveNotification`(安全網。バックグラウンド遷移では Began は確実に
+飛ぶが、対応する Ended が確実に飛んでくる保証が無いため)。後者は**割り込み中だった場合に
+限り**復帰を試みる——Control Center やバナー通知でも `DidBecomeActive` は飛んでくるが実際には
+中断していないため、無条件に `pause()`→`play()` すると通常プレイ中に不要な音切れを生む。
+通知名は `objc2-ui-kit` を新規依存に追加せず `ns_string!` マクロで文字列リテラルから直接
+作った(実行時アロケーション無し)。
+
+**Android の点検結果**: cpal 0.18 の AAudio 実装は disconnect を `err_fn` 経由で
+`Event::StreamError` として既に報告できる(M2-6 の既存経路)。ただし AAudio の disconnect は
+iOS と違い**構造的に終端**(disconnect したストリームは `play()` で復活せず、閉じて
+新しいストリームを作るしかない)で、これは案1で見送った「`Renderer` の再構築」問題と
+完全に同じ壁にぶつかる。今回のスコープでは見送り、報告のみとした(依頼書の指示どおり)。
+
+**C ABI へのイベント追加**: `mw_core::Event` に `AudioInterruptionBegan` /
+`AudioInterruptionEnded { recovered: bool }` を追加し、`mw_poll_events` 経由で観測できるように
+した(`MwEventKind` へ 6/7 を追加。**既存シグネチャは無変更**、列挙値の追加のみ)。
+クライアント側が「鳴らなくなった/復帰した(成功したか)」を知る手段がこれまで無かったための
+追加(依頼書の判断基準どおり)。
+
+**テスト**: 実機の割り込み・バックグラウンド遷移は自動テストで再現できないため、復帰ロジックを
+`InterruptionState`(OS API 呼び出しを一切含まない純粋な状態機械。`Running` →
+`Interrupted` → `RecoveryPending` → `Recovered`/`RecoveryFailed`)として切り出し、
+`crates/mw-backend/src/ios_interruption.rs` に7件の単体テストで遷移を固定化した
+(「停止した→再開要求→再開した」の基本シナリオ、`ShouldResume` 無しでは復帰を試みない、
+復帰失敗後の再試行、ベニンなアクティブ化では何もしない、新しい割り込みは常に最優先、
+既定値)。`realtime_safety.rs` は変更していない(音声スレッド経路は今回無変更)。
+
+自動テストで守れる範囲は状態機械の遷移ロジックのみ。**OS 通知が実機で実際に発火するか**
+**`pause()`→`play()` の順序で `AudioOutputUnitStart` が本当に音を復活させるか**は
+実機検証でしか確認できない(iPhone 14 実機でホーム往復を試すこと)。
+
+検証: `cargo fmt --check` 緑 / `cargo clippy --workspace --all-targets -- -D warnings` 警告0
+(ホスト・`aarch64-apple-ios` の両ターゲットで確認) / `cargo test --workspace`
+**215/215 緑**(内訳 mw-backend 9 / mw-core 153 / mw-core realtime_safety 1 / mw-ffi 52。
+着手前基準 208 から +7 = `ios_interruption.rs` の新規ユニットテスト7件ぶん) /
+`cargo build -p mw-ffi --release --target aarch64-apple-ios` 成功(実際の iOS ターゲットで
+objc2 コードがビルドできることを確認。xcframework の組み立て・Unity への配置・実機インストールは
+呼び出し元が行う)。
 
 #### 2026-08-28(middleware: バグ修正 —— キャリブレーション画面キャンセルでメトロノームが鳴り続ける退行)
 

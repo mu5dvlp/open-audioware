@@ -21,6 +21,23 @@ version = "0.3"
 features = ["std", "AVAudioSession", "AVAudioSessionTypes"]
 default-features = false
 
+# AVAudioSessionInterruptionNotification / UIApplicationDidBecomeActiveNotification を
+# NSNotificationCenter 経由で監視するために使う(M3、割り込み・バックグラウンド復帰対応)。
+# cpal 0.18 の iOS 実装が `session_event_manager.rs`(ルート変化等の監視)で既に
+# objc2-foundation / objc2 / block2 に依存しているため、バージョンを揃えてある限り
+# 依存ツリーは増えない(`Cargo.lock` で確認済み)。詳細は
+# crates/mw-backend/src/ios_interruption.rs を参照。
+[target.'cfg(any(target_os = "ios", target_os = "tvos"))'.dependencies.objc2-foundation]
+version = "0.3"
+features = ["std", "NSNotification", "NSDictionary", "NSString", "NSValue", "NSOperation", "block2"]
+default-features = false
+
+[target.'cfg(any(target_os = "ios", target_os = "tvos"))'.dependencies.objc2]
+version = "0.6"
+
+[target.'cfg(any(target_os = "ios", target_os = "tvos"))'.dependencies.block2]
+version = "0.6"
+
 # `host_time::host_time_ns`(初期構築仕様『§4.4』)が `mach_absolute_time` /
 # `mach_timebase_info` を cpal 0.18.1 の CoreAudio 実装(`host_time_to_stream_instant`)と
 # 完全に同じ式で呼ぶために使う。cpal 自身が macOS/iOS/tvOS で `mach2 0.6` に依存済みなので

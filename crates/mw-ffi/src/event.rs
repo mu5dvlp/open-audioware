@@ -20,6 +20,13 @@ pub enum MwEventKind {
     /// リリースビルドでも同じ値のまま予約しておく——ビルド構成によって列挙値が
     /// ずれると、生成される C# バインディングの意味がビルドごとに変わってしまうため)。
     ClipperEngaged = 5,
+    /// OS 主導のオーディオ割り込みが始まった(M3)。`mw_core::Event::AudioInterruptionBegan`
+    /// のドキュメント参照。iOS 実機で「バックグラウンドから復帰すると SE だけ無音になる」
+    /// 問題の観測手段として追加した(`crates/mw-backend/src/ios_interruption.rs`)。
+    AudioInterruptionBegan = 6,
+    /// 割り込みが終わった/復帰を試みた(M3)。`payload` は
+    /// `mw_core::Event::AudioInterruptionEnded::recovered`(0 or 1)をそのまま `u64` 化。
+    AudioInterruptionEnded = 7,
 }
 
 /// C# へポーリングで渡す1件分のイベント(blittable, `#[repr(C)]`)。
@@ -53,6 +60,8 @@ pub enum MwEventKind {
 ///   ではなく、連続するアンダーランをまとめて報告する)
 /// - `MusicLooped`: 折り返し先(曲頭からのフレーム位置)
 /// - `StreamError`: `mw_core::StreamErrorReason` の判別子をそのまま `u64`化したもの
+/// - `AudioInterruptionEnded`: 復帰(ストリーム再開)を試みて成功したら 1、それ以外は 0
+///   (`AudioInterruptionBegan` は付随データを持たないため常に 0)
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MwEvent {
@@ -87,6 +96,14 @@ impl MwEvent {
             mw_core::Event::ClipperEngaged => Self {
                 kind: MwEventKind::ClipperEngaged,
                 payload: 0,
+            },
+            mw_core::Event::AudioInterruptionBegan => Self {
+                kind: MwEventKind::AudioInterruptionBegan,
+                payload: 0,
+            },
+            mw_core::Event::AudioInterruptionEnded { recovered } => Self {
+                kind: MwEventKind::AudioInterruptionEnded,
+                payload: recovered as u64,
             },
         }
     }
@@ -139,6 +156,27 @@ mod tests {
             MwEvent::from_core(mw_core::Event::ClipperEngaged),
             MwEvent {
                 kind: MwEventKind::ClipperEngaged,
+                payload: 0
+            }
+        );
+        assert_eq!(
+            MwEvent::from_core(mw_core::Event::AudioInterruptionBegan),
+            MwEvent {
+                kind: MwEventKind::AudioInterruptionBegan,
+                payload: 0
+            }
+        );
+        assert_eq!(
+            MwEvent::from_core(mw_core::Event::AudioInterruptionEnded { recovered: true }),
+            MwEvent {
+                kind: MwEventKind::AudioInterruptionEnded,
+                payload: 1
+            }
+        );
+        assert_eq!(
+            MwEvent::from_core(mw_core::Event::AudioInterruptionEnded { recovered: false }),
+            MwEvent {
+                kind: MwEventKind::AudioInterruptionEnded,
                 payload: 0
             }
         );
