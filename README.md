@@ -2,7 +2,7 @@
   <img src="docs/assets/logo.png" alt="Open Audioware — open source audio middleware" width="520" />
 </p>
 
-# audio-middleware-sample
+# open-audioware
 
 **Open Audioware** — 音楽ゲーム向けに自作している、CRI Ware の大まかな代替となる
 オーディオミドルウェア(Rust)。
@@ -79,7 +79,7 @@ CI の macOS ランナー(`macos-latest`)は Apple Silicon のため、CI で生
 ## リポジトリ構成
 
 ```
-audio-middleware-sample/
+open-audioware/
   crates/
     mw-core/     … OS 非依存のミキサ・クロック・デコードコア
     mw-backend/  … 出力デバイス抽象(Backend trait)+ cpal 実装

@@ -242,7 +242,7 @@ namespace Mw.Native
     }
 
     /// <summary>
-    /// audio-middleware-sample のネイティブ層への薄いラッパ。
+    /// open-audioware のネイティブ層への薄いラッパ。
     /// csbindgen が生成した <c>Mw.Native.Generated.NativeMethods</c>(internal)を直接
     /// 呼ばず、必ずこのクラスを経由すること(初期構築仕様 §5.4)。
     /// <para>

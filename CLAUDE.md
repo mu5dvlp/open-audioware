@@ -1,4 +1,4 @@
-# CLAUDE.md — audio-middleware-sample 運用ルール
+# CLAUDE.md — open-audioware 運用ルール
 
 このファイルは短く保つ。詳細は索引先のドキュメントを参照すること。
 

@@ -1,6 +1,6 @@
 {
   "dependencies": {
-    "com.mu5dvlp.audio-middleware": {
+    "com.mu5dvlp.open-audioware": {
       "version": "file:../../unity",
       "depth": 0,
       "source": "local",

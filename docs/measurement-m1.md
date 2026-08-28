@@ -146,7 +146,7 @@ python3 tools/measurement/analyze_ab_video.py <Bの動画> --label B
   (`Measurement.EditorTools.IosXcodeExporter` が `PlayerSettings.iOS.appleEnableAutomaticSigning = true`
   ・`CODE_SIGN_STYLE = Automatic` を設定済み。`PRODUCT_BUNDLE_IDENTIFIER` は既定の
   `com.DefaultCompany.unity-sample` のまま — 変更が必要なら Xcode 上で構わない)
-- MwFfi.xcframework は `Build/iOS/Frameworks/com.mu5dvlp.audio-middleware/Runtime/Plugins/iOS/`
+- MwFfi.xcframework は `Build/iOS/Frameworks/com.mu5dvlp.open-audioware/Runtime/Plugins/iOS/`
   配下に正しく埋め込まれていることを確認済み
 
 手順(再実行する場合):

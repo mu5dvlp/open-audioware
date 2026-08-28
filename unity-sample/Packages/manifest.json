@@ -1,6 +1,6 @@
 {
   "dependencies": {
-    "com.mu5dvlp.audio-middleware": "file:../../unity",
+    "com.mu5dvlp.open-audioware": "file:../../unity",
     "com.unity.test-framework": "1.6.0",
     "com.unity.multiplayer.center": "1.0.1",
     "com.unity.ugui": "2.0.0",

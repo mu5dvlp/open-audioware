@@ -41,7 +41,7 @@ namespace Measurement.EditorTools
         private static bool ConfigureNativePluginImporter()
         {
             const string pluginPath =
-                "Packages/com.mu5dvlp.audio-middleware/Runtime/Plugins/Android/libs/arm64-v8a/libmw_ffi.so";
+                "Packages/com.mu5dvlp.open-audioware/Runtime/Plugins/Android/libs/arm64-v8a/libmw_ffi.so";
 
             if (AssetImporter.GetAtPath(pluginPath) is not PluginImporter importer)
             {

@@ -11,7 +11,7 @@ version = "0.1.0"
 edition = "2024"
 license = "UNLICENSED"
 publish = false
-repository = "https://github.com/mu5dvlp/audio-middleware-sample"
+repository = "https://github.com/mu5dvlp/open-audioware"
 
 [profile.release]
 # リアルタイムオーディオコールバックの性能を優先する。

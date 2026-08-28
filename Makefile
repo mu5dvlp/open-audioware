@@ -1,5 +1,5 @@
 \
-# audio-middleware-sample — 初期構築仕様 §7.3
+# open-audioware — 初期構築仕様 §7.3
 #
 # ターゲット一覧は `make help` で表示する。
 
@@ -32,7 +32,7 @@ XCFRAMEWORK           := $(PLUGINS_IOS_DIR)/MwFfi.xcframework
         measurement-scene measurement-export-ios measurement-build-android clean
 
 help:
-	@echo "audio-middleware-sample — make ターゲット"
+	@echo "open-audioware — make ターゲット"
 	@echo "  make setup          - ツールチェーン・ターゲット・cargo-ndk 等の導入確認"
 	@echo "  make lint           - fmt --check + clippy -D warnings + cargo-deny"
 	@echo "  make format         - cargo fmt (自動整形)"
@@ -167,7 +167,7 @@ unity-sample-create:
 			-createProject "$(CURDIR)/$(UNITY_SAMPLE_DIR)" \
 			-quit -logFile -; \
 		echo "作成後、Packages/manifest.json に以下を追記すること(初回のみ、手動 or ツールスクリプト):"; \
-		echo '  "com.mu5dvlp.audio-middleware": "file:../../unity"'; \
+		echo '  "com.mu5dvlp.open-audioware": "file:../../unity"'; \
 		echo '  "com.unity.test-framework": "1.6.0"'; \
 	fi
 
