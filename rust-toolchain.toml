@@ -1,0 +1,22 @@
+# CI (`.github/workflows/ci.yml`)の stable と食い違って「ローカルで緑・CI で赤」に
+# なる事故が2回続いた(clippy の新規 lint が stable のバージョン更新のたびに増える)ため、
+# ツールチェーンをここで明示的に固定する。rustup はこのファイルを見つけると
+# `cargo`/`rustc` 実行時に自動でこのバージョンを使う(`rustup toolchain install` 済みであれば
+# 追加のインストール不要)。
+#
+# CI 側は `.github/workflows/ci.yml` の `dtolnay/rust-toolchain@<version>` 3箇所を
+# ここと同じバージョンに手で合わせてある(`@stable` は rust-toolchain.toml を読まず
+# 常に最新 stable を入れてしまうため、意図的に `@stable` を使っていない)。
+#
+# 【今後 Rust を上げる手順】
+# 1. 上げたい stable バージョンを決める(`rustup check` や release note で確認)。
+# 2. このファイルの `channel` を書き換える。
+# 3. `.github/workflows/ci.yml` 内の `dtolnay/rust-toolchain@<version>` 3箇所を
+#    同じバージョンに揃える(grep -n "dtolnay/rust-toolchain" で洗い出せる)。
+# 4. ローカルで `rustup toolchain install <version>` してから
+#    `cargo clippy --workspace --all-targets -- -D warnings` /
+#    `cargo fmt --all -- --check` / `cargo test --workspace` を通し、
+#    新規 lint が出たらここで潰してから上げる(CI で初めて気づく、を繰り返さない)。
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]

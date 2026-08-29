@@ -378,11 +378,12 @@ impl Mixer {
         buffer_end_ns: u64,
         default_ramp_samples: u32,
     ) {
-        loop {
-            let Some(front) = self.se_schedule.front() else {
-                break;
-            };
-            let target_ns = front.0;
+        while let Some(&(target_ns, _)) = self.se_schedule.front() {
+            // `front()` の不変借用はこのパターンマッチの中で完結させる(タプル先頭の
+            // `u64` だけをコピーして即座に手放す)。`front` を束縛して後段で使う書き方
+            // だと、ループ本体末尾の `pop_front()`(可変借用)まで不変借用が生き続けて
+            // しまい借用チェックに落ちる(clippy::while_let_loop 対応、CI 1.98 化に伴う
+            // 修正)。
             if target_ns >= buffer_end_ns {
                 break; // まだこのバッファの範囲外(未来)。
             }
