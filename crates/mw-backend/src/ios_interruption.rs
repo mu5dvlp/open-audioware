@@ -114,6 +114,61 @@
 //! (`mw_core::event::Event::RouteChanged` のドキュメント参照)。今回そのまま繋いだ——
 //! 復帰(`AudioInterruptionEnded`)とは別軸の情報なので、混ぜずに両方積む。
 //!
+//! ## 追記: `DidBecomeActive` 安全網の前提が崩れていたケース(実機 R12、2026-08-29)
+//!
+//! ユーザー実機報告 R12「iOS でホームに戻って復帰すると音が出ない」。8d90724(このモジュール
+//! 新設。Interruption + `DidBecomeActive` 安全網)と 19099a1(ルート変化対応)を経てもなお
+//! **実機ではまだ直っていなかった**(ユーザー再回答: SE も楽曲も両方鳴らない = 個別ボイスでは
+//! なく出力ストリームごと死んでいることが確定)。
+//!
+//! 上の「実装方針」節にはこう書いていた——「上記の Began は確実に飛んでくる」。これは
+//! Apple のドキュメント・WWDC セッションを根拠にしていたが、**実機の症状はこの前提が
+//! 崩れていることと完全に整合していた**。[`InterruptionState::on_app_became_active`] は
+//! 元々 `Interrupted`/`RecoveryFailed` のときしか `RecoveryPending` へ遷移しなかった。
+//! つまり `AVAudioSessionInterruptionNotification` の Began が(何らかの理由で)一度も
+//! 飛んでこないままバックグラウンドへ行った場合、状態は `Running` のまま変わらず、
+//! 前面復帰で `DidBecomeActive` が飛んできても安全網が一切働かない——ガードに阻まれて
+//! `needs_recovery_attempt()` が `false` のままになり、`pause()`→`play()` が呼ばれない。
+//! 「対応する Ended が確実に飛んでくる保証が無い」という当初の懸念(上記「実装方針」節)は
+//! 正しかったが、**その保険自体が「Began は必ず飛んでくる」という別の未検証の前提の上に
+//! 乗っていた**ため、Began も飛んでこないケースには無力だった。
+//!
+//! **対応: `UIApplicationDidEnterBackgroundNotification` を新たな判別子として追加監視し、
+//! 「実際に背面へ回った」事実そのものを [`InterruptionState::Backgrounded`] として持つ。**
+//! Interruption の Began/Ended が飛ぶかどうかに一切依存しない独立した経路にすることで、
+//! 「Began が確実に飛んでくる」という崩れた前提への依存を無くした。
+//!
+//! これが正しい判別子である理由(「実装方針」節のガード——Control Center・通知バナーでの
+//! 誤発火防止——を壊さないための根拠):
+//!
+//! - **Control Center の引き下ろし・通知バナー表示では `UIApplicationDidEnterBackgroundNotification`
+//!   は飛んでこない**(アプリはあくまで前面のまま。UIKit のアプリライフサイクル上、これらで
+//!   飛ぶのは `UIApplicationWillResignActiveNotification` までで、`DidEnterBackground` は
+//!   アプリが本当に非アクティブ空間(バックグラウンド)へ遷移したときにしか飛ばない)。
+//!   つまり `on_app_became_active` の既存ガード(`Running`/`Recovered` から無条件に
+//!   `pause()`→`play()` しない——通常プレイ中の不要な音切れ防止)が守ろうとしていたものを
+//!   一切損なわずに、「本当に背面へ行った」ケースだけを拾える。
+//! - Began/Ended の到達を一切前提にしない——`Backgrounded` は `DidEnterBackground` 単独で
+//!   立つ状態であり、`on_app_became_active` はここからも無条件で `RecoveryPending` へ
+//!   遷移する([`InterruptionState::on_app_became_active`] 参照)。
+//!
+//! **観測性(この修正でも直らなかった場合に実機ログで切り分けるため)も合わせて足した:**
+//!
+//! - `DidEnterBackground` 到達時に遷移前の状態(`previous_state`)をログへ出す——ログに
+//!   この行が実機で1行も出ていなければ、`DidEnterBackground` 自体が届いていない
+//!   (今回の仮説とは別の穴がある)ことが分かる。
+//! - `DidBecomeActive` 到達時、復帰を試みる場合は遷移前の状態(`previous_state`)を
+//!   ログへ出す。`previous_state=Backgrounded` なら今回追加した経路(Began 未到達)、
+//!   `previous_state=Interrupted`/`RecoveryFailed` なら従来の経路(Began は届いていた)
+//!   ——実機でどちらが起きていたか判別できる。
+//! - `attempt_recovery` にどの通知が起点だったか(`trigger`。Interruption Ended /
+//!   DidBecomeActive / RouteChange のいずれか。DidBecomeActive の場合は上記
+//!   `previous_state` でさらに内訳が分かる)をログへ出す。
+//! - `stream.play()` の成否を**成功時も**ログへ出すようにした(従来は失敗時のみ)。
+//!   実機で「`stream restart succeeded` のログは出ているのに無音」であれば、
+//!   このモジュールの復帰処理自体は正常に動いており、原因は別の層
+//!   (`Renderer`/`Mixer` 側やそもそもの音声グラフ)にあると切り分けられる。
+//!
 //! ## パニック安全性
 //!
 //! Objective-C ランタイムから直接呼ばれるブロックの内部で panic が Rust スタックを
@@ -130,11 +185,14 @@
 //! 状態機械)として切り出し、遷移だけをこのファイル末尾の `tests` で固定化している。
 //! 「割り込みで止まった → 再開要求 → 実際に再開できた」の一連の流れ、
 //! 「ベニンな(実際には中断していない)アクティブ化では何もしない」ガード、
-//! そして「`OldDeviceUnavailable` だけが復帰を要求し、それ以外のルート変化 reason は
+//! 「`OldDeviceUnavailable` だけが復帰を要求し、それ以外のルート変化 reason は
 //! 状態を一切変えない」ガード([`RouteChangeReason::requires_recovery`] /
-//! [`InterruptionState::on_route_changed`])の3つをカバーする。OS 通知が実機で本当に
-//! 発火するか、`pause()`→`play()` の順序で `AudioOutputUnitStart` が実際に音を復活
-//! させるかは実機検証でしか確認できない。
+//! [`InterruptionState::on_route_changed`])、そして追記で足した
+//! 「Began が一度も来ないままバックグラウンドへ行っても、前面復帰したら復帰を試みる」
+//! ([`InterruptionState::Backgrounded`] / [`InterruptionState::on_app_entered_background`])
+//! の4つをカバーする。OS 通知が実機で本当に発火するか(特に `DidEnterBackground` が
+//! このバグシナリオで本当に飛んでくるか)、`pause()`→`play()` の順序で
+//! `AudioOutputUnitStart` が実際に音を復活させるかは実機検証でしか確認できない。
 
 use std::sync::Arc;
 
@@ -157,6 +215,12 @@ pub enum InterruptionState {
     /// 復帰を試みたが失敗した。次にアプリがアクティブになったタイミングで再試行する
     /// ([`InterruptionState::on_app_became_active`])。
     RecoveryFailed,
+    /// 実際にバックグラウンドへ遷移した(`UIApplicationDidEnterBackgroundNotification`)。
+    /// `AVAudioSessionInterruptionNotification` の Began が(何らかの理由で)一度も
+    /// 飛んでこないままバックグラウンドへ行った場合の安全網——モジュール doc「追記:
+    /// `DidBecomeActive` 安全網の前提が崩れていたケース」参照。前面復帰時
+    /// ([`InterruptionState::on_app_became_active`])に無条件で `RecoveryPending` へ遷移する。
+    Backgrounded,
 }
 
 impl InterruptionState {
@@ -189,16 +253,38 @@ impl InterruptionState {
 
     /// アプリがアクティブになった(`UIApplicationDidBecomeActiveNotification`)。
     ///
-    /// 割り込み中だった(`Interrupted`)、または前回の復帰に失敗していた
-    /// (`RecoveryFailed`)場合のみ復帰を試みる。それ以外(`Running`/`RecoveryPending`/
-    /// `Recovered`)では何もしない——実際には中断していないアクティブ化(Control
-    /// Center・通知バナー等)のたびに `pause()`→`play()` を呼び直すと、通常プレイ中に
-    /// 不要な音切れを生むため(モジュール doc「実装方針」参照)。
+    /// 割り込み中だった(`Interrupted`)、前回の復帰に失敗していた(`RecoveryFailed`)、
+    /// または実際にバックグラウンドへ行っていた(`Backgrounded`。モジュール doc「追記:
+    /// `DidBecomeActive` 安全網の前提が崩れていたケース」参照)場合のみ復帰を試みる。
+    /// それ以外(`Running`/`RecoveryPending`/`Recovered`)では何もしない——実際には
+    /// 中断していないアクティブ化(Control Center・通知バナー等)のたびに
+    /// `pause()`→`play()` を呼び直すと、通常プレイ中に不要な音切れを生むため
+    /// (モジュール doc「実装方針」参照)。このガードは `Backgrounded` を足した後も
+    /// 変わらず有効——`Backgrounded` は `DidEnterBackground` が実際に飛んできたときにしか
+    /// 立たない状態で、Control Center・通知バナーでは飛んでこない
+    /// ([`InterruptionState::on_app_entered_background`] 参照)。
     pub fn on_app_became_active(self) -> Self {
         match self {
-            Self::Interrupted | Self::RecoveryFailed => Self::RecoveryPending,
+            Self::Interrupted | Self::RecoveryFailed | Self::Backgrounded => Self::RecoveryPending,
             other => other,
         }
+    }
+
+    /// アプリが実際にバックグラウンドへ入った(`UIApplicationDidEnterBackgroundNotification`)。
+    ///
+    /// どの状態からでも `Backgrounded` へ遷移する——割り込み中(`Interrupted`)に
+    /// バックグラウンドへ行くケース(電話に出たままホームへ戻る等)も普通にあり、
+    /// その場合でも「実際に背面へ回った」という最新の事実を優先する
+    /// (`on_interruption_began` の「最新の事実を優先」と同じ設計)。
+    ///
+    /// この通知は Control Center の引き下ろし・通知バナー表示では飛んでこない
+    /// (アプリは前面のままで、これらで飛ぶのは `UIApplicationWillResignActiveNotification`
+    /// まで)。そのため `on_app_became_active` の既存ガード(実際には中断していない
+    /// アクティブ化での不要な音切れ回避)を壊さずに、「本当に背面へ行った」ケースだけを
+    /// 判別子として使える(モジュール doc「追記: `DidBecomeActive` 安全網の前提が
+    /// 崩れていたケース」参照)。
+    pub fn on_app_entered_background(self) -> Self {
+        Self::Backgrounded
     }
 
     /// ルート変化(`AVAudioSessionRouteChangeNotification`)。`reason` は
@@ -276,8 +362,9 @@ impl RouteChangeReason {
 }
 
 /// `AVAudioSessionInterruptionNotification` / `UIApplicationDidBecomeActiveNotification` /
-/// `AVAudioSessionRouteChangeNotification` の監視・復帰処理。iOS / tvOS 以外では何もしない
-/// no-op(`ios_session::configure` と同じ「常に呼んでよい・非対応 OS では素通り」の設計)。
+/// `UIApplicationDidEnterBackgroundNotification` / `AVAudioSessionRouteChangeNotification` の
+/// 監視・復帰処理。iOS / tvOS 以外では何もしない no-op(`ios_session::configure` と同じ
+/// 「常に呼んでよい・非対応 OS では素通り」の設計)。
 pub struct Watcher {
     // 読み出さない(`Drop` 経由で observer を確実に `removeObserver` させるためだけに
     // 保持する RAII ハンドル)。
@@ -382,6 +469,33 @@ mod imp {
                          is unavailable"
                     );
                 }
+            }
+
+            {
+                let state = Arc::clone(&state);
+                let block = RcBlock::new(move |_: NonNull<NSNotification>| {
+                    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                        handle_entered_background(&state);
+                    }));
+                    if outcome.is_err() {
+                        crate::mw_log!(
+                            "[mw-backend] ios_interruption: panic while handling \
+                             UIApplicationDidEnterBackgroundNotification (caught at the boundary)"
+                        );
+                    }
+                });
+                // UIKit 側の通知名。`objc2-ui-kit` を新規依存に追加せず、文字列リテラルから
+                // 直接 NSString を作る(`UIApplicationDidBecomeActiveNotification` と同じ
+                // 理由づけ、下記参照)。モジュール doc「追記: `DidBecomeActive` 安全網の前提が
+                // 崩れていたケース」参照——Began が一度も飛んでこないままバックグラウンドへ
+                // 行った場合の安全網として、この通知を新たな判別子に使う。
+                let name = ns_string!("UIApplicationDidEnterBackgroundNotification");
+                // SAFETY: 上記と同様、`addObserverForName_object_queue_usingBlock` の契約に
+                // 従う。
+                let observer = unsafe {
+                    nc.addObserverForName_object_queue_usingBlock(Some(name), None, None, &block)
+                };
+                observers.push(observer);
             }
 
             {
@@ -496,28 +610,59 @@ mod imp {
             let attempt = guard.needs_recovery_attempt();
             drop(guard);
             if attempt {
-                attempt_recovery(state, stream, events);
+                attempt_recovery(state, stream, events, RecoveryTrigger::InterruptionEnded);
             } else {
                 events.push_side_channel(Event::AudioInterruptionEnded { recovered: false });
             }
         }
     }
 
+    /// アプリが実際にバックグラウンドへ入った(`UIApplicationDidEnterBackgroundNotification`)。
+    /// ここでは状態を `Backgrounded` へ倒すだけで、復帰は試みない(復帰はあくまで前面復帰
+    /// (`handle_became_active`)またはルート変化・割り込み終了の契機で行う)。
+    ///
+    /// `previous_state` をログへ出す。実機でこの行が1行も出なければ
+    /// `DidEnterBackground` 自体が届いていないことが分かる(モジュール doc「追記:
+    /// `DidBecomeActive` 安全網の前提が崩れていたケース」の観測性節参照)。
+    fn handle_entered_background(state: &Mutex<InterruptionState>) {
+        let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+        let previous_state = *guard;
+        *guard = guard.on_app_entered_background();
+        drop(guard);
+        crate::mw_log!(
+            "[mw-backend] app entered background (previous_state={previous_state:?}); will \
+             attempt recovery on next activation"
+        );
+    }
+
+    /// アプリがアクティブになった(`UIApplicationDidBecomeActiveNotification`)。
+    ///
+    /// 復帰を試みる場合、遷移前の状態(`previous_state`)をログへ出す——
+    /// `previous_state=Backgrounded` なら「Began が一度も来ないままバックグラウンドへ
+    /// 行った」今回追加した経路、`Interrupted`/`RecoveryFailed` なら従来の経路
+    /// (Began は届いていた)だったと実機ログから判別できる(モジュール doc「追記:
+    /// `DidBecomeActive` 安全網の前提が崩れていたケース」の観測性節参照)。
     fn handle_became_active(
         state: &Mutex<InterruptionState>,
         stream: &cpal::Stream,
         events: &EventQueue,
     ) {
         let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+        let previous_state = *guard;
         *guard = guard.on_app_became_active();
         let attempt = guard.needs_recovery_attempt();
         drop(guard);
         if attempt {
             crate::mw_log!(
-                "[mw-backend] app became active while a stream interruption was unresolved; \
-                 attempting recovery"
+                "[mw-backend] app became active while unresolved (previous_state=\
+                 {previous_state:?}); attempting recovery"
             );
-            attempt_recovery(state, stream, events);
+            attempt_recovery(
+                state,
+                stream,
+                events,
+                RecoveryTrigger::AppBecameActive { previous_state },
+            );
         }
     }
 
@@ -541,7 +686,12 @@ mod imp {
         let attempt = guard.needs_recovery_attempt();
         drop(guard);
         if attempt {
-            attempt_recovery(state, stream, events);
+            attempt_recovery(
+                state,
+                stream,
+                events,
+                RecoveryTrigger::RouteChange { reason },
+            );
         }
     }
 
@@ -572,21 +722,60 @@ mod imp {
         ))
     }
 
+    /// 復帰を試みた起点(観測性のためだけの値。`InterruptionState` の遷移ロジックには
+    /// 一切影響しない)。`attempt_recovery` のログに出し、実機でどの通知経由の復帰
+    /// だったかを判別できるようにする(モジュール doc「追記: `DidBecomeActive` 安全網の
+    /// 前提が崩れていたケース」の観測性節参照)。
+    #[derive(Debug, Clone, Copy)]
+    enum RecoveryTrigger {
+        /// `AVAudioSessionInterruptionNotification` の Ended(`should_resume` あり)。
+        InterruptionEnded,
+        /// `UIApplicationDidBecomeActiveNotification`。`previous_state` が
+        /// `Backgrounded` なら今回追加した経路(Began 未到達)、`Interrupted`/
+        /// `RecoveryFailed` なら従来の経路(Began は届いていた)。
+        //
+        // フィールドは `{trigger:?}`(導出 `Debug`)経由でしかログに出さない。rustc の
+        // dead_code 解析は導出 impl 経由の読み出しを「使用」に数えないため
+        // `#[allow(dead_code)]` が要る(`Watcher::inner` フィールドと同じ理由づけ)。
+        #[allow(dead_code)]
+        AppBecameActive { previous_state: InterruptionState },
+        /// `AVAudioSessionRouteChangeNotification`(`reason` は
+        /// `RouteChangeReason::OldDeviceUnavailable` のはず——他の reason は
+        /// `needs_recovery_attempt()` が `false` になるため、そもそもここへ来ない)。
+        #[allow(dead_code)]
+        RouteChange { reason: RouteChangeReason },
+    }
+
     /// セッション再アクティブ化 + ストリーム再始動を試みる。
     ///
     /// `stream.play()` だけでは復帰しない(モジュール doc の「実機バグの原因」参照:
     /// cpal 0.18.1 の内部 `playing` フラグが OS 主導の停止に追随しないため、まず
     /// `pause()` でフラグを倒してから `play()` を呼ぶ)。
+    ///
+    /// `trigger` と `stream.play()` の成否は必ずログへ出す——実機で「succeeded のログは
+    /// 出ているのに無音」であれば、この関数自体は正常に動いており原因は別の層にあると
+    /// 切り分けられる(モジュール doc「追記: `DidBecomeActive` 安全網の前提が崩れていた
+    /// ケース」の観測性節参照)。
     fn attempt_recovery(
         state: &Mutex<InterruptionState>,
         stream: &cpal::Stream,
         events: &EventQueue,
+        trigger: RecoveryTrigger,
     ) {
+        crate::mw_log!("[mw-backend] ios_interruption: attempting recovery (trigger={trigger:?})");
         crate::ios_session::configure();
         let _ = stream.pause();
         let success = stream.play().is_ok();
-        if !success {
-            crate::mw_log!("[mw-backend] ios_interruption: stream restart failed");
+        if success {
+            crate::mw_log!(
+                "[mw-backend] ios_interruption: stream restart succeeded (pause+play, \
+                 trigger={trigger:?})"
+            );
+        } else {
+            crate::mw_log!(
+                "[mw-backend] ios_interruption: stream restart failed (stream.play() returned \
+                 Err, trigger={trigger:?})"
+            );
         }
 
         let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
@@ -676,10 +865,64 @@ mod tests {
         assert_eq!(state, InterruptionState::RecoveryPending);
     }
 
+    /// 依頼書が明示した最小シナリオそのもの:実機バグ R12「iOS でホームに戻って復帰すると
+    /// 音が出ない」の原因——`AVAudioSessionInterruptionNotification` の Began が
+    /// (何らかの理由で)一度も飛んでこないままバックグラウンドへ行くと、`Running` のまま
+    /// 変わらず、`on_app_became_active` の当初のガード(`Interrupted`/`RecoveryFailed`
+    /// のみ復帰)には引っかからなかった。`UIApplicationDidEnterBackgroundNotification` を
+    /// 判別子に足したことで、Began の到達に一切依存せず復帰を要求できることを固定化する
+    /// (モジュール doc「追記: `DidBecomeActive` 安全網の前提が崩れていたケース」参照)。
+    #[test]
+    fn app_became_active_recovers_when_no_interruption_began_before_backgrounding() {
+        let state = InterruptionState::new();
+        assert_eq!(state, InterruptionState::Running);
+
+        // Began は一度も来ない。バックグラウンドへ行った事実だけを状態として持つ。
+        let state = state.on_app_entered_background();
+        assert_eq!(state, InterruptionState::Backgrounded);
+
+        let state = state.on_app_became_active();
+        assert_eq!(state, InterruptionState::RecoveryPending);
+        assert!(state.needs_recovery_attempt());
+    }
+
+    /// 割り込み中(電話中等)にホームへ戻ってバックグラウンドへ行くのも普通にある。
+    /// `Backgrounded` で上書きされても、前面復帰時に復帰要求へ到達することを固定化する。
+    #[test]
+    fn app_entered_background_while_interrupted_still_recovers_on_becoming_active() {
+        let state = InterruptionState::new()
+            .on_interruption_began()
+            .on_app_entered_background();
+        assert_eq!(state, InterruptionState::Backgrounded);
+
+        let state = state.on_app_became_active();
+        assert_eq!(state, InterruptionState::RecoveryPending);
+    }
+
+    /// R12 の経路(バックグラウンド経由)で復帰に失敗しても、従来の割り込み経由
+    /// ([`recovery_failure_can_be_retried_when_the_app_becomes_active_again`])と同じく
+    /// 次のアクティブ化で再試行できることを固定化する。
+    #[test]
+    fn recovery_failure_after_backgrounding_can_be_retried_on_becoming_active_again() {
+        let state = InterruptionState::new()
+            .on_app_entered_background()
+            .on_app_became_active();
+        assert_eq!(state, InterruptionState::RecoveryPending);
+
+        let state = state.on_recovery_attempted(false);
+        assert_eq!(state, InterruptionState::RecoveryFailed);
+
+        let state = state.on_app_became_active();
+        assert_eq!(state, InterruptionState::RecoveryPending);
+        assert!(state.needs_recovery_attempt());
+    }
+
     #[test]
     fn app_became_active_is_a_no_op_when_nothing_was_interrupted() {
         // Control Center・通知バナー等、実際には中断していないアクティブ化で
         // 毎回ストリームを作り直さないことを固定化する(モジュール doc「実装方針」参照)。
+        // `Backgrounded` はここに含めない——それはまさに「実際にバックグラウンドへ
+        // 行った」ケースで、復帰を試みるのが正しい(上記の R12 回帰テスト群を参照)。
         for state in [
             InterruptionState::Running,
             InterruptionState::RecoveryPending,
@@ -705,6 +948,37 @@ mod tests {
         }
     }
 
+    /// 上と同じ「最新の事実を優先」設計が `Backgrounded` からでも成り立つことを固定化する
+    /// (`a_new_interruption_always_wins_even_mid_recovery` を壊さず、`Backgrounded` 分だけ
+    /// 別テストとして足す)。
+    #[test]
+    fn a_new_interruption_always_wins_even_while_backgrounded() {
+        assert_eq!(
+            InterruptionState::Backgrounded.on_interruption_began(),
+            InterruptionState::Interrupted
+        );
+    }
+
+    /// `on_app_entered_background` はどの状態からでも `Backgrounded` へ遷移する
+    /// (`on_interruption_began` の「最新の事実を優先」と同じ設計、モジュール doc
+    /// 「追記: `DidBecomeActive` 安全網の前提が崩れていたケース」参照)。
+    #[test]
+    fn entering_background_always_wins_from_any_state() {
+        for state in [
+            InterruptionState::Running,
+            InterruptionState::Interrupted,
+            InterruptionState::RecoveryPending,
+            InterruptionState::Recovered,
+            InterruptionState::RecoveryFailed,
+            InterruptionState::Backgrounded,
+        ] {
+            assert_eq!(
+                state.on_app_entered_background(),
+                InterruptionState::Backgrounded
+            );
+        }
+    }
+
     #[test]
     fn default_state_is_running() {
         assert_eq!(InterruptionState::default(), InterruptionState::Running);
@@ -720,6 +994,7 @@ mod tests {
             InterruptionState::RecoveryPending,
             InterruptionState::Recovered,
             InterruptionState::RecoveryFailed,
+            InterruptionState::Backgrounded,
         ] {
             assert_eq!(
                 state.on_route_changed(RouteChangeReason::OldDeviceUnavailable),
@@ -745,6 +1020,7 @@ mod tests {
                 InterruptionState::RecoveryPending,
                 InterruptionState::Recovered,
                 InterruptionState::RecoveryFailed,
+                InterruptionState::Backgrounded,
             ] {
                 assert_eq!(
                     state.on_route_changed(reason),
