@@ -22,6 +22,53 @@
 
 ## 作業記録
 
+#### 2026-08-29(middleware: M3 追撃その3 —— ホーム復帰で音が戻らない「安全網の前提が崩れていた」)
+
+**背景**: ユーザー実機報告 R12。`8d90724`(iOS 割り込み対応)と `19099a1`(ルート変化対応)を
+入れてもなお、ホームへ戻って復帰すると音が出ないままだった。ユーザーへの追加確認で
+**「SE も楽曲も両方鳴らない」**ことが分かり、個別のボイスではなく**出力ストリームごと
+死んでいる**ことが確定した(ボイスプールや予約の問題ではない、と切り分けられた)。
+
+**真因**: `InterruptionState::on_app_became_active` が `Interrupted` / `RecoveryFailed` の
+ときしか `RecoveryPending` へ遷移しない作りだった。これは**「割り込みの Began は確実に
+飛んでくる」という未検証の前提**の上に乗っていた。Began が飛んでこないままバックグラウンドへ
+行くと状態は `Running` のままで、前面復帰して `DidBecomeActive` が届いても
+`needs_recovery_attempt()` が false になり、`pause()`→`play()` が一度も呼ばれない。
+
+⚠️ **モジュール doc 自身が「対応する Ended が確実に飛んでくる保証が無い」という懸念を
+正しく書いていた。にもかかわらず直らなかったのは、そのために足した保険
+(`DidBecomeActive`)が、Ended とは別の未検証の前提(Began は必ず来る)に依存していた
+ため。**「保険を足した」ことと「保険が前提から独立している」ことは別物だった、というのが
+この件の教訓。
+
+**対応**: `UIApplicationDidEnterBackgroundNotification` を新たな判別子として監視し、
+「実際に背面へ回った」という事実そのものを `InterruptionState::Backgrounded` として持つ。
+Began / Ended の到達に一切依存しない独立経路になる。
+
+なぜこれが正しい判別子か(既存ガードを壊さない根拠): Control Center の引き下ろしや通知
+バナーでは `DidEnterBackground` は飛ばない(飛ぶのは `WillResignActive` まで)。つまり
+`on_app_became_active` の既存ガード —— `Running` / `Recovered` から無条件に `pause()`→`play()`
+しない、通常プレイ中の不要な音切れ防止 —— が守っていたものを一切損なわずに、本当に
+背面へ行ったケースだけを拾える。
+
+**観測性**: この修正でも直らなかった場合に実機ログで決着させるため、次を足した ——
+復帰の起点になった通知(`trigger`)/ `DidBecomeActive` 時の遷移前状態(`previous_state`。
+`Backgrounded` なら今回の新経路、`Interrupted` なら従来経路で Began は届いていた)/
+`DidEnterBackground` の到達そのもの / `stream.play()` の成否(従来は失敗時のみログしていた)。
+**「`stream restart succeeded` と出ているのに無音」なら、このモジュールの復帰処理は正常に
+動いており、原因は別の層にある**と切り分けられる —— その場合は cpal ストリームごと作り直す
+経路(M3 の設計本体。Android の AAudio 切断復旧と同じ形)が必要という結論になる。
+
+`Event` のシグネチャは変更していない(FFI 境界と Unity 側 C# ラッパへ波及させないため)。
+
+**検証**: `cargo test --workspace` 233件緑(228 → 状態遷移のテスト5件が純増)。
+`cargo clippy --workspace --all-targets -- -D warnings` / `cargo fmt --check` 緑。
+🔴 **`cargo check --target aarch64-apple-ios` / `cargo clippy --target aarch64-apple-ios` も
+実行して緑を確認した** —— `imp` モジュールは `#[cfg(any(target_os = "ios", target_os = "tvos"))]`
+の中にあり、**ホストの `cargo build` では型検査すらされない**ため。
+ネイティブは macOS / iOS / Android の3種とも再ビルド済みで、iOS バイナリに新しい通知名の
+文字列が含まれていること(旧バイナリには含まれていないこと)を `strings` で確認した。
+
 #### 2026-08-29(middleware: M4-3 BGM のネイティブ化)
 
 **背景**: タスク #30。client 側の #109(SE をネイティブミドルウェア経由にする際、
