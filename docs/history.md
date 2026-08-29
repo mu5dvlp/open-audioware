@@ -22,6 +22,61 @@
 
 ## 作業記録
 
+#### 2026-08-29(middleware: R12 の実機確認 + R13「Bluetooth 再接続で無音」)
+
+**R12 は実機ログで解決を確認した。しかも「たまたま」でないことまで確定した。**
+
+```
+[mw-backend] app entered background (previous_state=Running); will attempt recovery on next activation
+[mw-backend] app became active while unresolved (previous_state=Backgrounded); attempting recovery
+[mw-backend] ios_interruption: stream restart succeeded (pause+play, trigger=AppBecameActive { previous_state: Backgrounded })
+```
+
+🔴 **`previous_state=Running` が決定的。** 割り込みの Began が一度も飛んでいない状態で
+バックグラウンドへ行っている。つまり**修正前のコードなら `needs_recovery_attempt()` が false のまま
+何もせず、無音のままだった**ケースそのもの。doc が前提にしていた「Began は確実に飛んでくる」は
+**実機で誤りだと確定した**ので、doc を「〜と整合する」から「〜と確認済み」へ更新した。
+
+**R13: Bluetooth の「切断」ではなく「再接続」が問題だった。**
+
+| 操作 | 結果 |
+|---|---|
+| BT 切断 → 内蔵スピーカー | ✅ 鳴る |
+| BT **再接続** | 🔴 **鳴らない** |
+| ホームに戻って復帰 | ✅ 鳴るようになった |
+
+🔴 **3行目が効いている。** `attempt_recovery` 自体は正しく動くと実機が証明しており、
+**足りないのは引き金だけ**だと切り分けられた。`requires_recovery` は `OldDeviceUnavailable` だけを
+対象にしており、`NewDeviceAvailable` は意図的に除外していた。その根拠は doc のこの記述:
+
+> `NewDeviceAvailable`(BT 接続・イヤホン挿し込み)や `Override` は音が途切れず自動的に継続するのが通例
+
+**この前提も実機で否定された。** `NewDeviceAvailable` を復帰対象に加えた。
+
+| reason | 復帰 | 根拠 |
+|---|---|---|
+| `OldDeviceUnavailable` | ✅ | 従来どおり(BT 切断) |
+| `NewDeviceAvailable` | ✅ **今回追加** | 実機 R13。「継続するのが通例」が否定された |
+| `CategoryChange` | ❌ | `attempt_recovery` → `ios_session::configure()` → `setCategory` の**自己誘発ループ**の危険。専用テストで意図を固定 |
+| `Override` / その他 | ❌ | 実機報告が無い。**報告があるものだけ直す**方針 |
+
+**あわせて「黙って捨てる」経路を塞いだ。** `handle_route_change_notification` は
+`let Some(reason) = route_change_reason(notif) else { return; };` で**ログより先に return**
+していたため、reason の解釈に失敗すると何も記録されずに消えていた。実際、ユーザーの実機ログには
+BT 操作の前後で `route changed` の行が1度も出ていない。**通知を受け取った事実そのものを解釈より前に
+ログする**ようにして、次の実機テストで「貼り漏れ / observer が発火していない / 解釈に失敗している」の
+3つを区別できるようにした。
+
+⚠️ **この「解釈に失敗したら黙って捨てる」形は、このプロジェクトが繰り返し踏んでいる罠**
+(譜面ビルダーのスキップ、出荷アセットのフラグ、等)。新しく early return を書くときは、
+**捨てる前に必ず記録する**こと。
+
+**検証**: `cargo test --workspace` 235件緑(233 → 新規2件・改名1件)。clippy / fmt 緑。
+🔴 `cargo check --target aarch64-apple-ios` / `cargo clippy --target aarch64-apple-ios` も実行して緑
+(`imp` は `cfg(ios)` の中でホストビルドでは型検査されないため)。
+ネイティブは macOS / iOS / Android の3種とも再ビルドし、iOS バイナリに新しいログ文言が
+入っていることを `strings` で確認した。
+
 #### 2026-08-29(middleware: M3 追撃その3 —— ホーム復帰で音が戻らない「安全網の前提が崩れていた」)
 
 **背景**: ユーザー実機報告 R12。`8d90724`(iOS 割り込み対応)と `19099a1`(ルート変化対応)を
