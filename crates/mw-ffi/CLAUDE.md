@@ -30,13 +30,23 @@ C ABI 境界。`mw-core` / `mw-backend` 両方に依存する唯一のクレー�
   Mutex<HashMap<u64, Arc<Vec<u8>>>>`、デコードスレッドの送信ハンドル・停止フラグ・
   join ハンドル)を追加した。**楽曲 ID は最上位ビット(`MUSIC_ID_FLAG`)を立てて
   SE の ID(`mw_core::SoundStorage` 採番)と空間を分離してある**(`is_music_id`
-  で判別。理由は `MUSIC_ID_FLAG` のドキュメント参照)。
+  で判別。理由は `MUSIC_ID_FLAG` のドキュメント参照)。M4-3 で BGM 用に
+  `Arc<mw_core::BgmStatePublisher>`(`bgm_state` フィールド。`mw_bgm_state` が
+  ここからロック無しで読む)と、BGM 専用のもう1本のデコードスレッド一式
+  (`bgm_decoder_tx`/`bgm_decode_thread_stop`/`bgm_decode_thread`)を追加した。
+  **`music_bytes` ストレージと ID 空間は楽曲と共有する**——`mw_bgm_set` は同じ
+  `get_music_bytes` を呼ぶだけで、専用のストレージ・ID 空間を新設していない
+  (「デコード前の圧縮バイト列を保持する」という表現そのものへの分離であり、
+  どちらのボイスで鳴らすかとは無関係なため)。
 - `src/decode_thread.rs` — 楽曲のデコードスレッド(M2-7)。`mw_core::stream` が
   意図的に持たないスレッドをここで1本立て、`mw_init`〜`mw_shutdown` の間
   生かし続ける。`mw_music_set` のたびに立て直すのではなく、
   `mpsc::Sender<Box<dyn mw_core::MusicDecoder + Send>>` 経由でデコーダを
   差し替える設計(理由・待ち方・ポーリング間隔・パニック安全性はモジュール doc
-  参照)。
+  参照)。**M4-3 で BGM 用にもう1本立てるようになった**——`spawn` 自体は
+  「楽曲用」「BGM 用」を一切区別しない汎用実装なので、`handle::init` が
+  独立した `MusicStreamProducer` を渡して2回呼ぶだけでそのまま使い回せている
+  (`decode_thread.rs` 自体の変更は無し)。
 - `src/event.rs` — `MwEvent`(`#[repr(C)]`、blittable)/ `MwEventKind`(`#[repr(i32)]`)。
   初期構築仕様『§4.6 イベント通知』の C ABI 表現(M2-6)。`mw_core::Event` からの
   変換(`MwEvent::from_core`)をここに置く。**csbindgen の入力**(`build.rs` が
@@ -48,7 +58,7 @@ C ABI 境界。`mw-core` / `mw-backend` 両方に依存する唯一のクレー�
 - `build.rs` — csbindgen で `unity/Runtime/Generated/NativeMethods.g.cs` を生成する。
 
 ## 現状の公開 API(M1: SE 再生 / M2-5: ホスト時刻・予約発音 / M2-6: イベント通知 /
-M2-7: 楽曲再生)
+M2-7: 楽曲再生 / M4-3: BGM のネイティブ化)
 
 ```
 mw_abi_version() -> u32                                          // 定数 1
@@ -98,6 +108,18 @@ mw_music_play_scheduled(handle, host_time_ns: u64) -> MwResult
     // 楽曲の予約再生(初期構築仕様 §4.3)。プリロール未完了時の繰り下げは Rust 内部
     // (`mw_core::Renderer::music_schedule_deferred`)からのみ問い合わせ可能
 
+mw_bgm_set(handle, sound_id: u64) -> MwResult
+    // BGM 用の2本目の楽曲ボイス(初期構築仕様『§2』M14, M4-3)を準備する。
+    // sound_id は mw_music_set と同じ mode=Music の ID(ストレージ・ID 空間を共有)。
+    // 手順・非ブロッキング契約は mw_music_set と同一(対象がbgm_voiceに変わるだけ)
+mw_bgm_state(handle, out_state: *mut i32) -> MwResult
+    // BGM ボイスの状態(MwMusicState、mw_music_state と同じ判別子)。
+    // クロックの一部ではない——曲位置・世代カウンタは持たない(mw_bgm_get_position 相当は無い)
+mw_bgm_play(handle) -> MwResult      // Ready からのみ有効、既定ランプでフェードイン
+mw_bgm_stop(handle) -> MwResult      // 既定ランプでフェードアウトしてから Ready へ
+mw_bgm_set_loop(handle, begin_frames, end_frames) -> MwResult
+    // mw_music_set_loop と同じ規約(0,0 はループ解除、begin>=end は ErrInvalidLoopRegion)
+
 mw_get_output_latency_ns(handle, out_ns: *mut u64) -> MwResult
     // 出力レイテンシの実測値(ns)。0 は「まだ不明」(コールバック未実行)
 
@@ -138,6 +160,24 @@ music_bytes`)、同じ ID 空間を共有すると `mw_sound_release` が誤っ�
 `mw_music_set`/`mw_sound_release` はこのビットで自動的に正しいストレージへ
 振り分ける。ID は C# から見て不透明な整数(初期構築仕様『§4.8』)なので、この
 ビット演算による分離は呼び出し側に副作用を持たない。
+
+### BGM(`mw_bgm_*` / M4-3)との分担 —— 共有するもの・分けるもの
+
+初期構築仕様『§2』M14「BGM 用の2本目の楽曲ボイス」の実装。楽曲(`mw_music_*`)との
+分担は次のとおり:
+
+- **共有するもの**: 圧縮バイト列のストレージ・ID 空間(上記「楽曲 ID の空間分離」
+  そのまま——`mw_bgm_set` は `Instance::get_music_bytes` を呼ぶだけで、BGM 専用の
+  ストレージや ID フラグを新設していない)、ストリーミングデコードの仕組み一式
+  (`SymphoniaDecoder` / `decode_thread::spawn`)、状態機械(`mw_core::MusicVoice`
+  をそのまま転用。ループ・フェードの実装も共有)、Bgm バス(`mw_bus_set_volume`/
+  `mw_bus_fade` をそのまま使う。BGM 専用バスは追加しない)。
+- **分けるもの**: リングバッファとデコードスレッドは BGM 専用にもう1本立てる
+  (`handle.rs::Instance::bgm_decoder_tx` 等)。**クロックは発行しない**
+  (`mw_music_get_position` 相当の関数が無い。発行元は楽曲ボイスに固定、M14)ため、
+  代わりに軽量な `mw_core::BgmStatePublisher` で状態だけを公開する。サンプル精度の
+  予約再生・巻き戻し付き再開も BGM には無い(不要なため、対応する FFI 関数も
+  `mw_core::Command` のバリアントも意図的に持たせていない)。
 
 ## 不変条件
 

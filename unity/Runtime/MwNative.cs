@@ -585,6 +585,95 @@ namespace Mw.Native
             return SetMusicLoop(handle, 0, 0);
         }
 
+        // --- BGM(M4-3)---------------------------------------------------------
+        //
+        // 初期構築仕様『§2』M14: 楽曲ボイスは同時に1本のみという原則を守ったまま、
+        // BGM 用の2本目の楽曲ボイスを追加したもの。楽曲(上のセクション)との違い:
+        // <b>クロックを持たない</b>(<see cref="GetMusicPosition"/> 相当の関数が無い。
+        // 発行元は楽曲ボイスに固定)。ループ再生とフェードだけを扱う——サンプル精度の
+        // 予約再生・巻き戻し付き再開も無い。バス音量は楽曲と<b>同じ Bgm バス</b>を
+        // 共有する(<see cref="BusSetVolume"/>/<see cref="BusFade"/> に
+        // <see cref="Bus.Bgm"/> を渡せばよく、BGM 専用のバス操作 API は無い)。
+
+        /// <summary>
+        /// BGM のストリーミング再生を準備する(<see cref="SetMusic"/> の BGM 版)。
+        /// <para>
+        /// <paramref name="soundId"/> は <see cref="LoadSound"/> に
+        /// <see cref="SoundMode.Music"/> を渡して得た ID であること——楽曲・BGM は
+        /// 圧縮バイト列のストレージと ID 空間を共有する(SE の ID を渡すと
+        /// <see cref="MwResult.ErrInvalidSoundId"/>)。
+        /// </para>
+        /// <para>
+        /// <b>非ブロッキング。</b><see cref="GetBgmState"/> が <see cref="MusicState.Ready"/>
+        /// を返すまでポーリングしてから <see cref="PlayBgm"/> を呼ぶこと。
+        /// </para>
+        /// </summary>
+        public static MwResult SetBgm(ulong handle, ulong soundId)
+        {
+            Generated.MwResult native = NativeMethods.mw_bgm_set(handle, soundId);
+            return ToPublicResult(native);
+        }
+
+        /// <summary>
+        /// BGM ボイスの再生状態を取得する(<see cref="GetMusicState"/> の BGM 版)。
+        /// <see cref="SetBgm"/> の後、<see cref="MusicState.Ready"/> になるまでポーリングする。
+        /// <b>曲位置は取得できない</b>(BGM はクロックを持たない。初期構築仕様『§2』M14)。
+        /// </summary>
+        public static unsafe MwResult GetBgmState(ulong handle, out MusicState state)
+        {
+            int raw = 0;
+            Generated.MwResult native = NativeMethods.mw_bgm_state(handle, &raw);
+            state = (MusicState)raw;
+            return ToPublicResult(native);
+        }
+
+        /// <summary>
+        /// BGM を再生する。<see cref="MusicState.Ready"/> からのみ有効で、既定ランプで
+        /// フェードインする(初期構築仕様『§2』M14「フェード」)。
+        /// <para>
+        /// 楽曲ボイス(<see cref="MusicPlayScheduled"/>)と同時に再生してもよい——
+        /// 両者は同じ Bgm バスで単純に加算されるため、片方をフェードアウトしつつ
+        /// もう片方をフェードインする<b>画面遷移をまたぐクロスフェード</b>がこれだけで成立する。
+        /// </para>
+        /// </summary>
+        public static MwResult PlayBgm(ulong handle)
+        {
+            Generated.MwResult native = NativeMethods.mw_bgm_play(handle);
+            return ToPublicResult(native);
+        }
+
+        /// <summary>
+        /// BGM を停止する(<see cref="MusicStop"/> の BGM 版)。<see cref="MusicState.Playing"/>
+        /// 中は既定ランプでフェードアウトしてから位置を 0 に戻し <see cref="MusicState.Ready"/> へ。
+        /// </summary>
+        public static MwResult StopBgm(ulong handle)
+        {
+            Generated.MwResult native = NativeMethods.mw_bgm_stop(handle);
+            return ToPublicResult(native);
+        }
+
+        /// <summary>
+        /// BGM のループ区間を設定する(<see cref="SetMusicLoop"/> の BGM 版)。
+        /// <para>
+        /// トラック全体をループさせたい場合は、呼び出し側が把握している総フレーム数を使って
+        /// <c>(0, totalFrames)</c> を渡すこと——ネイティブ側は総フレーム数を問い合わせる
+        /// API を持たない(素材メタデータ等から呼び出し側が把握している前提。
+        /// <see cref="SetMusicLoop"/> と同じ設計)。
+        /// </para>
+        /// <para>解除は <see cref="ClearBgmLoop"/> を使うこと。</para>
+        /// </summary>
+        public static MwResult SetBgmLoop(ulong handle, ulong beginFrames, ulong endFrames)
+        {
+            Generated.MwResult native = NativeMethods.mw_bgm_set_loop(handle, beginFrames, endFrames);
+            return ToPublicResult(native);
+        }
+
+        /// <summary>BGM のループ区間を解除する(<see cref="ClearMusicLoop"/> の BGM 版)。</summary>
+        public static MwResult ClearBgmLoop(ulong handle)
+        {
+            return SetBgmLoop(handle, 0, 0);
+        }
+
         /// <summary>
         /// 音楽クロックのスナップショットを取得する(初期構築仕様『§4.4 音楽クロック』)。
         /// <b>毎フレーム呼ぶ想定の関数で、GC アロケーションは発生しない</b>

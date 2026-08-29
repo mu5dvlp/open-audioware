@@ -46,8 +46,8 @@ impl Renderer {
     /// 確定させてよい(音声コールバックが動き出す前に呼ぶこと)。
     ///
     /// 戻り値は `(Renderer, コマンド送信, Arc 回収, 楽曲PCM供給の生産側, 音楽クロックの読み手,
-    /// イベントキューの読み書きハンドル)`。後ろ3つは `mixer::build` のドキュメント参照
-    /// (M2-5, M2-6)。
+    /// イベントキューの読み書きハンドル, BGM 専用ハンドル一式)`。後ろ4つは `mixer::build` の
+    /// ドキュメント参照(M2-5, M2-6, M4-3)。
     pub fn build(
         config: Config,
         sample_rate: u32,
@@ -58,8 +58,9 @@ impl Renderer {
         MusicStreamProducer,
         Arc<MusicClockPublisher>,
         Arc<EventQueue>,
+        mixer::BgmHandles,
     ) {
-        let (mixer, sender, reclaim, music_producer, music_clock, events) =
+        let (mixer, sender, reclaim, music_producer, music_clock, events, bgm) =
             mixer::build(config, sample_rate);
         (
             Renderer {
@@ -71,6 +72,7 @@ impl Renderer {
             music_producer,
             music_clock,
             events,
+            bgm,
         )
     }
 
@@ -122,6 +124,11 @@ impl Renderer {
         self.mixer.music_state()
     }
 
+    /// 現在の BGM ボイスの状態(初期構築仕様『§2』M14, M4-3)。
+    pub fn bgm_state(&self) -> MusicState {
+        self.mixer.bgm_state()
+    }
+
     /// 直近の楽曲予約再生が、到来時点でプリロール未完了だったために繰り下げられたか
     /// (初期構築仕様『§4.3』【仮】)。発火すると `false` に戻る。
     pub fn music_schedule_deferred(&self) -> bool {
@@ -139,7 +146,7 @@ mod tests {
     use super::*;
 
     fn renderer_for_test() -> Renderer {
-        let (renderer, _sender, _reclaim, _music_producer, _music_clock, _events) =
+        let (renderer, _sender, _reclaim, _music_producer, _music_clock, _events, _bgm) =
             Renderer::build(Config::default(), 48_000);
         renderer
     }
@@ -191,7 +198,7 @@ mod tests {
         // `Renderer::build` が返す `Arc<MusicClockPublisher>` は、
         // `Renderer::render`(音声コールバック役)が書き込んだ内容を
         // ゲームスレッド役から直接読める必要がある(M2-5 の核心)。
-        let (mut renderer, _sender, _reclaim, _music_producer, music_clock, _events) =
+        let (mut renderer, _sender, _reclaim, _music_producer, music_clock, _events, _bgm) =
             Renderer::build(Config::default(), 1_000);
 
         let mut buffer = vec![0.0_f32; 10 * CHANNELS];

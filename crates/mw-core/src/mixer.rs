@@ -11,7 +11,7 @@ use rtrb::{Consumer, Producer, PushError, RingBuffer};
 
 use crate::bus::{ALL_BUSES, BUS_COUNT, BusId, BusSet};
 use crate::clipper::SoftClipper;
-use crate::clock::MusicClockPublisher;
+use crate::clock::{BgmStatePublisher, MusicClockPublisher};
 use crate::command::{Command, ScheduledSe};
 use crate::config::Config;
 use crate::event::{Event, EventQueue};
@@ -155,6 +155,32 @@ impl MusicSchedule {
     }
 }
 
+/// BGM ボイス(`Mixer::bgm_voice`)の生 PCM を1コールバックぶんまとめて保持せず、
+/// 固定長のスタックチャンク単位でレンダリングするためのフレーム数(【仮】)。
+///
+/// `output`(音声コールバックのバッファ)は既に `music_voice` の生 PCM 保持に
+/// 使っているため、BGM 用に二重利用できない。かといって §5.3 によりヒープ確保も
+/// できないため、`Vec` ではなくコンパイル時サイズ固定のスタック配列
+/// (`[f32; BGM_CHUNK_FRAMES * CHANNELS]`)へチャンク単位で読み直す設計にした
+/// (`Mixer::render` のこの定数を使っている箇所のコメント参照)。値を大きくすると
+/// `bgm_voice.render` ひいては `MusicFrameSource::read` の呼び出し回数が減る一方、
+/// スタック消費量が増える(256フレーム×2ch×4byte = 2KiB)。実測で見直してよい。
+const BGM_CHUNK_FRAMES: usize = 256;
+
+/// [`mixer::build`] が返す、BGM(初期構築仕様『§2』M14, M4-3)専用のゲームスレッド側
+/// ハンドル一式。既存の6要素タプルにこれ以上要素を増やすと可読性が落ちるため、
+/// BGM ぶんだけ1つの構造体にまとめてある。
+pub struct BgmHandles {
+    /// BGM PCM の供給元(生産側)。実体はデコードスレッド(mw-ffi 側、楽曲用とは
+    /// 別にもう1本立てる想定)から `pump` されるリングバッファの生産側(`stream.rs`)。
+    pub stream_producer: MusicStreamProducer,
+    /// BGM ボイスの状態(初期構築仕様『§4.3』の4状態)をロック無しで読むハンドル。
+    /// **クロックではない**——BGM は曲位置・ホスト時刻の相関点を持たない(M14)ため、
+    /// `MusicClockPublisher` ではなく状態1本だけを公開する `BgmStatePublisher`
+    /// (`clock.rs`)を使う。
+    pub state: Arc<BgmStatePublisher>,
+}
+
 /// mw-core の最上位ミキサ。音声コールバックから駆動される(単一スレッド専用の
 /// 排他所有物として `mw-backend` のストリームクロージャへムーブされる想定)。
 pub struct Mixer {
@@ -171,6 +197,20 @@ pub struct Mixer {
     /// リングバッファの消費側(`stream.rs`)。
     music_source: StreamingMusicSource,
     music_schedule: MusicSchedule,
+    /// BGM 用の2本目の楽曲ボイス(初期構築仕様『§2』M14, M4-3)。`music_voice` と
+    /// **同じ `MusicVoice` 型をそのまま転用する**——状態機械・フェード・ループの
+    /// 実装をまるごと共有できるうえ、「クロックを持たない」という M14 の要件は
+    /// `MusicVoice` 自身の責務ではなく、その位置を `music_clock`(下記)へ**公開しない**
+    /// という `Mixer::render` 側の配線だけで満たせる(型を分ける理由が無い)。
+    bgm_voice: MusicVoice,
+    /// BGM PCM の供給元。`music_source` と対になる、独立したストリーミングチャネル
+    /// (`stream::channel` をもう一度呼んで作る。`music_source` とリングバッファも
+    /// デコードスレッドも完全に別)。
+    bgm_source: StreamingMusicSource,
+    /// BGM ボイスの状態をゲームスレッドへ公開するハンドル(`BgmHandles::state` と
+    /// 同じ `Arc` を共有する)。`music_clock`(音楽クロック)とは別物——BGM は
+    /// クロックを持たないため、公開するのは状態1本だけ。
+    bgm_state: Arc<BgmStatePublisher>,
     /// 予約 SE(初期構築仕様『§4.5』)のソート済みキュー。固定容量
     /// (`Config::schedule_queue_capacity`)。
     se_schedule: ScheduleQueue<ScheduledSe>,
@@ -219,13 +259,18 @@ pub fn build(
     MusicStreamProducer,
     Arc<MusicClockPublisher>,
     Arc<EventQueue>,
+    BgmHandles,
 ) {
     let (command_producer, command_consumer) =
         RingBuffer::<Command>::new(config.command_queue_capacity);
     let (reclaim_producer, reclaim_consumer) =
         RingBuffer::<Arc<SoundData>>::new(config.reclaim_queue_capacity);
     let (music_producer, music_source) = stream::channel(config, sample_rate);
+    // BGM(初期構築仕様『§2』M14, M4-3)専用の独立したストリーミングチャネル。
+    // `music_source`/`music_producer` とはリングバッファもデコード進行も完全に別。
+    let (bgm_producer, bgm_source) = stream::channel(config, sample_rate);
     let music_clock = Arc::new(MusicClockPublisher::new());
+    let bgm_state = Arc::new(BgmStatePublisher::new());
     let events = Arc::new(EventQueue::new(config.event_queue_capacity));
 
     let mixer = Mixer {
@@ -241,6 +286,9 @@ pub fn build(
         music_voice: MusicVoice::new(sample_rate),
         music_source,
         music_schedule: MusicSchedule::default(),
+        bgm_voice: MusicVoice::new(sample_rate),
+        bgm_source,
+        bgm_state: Arc::clone(&bgm_state),
         se_schedule: ScheduleQueue::with_capacity(config.schedule_queue_capacity),
         se_schedule_overflow_count: AtomicU64::new(0),
         music_clock: Arc::clone(&music_clock),
@@ -254,7 +302,19 @@ pub fn build(
     let receiver = ReclaimReceiver {
         consumer: reclaim_consumer,
     };
-    (mixer, sender, receiver, music_producer, music_clock, events)
+    let bgm_handles = BgmHandles {
+        stream_producer: bgm_producer,
+        state: bgm_state,
+    };
+    (
+        mixer,
+        sender,
+        receiver,
+        music_producer,
+        music_clock,
+        events,
+        bgm_handles,
+    )
 }
 
 impl Mixer {
@@ -357,6 +417,21 @@ impl Mixer {
             }
             Command::MusicSetLoop { region } => {
                 self.music_voice.set_loop(region);
+            }
+            Command::BgmPrepare => {
+                self.bgm_voice.prepare();
+            }
+            Command::BgmSeek { frames } => {
+                self.bgm_voice.seek(frames, &mut self.bgm_source);
+            }
+            Command::BgmPlay => {
+                self.bgm_voice.play();
+            }
+            Command::BgmStop => {
+                self.bgm_voice.stop();
+            }
+            Command::BgmSetLoop { region } => {
+                self.bgm_voice.set_loop(region);
             }
         }
     }
@@ -491,6 +566,14 @@ impl Mixer {
         // 数を持たないマーカーイベントなので、これで十分)。
         let clipper_engaged_before_frame_loop = self.clipper.engaged_count();
 
+        // --- BGM ボイス(初期構築仕様『§2』M14, M4-3) ---
+        // `music_voice` と違ってサンプル精度の予約発火(§4.5)を持たないため、
+        // ここでは分割レンダリングは不要。`output` は既に楽曲の生 PCM 保持に
+        // 使っているため二重利用できず、かつヒープ確保もできない(§5.3)ので、
+        // 固定長のスタックチャンク(`BGM_CHUNK_FRAMES` フレームぶん)へ読み直しながら
+        // 下の周波数ループの中で都度リフィルする([`BGM_CHUNK_FRAMES`] のドキュメント参照)。
+        let mut bgm_chunk = [0.0f32; BGM_CHUNK_FRAMES * CHANNELS];
+
         // --- SE ボイス + 楽曲の合成 ---
         for frame_index in 0..frames {
             self.fire_due_se(
@@ -499,6 +582,18 @@ impl Mixer {
                 buffer_end_ns,
                 default_ramp,
             );
+
+            // BGM チャンクの先頭フレームに来たら、次のチャンクぶんをレンダリングし直す。
+            // `MusicVoice::render` は渡したスライスを毎回まるごと埋める(先頭で無音
+            // 初期化してから書く実装、`music.rs` 参照)ため、末尾が
+            // `BGM_CHUNK_FRAMES` に満たない最終チャンクでも古いチャンクの残骸が
+            // 残る心配は無い。
+            if frame_index % BGM_CHUNK_FRAMES == 0 {
+                let this_chunk_frames = (frames - frame_index).min(BGM_CHUNK_FRAMES);
+                if let Some(bgm_slice) = bgm_chunk.get_mut(..this_chunk_frames * CHANNELS) {
+                    self.bgm_voice.render(bgm_slice, &mut self.bgm_source);
+                }
+            }
 
             let mut bus_volume = [0.0f32; BUS_COUNT];
             for id in ALL_BUSES {
@@ -510,12 +605,22 @@ impl Mixer {
             let base = frame_index * CHANNELS;
             // 2で書き込んだ楽曲の生 PCM をここで読み直し、Bgm バス音量を適用してから
             // SE 分に加算する(この読み出しの直後に同じ位置へ最終値を上書きする)。
+            // BGM ボイスも**同じ Bgm バス**を共有する(初期構築仕様『§2』M14 の
+            // 「同じバスを2人が触る」を意図的な設計として受け入れた結果——楽曲〔ライブ中〕と
+            // BGM〔メタ画面〕は同時に鳴らない運用が前提だが、画面遷移をまたぐクロス
+            // フェード〔片方をフェードアウトしつつもう片方をフェードインする〕は
+            // 各ボイス自身のゲイン〔`MusicVoice::gain`〕が独立しているため、この
+            // 素朴な加算だけで自然に成立する)。
             let bgm_gain = bus_volume[BusId::Bgm.index()];
             let raw_music_l = output.get(base).copied().unwrap_or(0.0);
             let raw_music_r = output.get(base + 1).copied().unwrap_or(0.0);
+            let chunk_local = frame_index % BGM_CHUNK_FRAMES;
+            let bgm_base = chunk_local * CHANNELS;
+            let raw_bgm_l = bgm_chunk.get(bgm_base).copied().unwrap_or(0.0);
+            let raw_bgm_r = bgm_chunk.get(bgm_base + 1).copied().unwrap_or(0.0);
 
-            let mut l = se_l + raw_music_l * bgm_gain;
-            let mut r = se_r + raw_music_r * bgm_gain;
+            let mut l = se_l + (raw_music_l + raw_bgm_l) * bgm_gain;
+            let mut r = se_r + (raw_music_r + raw_bgm_r) * bgm_gain;
 
             let master_volume = bus_volume[BusId::Master.index()];
             l *= master_volume;
@@ -552,6 +657,11 @@ impl Mixer {
             self.sample_rate,
             self.music_voice.state(),
         );
+
+        // --- BGM ボイスの状態を公開(初期構築仕様『§2』M14, M4-3) ---
+        // クロックではなく状態1本だけ(`BgmStatePublisher`)。曲位置・世代カウンタは
+        // 発行しない——BGM はそもそもそれらを持たない設計(M14)。
+        self.bgm_state.write(self.bgm_voice.state());
     }
 
     /// アンダーランの集約(初期構築仕様『§4.6』)。
@@ -595,6 +705,17 @@ impl Mixer {
         self.music_voice.state()
     }
 
+    /// 現在の BGM ボイスの状態(初期構築仕様『§2』M14, M4-3)。
+    pub fn bgm_state(&self) -> MusicState {
+        self.bgm_voice.state()
+    }
+
+    /// 現在の BGM ボイスのループ区間(テスト・診断用)。
+    #[cfg(test)]
+    fn bgm_loop_region(&self) -> Option<(u64, u64)> {
+        self.bgm_voice.loop_region()
+    }
+
     /// 直近の楽曲予約再生が、到来時点でプリロール未完了だったために繰り下げられたか
     /// (初期構築仕様『§4.3』【仮】)。発火すると `false` に戻る。
     pub fn music_schedule_deferred(&self) -> bool {
@@ -622,6 +743,7 @@ impl Mixer {
     pub fn set_sample_rate(&mut self, sample_rate: u32) {
         self.sample_rate = sample_rate;
         self.music_voice.set_sample_rate(sample_rate);
+        self.bgm_voice.set_sample_rate(sample_rate);
     }
 
     /// テスト・診断用。
@@ -645,7 +767,7 @@ mod tests {
 
     #[test]
     fn silence_by_default() {
-        let (mut mixer, _sender, _reclaim, _music_producer, _music_clock, _events) =
+        let (mut mixer, _sender, _reclaim, _music_producer, _music_clock, _events, _bgm) =
             build(Config::default(), 48_000);
         let mut buf = vec![1.0; 32 * CHANNELS];
         mixer.render(&mut buf, 0);
@@ -654,7 +776,7 @@ mod tests {
 
     #[test]
     fn play_command_produces_sound_on_the_very_next_render_call() {
-        let (mut mixer, sender, _reclaim, _music_producer, _music_clock, _events) =
+        let (mut mixer, sender, _reclaim, _music_producer, _music_clock, _events, _bgm) =
             build(Config::default(), 48_000);
         assert!(sender.send(Command::PlaySe {
             voice_serial: 1,
@@ -673,7 +795,7 @@ mod tests {
 
     #[test]
     fn bus_volume_scales_voice_output_exactly() {
-        let (mut mixer, sender, _reclaim, _music_producer, _music_clock, _events) =
+        let (mut mixer, sender, _reclaim, _music_producer, _music_clock, _events, _bgm) =
             build(Config::default(), 48_000);
         sender.send(Command::PlaySe {
             voice_serial: 1,
@@ -697,7 +819,7 @@ mod tests {
 
     #[test]
     fn master_bus_applies_once_not_double_counted_for_direct_master_voices() {
-        let (mut mixer, sender, _reclaim, _music_producer, _music_clock, _events) =
+        let (mut mixer, sender, _reclaim, _music_producer, _music_clock, _events, _bgm) =
             build(Config::default(), 48_000);
         sender.send(Command::PlaySe {
             voice_serial: 1,
@@ -724,7 +846,7 @@ mod tests {
             steal_tail_capacity: 1,
             ..Config::default()
         };
-        let (mut mixer, sender, mut reclaim, _music_producer, _music_clock, _events) =
+        let (mut mixer, sender, mut reclaim, _music_producer, _music_clock, _events, _bgm) =
             build(config, 48_000);
 
         sender.send(Command::PlaySe {
@@ -758,7 +880,7 @@ mod tests {
 
     #[test]
     fn soft_clipper_engages_when_voices_sum_above_threshold() {
-        let (mut mixer, sender, _reclaim, _music_producer, _music_clock, _events) =
+        let (mut mixer, sender, _reclaim, _music_producer, _music_clock, _events, _bgm) =
             build(Config::default(), 48_000);
         for i in 0..4u64 {
             sender.send(Command::PlaySe {
@@ -872,7 +994,7 @@ mod tests {
 
     #[test]
     fn se_schedule_fires_at_exact_sample_offset_within_buffer() {
-        let (mut mixer, sender, _reclaim, _music_producer, _music_clock, _events) =
+        let (mut mixer, sender, _reclaim, _music_producer, _music_clock, _events, _bgm) =
             build(Config::default(), TEST_SAMPLE_RATE);
         let offset = 7u64;
         assert!(sender.send(Command::SeSchedule {
@@ -898,7 +1020,7 @@ mod tests {
     fn se_schedule_offset_boundary_values() {
         // 境界値1: バッファ先頭ちょうど。
         {
-            let (mut mixer, sender, _reclaim, _mp, _mc, _events) =
+            let (mut mixer, sender, _reclaim, _mp, _mc, _events, _bgm) =
                 build(Config::default(), TEST_SAMPLE_RATE);
             sender.send(Command::SeSchedule {
                 host_time_ns: 0,
@@ -914,7 +1036,7 @@ mod tests {
 
         // 境界値2: バッファ末尾ちょうど(最後のフレームだけ発音)。
         {
-            let (mut mixer, sender, _reclaim, _mp, _mc, _events) =
+            let (mut mixer, sender, _reclaim, _mp, _mc, _events, _bgm) =
                 build(Config::default(), TEST_SAMPLE_RATE);
             let frames = 8usize;
             sender.send(Command::SeSchedule {
@@ -936,7 +1058,7 @@ mod tests {
         // 境界値3: バッファをまたぐ(1バッファ目では発音せず、2バッファ目の正しい
         // オフセットで発音する)。
         {
-            let (mut mixer, sender, _reclaim, _mp, _mc, _events) =
+            let (mut mixer, sender, _reclaim, _mp, _mc, _events, _bgm) =
                 build(Config::default(), TEST_SAMPLE_RATE);
             let frames = 8usize;
             let buffer1_duration_ns = frames as u64 * NS_PER_SAMPLE;
@@ -968,7 +1090,7 @@ mod tests {
     fn se_schedule_offset_advances_by_exactly_one_sample_per_sample_shift() {
         let frames = 40usize;
         for n in 0..frames as u64 {
-            let (mut mixer, sender, _reclaim, _mp, _mc, _events) =
+            let (mut mixer, sender, _reclaim, _mp, _mc, _events, _bgm) =
                 build(Config::default(), TEST_SAMPLE_RATE);
             sender.send(Command::SeSchedule {
                 host_time_ns: n * NS_PER_SAMPLE,
@@ -991,7 +1113,7 @@ mod tests {
     /// 丸め方針と同じ判断: 「指定時刻以降で最短距離」を優先し、取りこぼさない)。
     #[test]
     fn se_schedule_in_the_past_fires_immediately_at_offset_zero() {
-        let (mut mixer, sender, _reclaim, _mp, _mc, _events) =
+        let (mut mixer, sender, _reclaim, _mp, _mc, _events, _bgm) =
             build(Config::default(), TEST_SAMPLE_RATE);
         // バッファ先頭(10ms 地点)よりずっと前を予約時刻に指定する。
         sender.send(Command::SeSchedule {
@@ -1012,7 +1134,8 @@ mod tests {
             schedule_queue_capacity: 2,
             ..Config::default()
         };
-        let (mut mixer, sender, _reclaim, _mp, _mc, _events) = build(config, TEST_SAMPLE_RATE);
+        let (mut mixer, sender, _reclaim, _mp, _mc, _events, _bgm) =
+            build(config, TEST_SAMPLE_RATE);
 
         for i in 0..2u64 {
             assert!(sender.send(Command::SeSchedule {
@@ -1045,7 +1168,7 @@ mod tests {
     /// 依頼書のテスト要件1: 予約した SE を発火前に `StopVoice` すると鳴らない。
     #[test]
     fn stop_voice_cancels_an_unfired_scheduled_se() {
-        let (mut mixer, sender, _reclaim, _mp, _mc, _events) =
+        let (mut mixer, sender, _reclaim, _mp, _mc, _events, _bgm) =
             build(Config::default(), TEST_SAMPLE_RATE);
         assert!(sender.send(Command::SeSchedule {
             host_time_ns: 5 * NS_PER_SAMPLE,
@@ -1070,7 +1193,7 @@ mod tests {
     /// 依頼書のテスト要件2: 別の voice の予約は巻き添えで消えない。
     #[test]
     fn stop_voice_does_not_cancel_a_different_voices_unfired_schedule() {
-        let (mut mixer, sender, _reclaim, _mp, _mc, _events) =
+        let (mut mixer, sender, _reclaim, _mp, _mc, _events, _bgm) =
             build(Config::default(), TEST_SAMPLE_RATE);
         assert!(sender.send(Command::SeSchedule {
             host_time_ns: 5 * NS_PER_SAMPLE,
@@ -1097,7 +1220,7 @@ mod tests {
     /// 既存経路を壊していないことの直接確認)。
     #[test]
     fn stop_voice_on_an_already_fired_voice_still_stops_it_via_the_ramp() {
-        let (mut mixer, sender, _reclaim, _mp, _mc, _events) =
+        let (mut mixer, sender, _reclaim, _mp, _mc, _events, _bgm) =
             build(Config::default(), TEST_SAMPLE_RATE);
         // 過去時刻を予約 → 最初の render の先頭フレームで即座に発火して `voices` へ移る。
         assert!(sender.send(Command::SeSchedule {
@@ -1126,7 +1249,7 @@ mod tests {
     /// (`mw_sound_release` が解放済み音源を後から鳴らしてしまう退行の修正)。
     #[test]
     fn stop_voices_using_sound_cancels_unfired_schedules_referencing_that_sound() {
-        let (mut mixer, sender, _reclaim, _mp, _mc, _events) =
+        let (mut mixer, sender, _reclaim, _mp, _mc, _events, _bgm) =
             build(Config::default(), TEST_SAMPLE_RATE);
         let released_sound_id = 100u64;
         let other_sound_id = 200u64;
@@ -1170,7 +1293,7 @@ mod tests {
     /// 正しい順序・正しいオフセットで発火する)。
     #[test]
     fn removal_preserves_ascending_order_so_remaining_schedules_still_fire_correctly() {
-        let (mut mixer, sender, _reclaim, _mp, _mc, _events) =
+        let (mut mixer, sender, _reclaim, _mp, _mc, _events, _bgm) =
             build(Config::default(), TEST_SAMPLE_RATE);
         // 1フレームだけ鳴る短い音にして、後続フレームへ音が持ち越されないようにする
         // (`se_entry` の既定 1000 フレームだと発火後ずっと鳴り続けてしまい、
@@ -1224,7 +1347,7 @@ mod tests {
     /// ことを確認する(音声コールバック内での Arc ドロップ禁止、§5.3)。
     #[test]
     fn stop_voice_routes_the_cancelled_arc_through_the_reclaim_queue_not_an_inline_drop() {
-        let (mut mixer, sender, mut reclaim, _mp, _mc, _events) =
+        let (mut mixer, sender, mut reclaim, _mp, _mc, _events, _bgm) =
             build(Config::default(), TEST_SAMPLE_RATE);
         assert!(sender.send(Command::SeSchedule {
             host_time_ns: 5 * NS_PER_SAMPLE,
@@ -1249,7 +1372,7 @@ mod tests {
 
     #[test]
     fn music_play_scheduled_starts_exactly_at_sample_offset_with_fade_in() {
-        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events) =
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events, _bgm) =
             build(Config::default(), TEST_SAMPLE_RATE);
         make_music_ready(&mut mixer, &mut producer, 1.0);
 
@@ -1288,7 +1411,7 @@ mod tests {
 
     #[test]
     fn music_play_scheduled_before_preroll_completion_is_deferred_then_fires_once_ready() {
-        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events) =
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events, _bgm) =
             build(Config::default(), TEST_SAMPLE_RATE);
 
         // わざと pump しない: プリロール未完了(Loading)のまま予約時刻を到来させる。
@@ -1332,7 +1455,7 @@ mod tests {
 
     #[test]
     fn music_play_scheduled_in_the_past_when_already_ready_fires_immediately() {
-        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events) =
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events, _bgm) =
             build(Config::default(), TEST_SAMPLE_RATE);
         make_music_ready(&mut mixer, &mut producer, 1.0);
 
@@ -1354,7 +1477,7 @@ mod tests {
 
     #[test]
     fn render_publishes_music_clock_snapshot_after_every_call() {
-        let (mut mixer, sender, _reclaim, mut producer, music_clock, _events) =
+        let (mut mixer, sender, _reclaim, mut producer, music_clock, _events, _bgm) =
             build(Config::default(), TEST_SAMPLE_RATE);
         make_music_ready(&mut mixer, &mut producer, 1.0);
 
@@ -1393,7 +1516,7 @@ mod tests {
 
     #[test]
     fn render_bumps_generation_exactly_once_on_seek_discontinuity() {
-        let (mut mixer, sender, _reclaim, mut producer, music_clock, _events) =
+        let (mut mixer, sender, _reclaim, mut producer, music_clock, _events, _bgm) =
             build(Config::default(), TEST_SAMPLE_RATE);
         make_music_ready(&mut mixer, &mut producer, 1.0);
 
@@ -1439,7 +1562,7 @@ mod tests {
 
     #[test]
     fn music_ended_event_is_pushed_on_natural_end() {
-        let (mut mixer, sender, _reclaim, mut producer, _music_clock, events) =
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, events, _bgm) =
             build(Config::default(), TEST_SAMPLE_RATE);
 
         let mut decoder = FiniteDecoder {
@@ -1471,7 +1594,7 @@ mod tests {
 
     #[test]
     fn music_looped_event_is_pushed_with_the_restart_frame() {
-        let (mut mixer, sender, _reclaim, mut producer, _music_clock, events) =
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, events, _bgm) =
             build(Config::default(), TEST_SAMPLE_RATE);
         make_music_ready(&mut mixer, &mut producer, 1.0);
 
@@ -1510,7 +1633,7 @@ mod tests {
             underrun_report_threshold_frames: 10,
             ..Config::default()
         };
-        let (mut mixer, sender, _reclaim, mut producer, _music_clock, events) =
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, events, _bgm) =
             build(config, TEST_SAMPLE_RATE);
         make_music_ready(&mut mixer, &mut producer, 1.0);
         sender.send(Command::MusicPlayScheduled { host_time_ns: 0 });
@@ -1547,7 +1670,7 @@ mod tests {
 
     #[test]
     fn clipper_engaged_event_is_pushed_when_the_clipper_activates() {
-        let (mut mixer, sender, _reclaim, _mp, _mc, events) =
+        let (mut mixer, sender, _reclaim, _mp, _mc, events, _bgm) =
             build(Config::default(), TEST_SAMPLE_RATE);
         for i in 0..4u64 {
             sender.send(Command::PlaySe {
@@ -1587,7 +1710,7 @@ mod tests {
 
     #[test]
     fn music_pause_command_freezes_position_then_resume_at_command_restarts_from_given_frame() {
-        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events) =
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events, _bgm) =
             build(Config::default(), TEST_SAMPLE_RATE);
         make_music_ready(&mut mixer, &mut producer, 1.0);
 
@@ -1626,7 +1749,7 @@ mod tests {
 
     #[test]
     fn music_stop_command_returns_to_ready_and_resets_position_to_zero() {
-        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events) =
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events, _bgm) =
             build(Config::default(), TEST_SAMPLE_RATE);
         make_music_ready(&mut mixer, &mut producer, 1.0);
 
@@ -1651,7 +1774,7 @@ mod tests {
 
     #[test]
     fn music_set_loop_command_wraps_at_region_end_then_none_clears_it() {
-        let (mut mixer, sender, _reclaim, mut producer, _music_clock, events) =
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, events, _bgm) =
             build(Config::default(), TEST_SAMPLE_RATE);
         make_music_ready(&mut mixer, &mut producer, 1.0);
 
@@ -1687,7 +1810,7 @@ mod tests {
     /// Loading → Ready → Playing → Paused の4状態すべてを正しく反映すること。
     #[test]
     fn music_clock_snapshot_reflects_all_four_states_through_the_playback_lifecycle() {
-        let (mut mixer, sender, _reclaim, mut producer, music_clock, _events) =
+        let (mut mixer, sender, _reclaim, mut producer, music_clock, _events, _bgm) =
             build(Config::default(), TEST_SAMPLE_RATE);
 
         // Loading: まだ pump していない。
@@ -1734,7 +1857,7 @@ mod tests {
     /// (`render_bumps_generation_exactly_once_on_seek_discontinuity` の resume_at 版)。
     #[test]
     fn render_bumps_generation_on_resume_at_discontinuity() {
-        let (mut mixer, sender, _reclaim, mut producer, music_clock, _events) =
+        let (mut mixer, sender, _reclaim, mut producer, music_clock, _events, _bgm) =
             build(Config::default(), TEST_SAMPLE_RATE);
         make_music_ready(&mut mixer, &mut producer, 1.0);
 
@@ -1769,7 +1892,7 @@ mod tests {
 
     #[test]
     fn music_prepare_command_resets_to_loading_and_clears_loop_region_even_while_playing() {
-        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events) =
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events, _bgm) =
             build(Config::default(), TEST_SAMPLE_RATE);
         make_music_ready(&mut mixer, &mut producer, 1.0);
 
@@ -1822,7 +1945,7 @@ mod tests {
     /// 初期化しておき、直後の `MusicStop` を完全な no-op にしてこの事故を防ぐ。
     #[test]
     fn music_set_command_sequence_recovers_cleanly_from_a_song_still_playing() {
-        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events) =
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events, _bgm) =
             build(Config::default(), TEST_SAMPLE_RATE);
         make_music_ready(&mut mixer, &mut producer, 1.0);
 
@@ -1862,5 +1985,206 @@ mod tests {
             (last - 1.0).abs() < 1e-4,
             "must fade in to full volume, not stay stuck silent forever; got {last}"
         );
+    }
+
+    // =====================================================================
+    // M4-3: BGM(初期構築仕様『§2』M14「BGM 用の2本目の楽曲ボイス」)
+    // =====================================================================
+    //
+    // `bgm_voice` は `music_voice` と同じ `MusicVoice` 型を転用しているため、
+    // フェード・ループそのものの数値的な正しさ(ランプの傾き・境界値等)は
+    // `music.rs`/このファイル上部の楽曲テストで既に固定化済み。ここで確認したいのは
+    // **「BGM 専用の配線」**だけに絞ってある: BGM コマンドが `music_voice` ではなく
+    // `bgm_voice` を動かすこと、`BgmStatePublisher` へ正しく状態が公開されること、
+    // 音楽クロック(`music_clock`)に一切触れないこと、そして楽曲ボイスと同じ Bgm バスを
+    // 通って**両方が加算される**こと(初期構築仕様『§2』M14 が意図する
+    // 「画面遷移をまたぐクロスフェード」が成立するための前提)。
+
+    /// `build` 直後の `Mixer` へ、BGM ボイスが `Ready` になるまで PCM を供給する
+    /// (`make_music_ready` の BGM 版)。
+    fn make_bgm_ready(mixer: &mut Mixer, producer: &mut MusicStreamProducer, value: f32) {
+        let mut decoder = ConstantDecoder { cursor: 0, value };
+        producer.pump(&mut decoder).expect("pump must succeed");
+        let mut warmup = vec![0.0; 4 * CHANNELS];
+        mixer.render(&mut warmup, 0);
+        assert_eq!(mixer.bgm_state(), MusicState::Ready);
+    }
+
+    #[test]
+    fn bgm_ready_then_play_fades_in_and_is_scaled_by_the_bgm_bus() {
+        let (mut mixer, sender, _reclaim, _mp, _mc, _events, mut bgm) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+        make_bgm_ready(&mut mixer, &mut bgm.stream_producer, 1.0);
+        // `BgmStatePublisher` は `mixer.bgm_state()` と同じ値を公開しているはず
+        // (同じ音声スレッド書き込みを別経路〔ロック無しの Arc〕から読むだけ)。
+        assert_eq!(bgm.state.read(), MusicState::Ready);
+
+        // Bgm バスを 0.5 に設定してから再生する(バス音量が正しく適用されることも
+        // 一緒に確認する)。
+        sender.send(Command::SetBusVolume {
+            bus: BusId::Bgm,
+            volume: 0.5,
+        });
+        assert!(sender.send(Command::BgmPlay));
+
+        let ramp_len = ms_to_samples(Config::DEFAULT_RAMP_MS, TEST_SAMPLE_RATE) as usize;
+        let mut buf = vec![-1.0; (ramp_len + 20) * CHANNELS];
+        mixer.render(&mut buf, 0);
+
+        assert_eq!(mixer.bgm_state(), MusicState::Playing);
+        assert_eq!(bgm.state.read(), MusicState::Playing);
+        // ランプ収束後は「BGM のフェードイン(1.0)× Bgm バス(0.5)」= 0.5 に漸近する。
+        let settled = buf[(ramp_len + 19) * CHANNELS];
+        assert!(
+            (settled - 0.5).abs() < 1e-3,
+            "expected ~0.5 (full BGM gain x 0.5 bus volume), got {settled}"
+        );
+        // フェードインの最初のサンプルは無音より大きく、収束値未満(まだ途中)。
+        assert!(buf[0] > 0.0 && buf[0] < settled);
+    }
+
+    #[test]
+    fn bgm_stop_fades_out_then_returns_to_ready_and_resets_position() {
+        let (mut mixer, sender, _reclaim, _mp, _mc, _events, mut bgm) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+        make_bgm_ready(&mut mixer, &mut bgm.stream_producer, 1.0);
+        sender.send(Command::BgmPlay);
+
+        let mut warmup = vec![0.0; 50 * CHANNELS];
+        mixer.render(&mut warmup, 0);
+        assert_eq!(mixer.bgm_state(), MusicState::Playing);
+        assert!(mixer.bgm_voice.position_frames() > 0);
+
+        assert!(sender.send(Command::BgmStop));
+        let ramp_len = ms_to_samples(Config::DEFAULT_RAMP_MS, TEST_SAMPLE_RATE) as usize;
+        let mut settle = vec![0.0; (ramp_len + 10) * CHANNELS];
+        mixer.render(&mut settle, 0);
+
+        assert_eq!(mixer.bgm_state(), MusicState::Ready);
+        assert_eq!(mixer.bgm_voice.position_frames(), 0);
+        assert_eq!(bgm.state.read(), MusicState::Ready);
+    }
+
+    #[test]
+    fn bgm_and_music_voices_sum_together_on_the_shared_bgm_bus() {
+        // 初期構築仕様『§2』M14「画面遷移をまたぐクロスフェード」の前提: 楽曲ボイスと
+        // BGM ボイスは同じ Bgm バスを共有し、両方が鳴っていれば単純に加算される
+        // (「片方をフェードアウトしつつもう片方をフェードインする」がこの加算だけで
+        // 自然に成立する。`Mixer::render` のコメント参照)。
+        let (mut mixer, sender, _reclaim, mut producer, _mc, _events, mut bgm) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+        make_music_ready(&mut mixer, &mut producer, 0.3);
+        make_bgm_ready(&mut mixer, &mut bgm.stream_producer, 0.4);
+
+        sender.send(Command::MusicPlayScheduled { host_time_ns: 0 });
+        sender.send(Command::BgmPlay);
+
+        let ramp_len = ms_to_samples(Config::DEFAULT_RAMP_MS, TEST_SAMPLE_RATE) as usize;
+        let mut buf = vec![0.0; (ramp_len + 20) * CHANNELS];
+        mixer.render(&mut buf, 0);
+
+        assert_eq!(mixer.music_state(), MusicState::Playing);
+        assert_eq!(mixer.bgm_state(), MusicState::Playing);
+        // Bgm バスは既定値 1.0 のまま: 0.3(楽曲) + 0.4(BGM) = 0.7。
+        let settled = buf[(ramp_len + 19) * CHANNELS];
+        assert!(
+            (settled - 0.7).abs() < 1e-3,
+            "expected the two voices to sum to ~0.7 on the shared Bgm bus, got {settled}"
+        );
+    }
+
+    #[test]
+    fn bgm_commands_never_touch_the_music_clock_or_the_song_voice() {
+        let (mut mixer, sender, _reclaim, _mp, music_clock, _events, mut bgm) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+        make_bgm_ready(&mut mixer, &mut bgm.stream_producer, 1.0);
+
+        sender.send(Command::BgmPlay);
+        let mut buf = vec![0.0; 100 * CHANNELS];
+        mixer.render(&mut buf, 0);
+        sender.send(Command::BgmSetLoop {
+            region: Some((0, 40)),
+        });
+        sender.send(Command::BgmStop);
+        mixer.render(&mut buf, 100 * NS_PER_SAMPLE);
+
+        // 楽曲ボイスは一度も触っていないので `Loading` のまま。
+        assert_eq!(mixer.music_state(), MusicState::Loading);
+        // 音楽クロックの相関点・世代カウンタは BGM の再生・ループ・停止では一切動かない
+        // (発行元は楽曲ボイスに固定、初期構築仕様『§2』M14)。
+        let snapshot = music_clock.snapshot();
+        assert_eq!(snapshot.song_frames, 0);
+        assert_eq!(snapshot.generation, 0);
+        assert!(!snapshot.is_playing);
+    }
+
+    #[test]
+    fn bgm_prepare_and_seek_reset_the_bgm_voice_not_the_song_voice() {
+        // `mw_bgm_set` が実際に送る2コマンド(デコーダ差し替え → Prepare → Seek{0})の
+        // うちコマンド部分だけをここで再現する(`music_set_command_sequence_...` の
+        // BGM 版)。対象が `bgm_voice` に限られ、`music_voice` は無傷であることを見る。
+        let (mut mixer, sender, _reclaim, mut producer, _mc, _events, mut bgm) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+        make_music_ready(&mut mixer, &mut producer, 1.0);
+        make_bgm_ready(&mut mixer, &mut bgm.stream_producer, 1.0);
+        sender.send(Command::MusicPlayScheduled { host_time_ns: 0 });
+        sender.send(Command::BgmPlay);
+
+        let mut buf = vec![0.0; 50 * CHANNELS];
+        mixer.render(&mut buf, 0);
+        assert_eq!(mixer.music_state(), MusicState::Playing);
+        assert_eq!(mixer.bgm_state(), MusicState::Playing);
+
+        sender.send(Command::BgmPrepare);
+        sender.send(Command::BgmSeek { frames: 0 });
+        let mut after = vec![0.0; CHANNELS];
+        mixer.render(&mut after, 0);
+
+        assert_eq!(
+            mixer.bgm_state(),
+            MusicState::Loading,
+            "BgmPrepare must reset only the BGM voice"
+        );
+        assert_eq!(mixer.bgm_voice.position_frames(), 0);
+        assert_eq!(
+            mixer.music_state(),
+            MusicState::Playing,
+            "the song voice must be completely unaffected by BGM commands"
+        );
+    }
+
+    #[test]
+    fn bgm_loop_region_wraps_repeatedly_like_the_song_preview_loop() {
+        let (mut mixer, sender, _reclaim, _mp, _mc, _events, mut bgm) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+        make_bgm_ready(&mut mixer, &mut bgm.stream_producer, 1.0);
+        sender.send(Command::BgmPlay);
+        sender.send(Command::BgmSetLoop {
+            region: Some((0, 12)),
+        });
+        // コマンドは `render` の先頭(`drain_commands`)で消化されるまでキューに
+        // 留まる(初期構築仕様『§5.2』)。ループ区間を1回 render を通してから確認する。
+        let mut warmup = vec![0.0; CHANNELS];
+        mixer.render(&mut warmup, 0);
+        assert_eq!(mixer.bgm_loop_region(), Some((0, 12)));
+
+        let mut loop_events_seen = 0;
+        for _ in 0..20 {
+            let mut buf = vec![0.0; 4 * CHANNELS];
+            mixer.render(&mut buf, 0);
+            if mixer.bgm_voice.position_frames() < 12 {
+                loop_events_seen += 1;
+            }
+        }
+        assert!(
+            loop_events_seen > 0,
+            "the BGM voice must keep wrapping within its loop region"
+        );
+        assert!(mixer.bgm_voice.position_frames() < 12);
+
+        sender.send(Command::BgmSetLoop { region: None });
+        let mut after_clear = vec![0.0; 4 * CHANNELS];
+        mixer.render(&mut after_clear, 0);
+        assert_eq!(mixer.bgm_loop_region(), None);
     }
 }

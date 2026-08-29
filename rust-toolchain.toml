@@ -20,3 +20,15 @@
 [toolchain]
 channel = "1.98.0"
 components = ["rustfmt", "clippy"]
+# ⚠️ **ターゲットもここで宣言する。** channel を固定した直後、iOS/Android の std が
+# 新しいツールチェーンに入っておらず `can't find crate for core/std` で
+# make build-ios / build-android が落ちた(2026-08-29)。固定前の stable には
+# 追加済みだったターゲットが、バージョンを変えると引き継がれないため。
+# 宣言しておけば rustup がこのディレクトリでの実行時に自動で入れる。
+# 一覧は Makefile の setup ターゲット(rustup target add ...)と揃えること。
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-apple-ios",
+    "aarch64-linux-android",
+]

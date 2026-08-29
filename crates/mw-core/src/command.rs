@@ -120,4 +120,34 @@ pub enum Command {
     /// `MusicVoice::set_loop` 側でループ無しとして扱われる(リアルタイム安全性のため
     /// パニックしない)。
     MusicSetLoop { region: Option<(u64, u64)> },
+
+    // --- M4-3: BGM(初期構築仕様『§2』M14「BGM 用の2本目の楽曲ボイス」) -----------
+    //
+    // `mixer.rs::Mixer::bgm_voice` は `music_voice` と同じ `MusicVoice`(状態機械・
+    // フェード・ループ)を転用したもの——**クロックは発行しない**(発行元は
+    // `music_voice` に固定する、M14)。予約再生(サンプル精度)・巻き戻し付き再開は
+    // BGM には不要なため、対応するコマンドは意図的に持たない(初期構築仕様
+    // 『§2』M14「ループ再生とフェードだけを扱う」)。
+    /// 新しい BGM を準備する(`MusicPrepare` の BGM 版。`mw_bgm_set` に相当)。
+    ///
+    /// `bgm_voice.prepare()` が状態を `Loading` から仕切り直す(`MusicPrepare` の
+    /// ドキュメント参照——挙動は完全に同じで、対象のボイスが違うだけ)。
+    BgmPrepare,
+    /// BGM ボイスをシークする(`MusicSeek` の BGM 版)。
+    ///
+    /// BGM 自体はシークを公開 API として持たないが、`mw_bgm_set` が曲切り替え時に
+    /// リングバッファへ残った前トラックの PCM を掃除するため `frames: 0` で内部的に
+    /// 使う(`MusicSeek` のドキュメント「曲の切り替えで前曲の PCM が漏れる問題への
+    /// 対処」と同じ理由)。
+    BgmSeek { frames: u64 },
+    /// BGM を再生する(`mw_bgm_play` に相当)。`Ready` からのみ有効、既定ランプで
+    /// フェードインする(`MusicVoice::play` そのまま)。
+    BgmPlay,
+    /// BGM を停止する(`mw_bgm_stop` に相当)。`Playing` 中は既定ランプでフェード
+    /// アウトしてから位置を 0 に戻し `Ready` へ、`Paused` 中は即座に `Ready` へ
+    /// (`MusicVoice::stop` そのまま)。
+    BgmStop,
+    /// BGM のループ区間を設定・解除する(`mw_bgm_set_loop` に相当)。`None` は
+    /// ループ解除(`MusicSetLoop` と同じ規約)。
+    BgmSetLoop { region: Option<(u64, u64)> },
 }

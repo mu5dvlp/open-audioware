@@ -39,6 +39,13 @@ OS 非依存・デバイス非依存のコア。ミキサ、ボイス管理、�
   観測されないよう、必ず同じ seqlock 書き込み区間の中で `state` と一緒に計算する。
   残してある理由は `MusicClockSnapshot::is_playing` のコメント参照)。
   `mixer::build` が返す `Arc<MusicClockPublisher>` を経由してゲームスレッド側へ渡す(M2-5)。
+  `BgmStatePublisher`(M4-3): BGM ボイス(下記)の状態だけをロック無しで公開する、
+  `MusicClockPublisher` よりずっと軽い publisher。BGM は**クロックを持たない**
+  (初期構築仕様『§2』M14: 発行元は楽曲ボイスに固定)ため、公開すべき値は
+  `MusicState` 1個だけで済み、複数フィールドの整合を取る seqlock は不要——単一の
+  `AtomicU8`(`MusicState::to_u8`/`from_u8` を再利用)の Release ストア/Acquire
+  ロードだけで書き手・読み手の整合が保証できる(`RenderedFrameCounter` と同じ
+  「単一フィールドは単純な atomic で足りる」考え方)。
 - `schedule`: 予約発音(§4.5)のソート済みキュー `ScheduleQueue<T>` と、
   ホスト時刻→バッファ内オフセットの変換(`offset_within_buffer`。切り捨て、
   丸め方向の根拠はモジュール doc を参照)。SE 予約はここのキューに、楽曲の予約再生は
@@ -87,7 +94,8 @@ OS 非依存・デバイス非依存のコア。ミキサ、ボイス管理、�
 - `command`: `Command` — ゲームスレッド→音声スレッドのコマンド列挙
   (`PlaySe` / `StopVoice` / `SetVoiceVolume` / `StopVoicesUsingSound` /
   `SetBusVolume` / `BusFade` / `SeSchedule` / `MusicPlayScheduled` / `MusicPrepare` /
-  `MusicSeek` / `MusicPause` / `MusicResumeAt` / `MusicStop` / `MusicSetLoop`)。
+  `MusicSeek` / `MusicPause` / `MusicResumeAt` / `MusicStop` / `MusicSetLoop` /
+  `BgmPrepare` / `BgmSeek` / `BgmPlay` / `BgmStop` / `BgmSetLoop`)。
   `SeSchedule`〜`MusicSeek` は M2-5 追加(予約発音・楽曲予約再生・楽曲シーク)。
   楽曲制御4種(`MusicPause`/`MusicResumeAt`/`MusicStop`/`MusicSetLoop`)は M2-7 前半で
   追加——§4.3 の楽曲制御 API を mw-ffi へ公開する下ごしらえとして、`MusicVoice` 側に
@@ -103,11 +111,13 @@ OS 非依存・デバイス非依存のコア。ミキサ、ボイス管理、�
   (`command.rs::Command::MusicPrepare` のドキュメント、`mixer.rs` の
   `music_set_command_sequence_recovers_cleanly_from_a_song_still_playing` テスト参照)。
 - `mixer`: `Mixer::render(output, buffer_start_host_time_ns)` — 「コマンド消化 →
-  楽曲ボイスのレンダリング(予約発火があればサンプル精度で分割) → イベント通知 →
-  アクティブ SE ボイス合算 + 楽曲の Bgm バス適用 → Master → クリッパ → 音楽クロックの
-  相関点を公開」(§4.1/§4.4/§4.6)。`mixer::build(config, sample_rate)` が `Mixer` と
+  楽曲ボイスのレンダリング(予約発火があればサンプル精度で分割) → BGM ボイスの
+  レンダリング(M4-3, 下記) → イベント通知 → アクティブ SE ボイス合算 + 楽曲・BGM の
+  Bgm バス適用 → Master → クリッパ → 音楽クロックの相関点 + BGM 状態を公開」
+  (§4.1/§4.4/§4.6, M14)。`mixer::build(config, sample_rate)` が `Mixer` と
   ゲームスレッド側ハンドル一式(`CommandSender` / `ReclaimReceiver` /
-  `MusicStreamProducer` / `Arc<MusicClockPublisher>` / `Arc<EventQueue>`)を返す。
+  `MusicStreamProducer` / `Arc<MusicClockPublisher>` / `Arc<EventQueue>` /
+  `BgmHandles { stream_producer, state }`)を返す。
   `buffer_start_host_time_ns` はこのバッファの先頭フレームが実際に DAC から
   出力される(と予測される)ホスト単調時刻——`mw-backend` が cpal の
   `OutputCallbackInfo::timestamp().playback` から求めて渡す(M2-5)。
@@ -116,6 +126,23 @@ OS 非依存・デバイス非依存のコア。ミキサ、ボイス管理、�
   集約(コールバックをまたいで蓄積し、収まるか閾値到達で1件にまとめる)を行う理由は
   同メソッドのコメントを参照。クリッパ動作検知(`ClipperEngaged`)は開発ビルドのみ
   (`cfg!(debug_assertions)`)発火する。
+  **M4-3(BGM 用の2本目の楽曲ボイス、初期構築仕様『§2』M14)**: `bgm_voice`
+  フィールドは `music_voice` と**同じ `MusicVoice` 型を転用**したもの(状態機械・
+  フェード・ループの実装をまるごと共有できる)。「クロックを持たない」という M14 の
+  要件は `MusicVoice` 自身の責務ではなく、その位置を `music_clock`
+  (`MusicClockPublisher`)へ**公開しない**という `Mixer::render` 側の配線だけで
+  満たしている——BGM の状態は代わりに軽量な `BgmStatePublisher`(`clock.rs`)で
+  公開する。BGM PCM の供給元(`bgm_source: StreamingMusicSource`)は
+  `music_source` とは独立した、もう一組の `stream::channel` インスタンス
+  (リングバッファもデコード進行も完全に別)。予約再生・巻き戻し付き再開は BGM に
+  無い(不要なため対応コマンドを持たせていない)。`output` は既に楽曲の生 PCM
+  保持に使っているため BGM 用に二重利用できず、かつヒープ確保もできない(§5.3)ので、
+  固定長のスタック配列(`BGM_CHUNK_FRAMES = 256` フレームぶん、【仮】)へチャンク
+  単位で読み直しながら周波数ループの中で都度リフィルする設計にしてある
+  (`Mixer::render` の `BGM_CHUNK_FRAMES` ドキュメント参照)。楽曲・BGM の両ボイスは
+  **同じ Bgm バスを共有**する(新しい専用バスは追加しない)——両者が同時に鳴っても
+  単純に加算されるだけで壊れず、これにより「画面遷移をまたぐクロスフェード」が
+  各ボイス自身のフェード(独立したゲイン)だけで自然に成立する。
 - `renderer`: `Renderer` — `Mixer` を包み、レンダリング済みフレーム数を数える最上位型。
   `Renderer::build` が `mixer::build` を呼ぶ薄いラッパ(戻り値もそのまま中継する)。
 
@@ -173,6 +200,12 @@ M0 では `Arc<Renderer>` をゲームスレッドと音声スレッドで共有
 ボイス満杯からのスティール・停止・バスフェード・クリッパ動作・予約 SE の挿入と発火
 (`ScheduleQueue::try_insert`/`pop_front`、M2-5)を含むシナリオを200回コールバック相当分
 レンダリングしてもアロケーション/デアロケーションが0回であることを固定化している。
+M4-3 で BGM ボイスの再生 + ループ折り返しもこの同じシナリオへ加えた(BGM の
+チャンクレンダリング経路〔`BGM_CHUNK_FRAMES` 固定長スタック配列〕も対象に含める
+ため)——このテストファイルは `#[global_allocator]` のカウンタがプロセス全体の
+静的状態であるため、意図的に `#[test]` 関数を1本だけに保っている(並行実行される
+別テストとカウンタを取り合わないようにするため)。BGM 単独の新しい `#[test]` を
+足すのではなく、既存の1本のシナリオへ追記する形にしたのはこの制約のため。
 
 ## 依存
 

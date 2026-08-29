@@ -114,7 +114,7 @@ fn render_path_never_allocates_or_deallocates() {
         ..Config::default()
     };
     let max_voices = config.max_voices;
-    let (mut renderer, sender, mut reclaim, mut music_producer, _music_clock, events) =
+    let (mut renderer, sender, mut reclaim, mut music_producer, _music_clock, events, mut bgm) =
         Renderer::build(config, 48_000);
 
     let mut decoder = UnboundedMusicDecoder { cursor: 0 };
@@ -125,6 +125,22 @@ fn render_path_never_allocates_or_deallocates() {
     renderer.render(&mut warmup, 0); // Loading -> Ready(セットアップ、計測対象外)。
     assert_eq!(renderer.music_state(), MusicState::Ready);
     assert!(sender.send(Command::MusicPlayScheduled { host_time_ns: 0 }));
+
+    // M4-3: BGM ボイス(初期構築仕様『§2』M14)もこのシナリオへ含める。
+    // `music_producer` と全く同じ理由・同じ手法で「デコードスレッドが停止した」
+    // 状況(継続的なアンダーラン)を再現し、BGM 側のチャンクレンダリング経路
+    // (`mixer.rs::Mixer::render` の `BGM_CHUNK_FRAMES` 固定長スタック配列)も
+    // ゼロアロケーションであることを実際の render 呼び出しの中で検証する。
+    let mut bgm_decoder = UnboundedMusicDecoder { cursor: 0 };
+    bgm.stream_producer
+        .pump(&mut bgm_decoder)
+        .expect("pump must succeed");
+    renderer.render(&mut warmup, 0); // Loading -> Ready(セットアップ、計測対象外)。
+    assert_eq!(renderer.bgm_state(), MusicState::Ready);
+    assert!(sender.send(Command::BgmPlay));
+    assert!(sender.send(Command::BgmSetLoop {
+        region: Some((0, 4_000)),
+    }));
 
     // ボイスプールを満杯にし、さらに追加でスティールを誘発する(セットアップ段階。
     // ここでのアロケーションはトラッキング対象外)。

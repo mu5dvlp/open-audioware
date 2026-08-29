@@ -997,6 +997,216 @@ pub unsafe extern "C" fn mw_music_get_position(handle: u64, out: *mut MwMusicPos
     }
 }
 
+// --- M4-3: BGM のネイティブ化 --------------------------------------------------
+//
+// 初期構築仕様『§2』M14: 「楽曲ボイスは同時に1本のみ」の原則を守ったまま、BGM 用に
+// **2本目の楽曲ボイス**を追加する。楽曲ボイス(上の M2-7 ブロック)との分担:
+//
+// - **共有するもの**: 圧縮バイト列のストレージ・ID 空間(`mw_sound_load(mode =
+//   Music)` / `mw_sound_release` はそのまま流用できる——「デコード前の圧縮バイト列を
+//   保持する」という表現そのものへの分離であり、どちらのボイスで鳴らすかとは無関係)、
+//   ストリーミングデコードの仕組み一式(`SymphoniaDecoder` / `decode_thread::spawn`)、
+//   状態機械(`MusicVoice` をそのまま転用。ループ・フェードの実装も共有)。
+// - **分けるもの**: リングバッファとデコードスレッドは BGM 専用にもう1本立てる
+//   (`crate::handle::Instance::bgm_decoder_tx` 等)。**クロックは発行しない**
+//   (`mw_music_get_position` 相当は無い。発行元は楽曲ボイスに固定。M14)。
+//   サンプル精度の予約再生・巻き戻し付き再開も BGM には無い(不要なため、
+//   `mw_core::Command` に対応するコマンドを意図的に持たせていない)。
+//
+// バス音量は**楽曲と同じ Bgm バス**を共有する(`mw_bus_set_volume`/`mw_bus_fade` を
+// そのまま使う——新しい BGM 専用バスは追加しない。両者が同時に鳴ることは運用上
+// 想定していないが、鳴った場合も単純に加算されるだけで壊れない設計になっている。
+// `mw_core::mixer::Mixer::render` のコメント参照)。
+
+/// BGM のストリーミング再生を準備する(`mw_music_set` の BGM 版)。
+///
+/// `sound_id` は `mw_sound_load(mode = Music)` が返した ID であること(SE の ID を
+/// 渡すと `MwResult::ErrInvalidSoundId`)。楽曲(`mw_music_set`)と同じ理由・同じ順序
+/// (デコーダ差し替え → `BgmPrepare` → `BgmSeek{0}`)で、前トラックの PCM が
+/// リングバッファに残って曲頭へ漏れる問題に対処する(`mw_music_set` のドキュメント
+/// 「曲の切り替えで前曲の PCM が漏れる問題への対処」を参照。BGM 版でも同じ罠がある)。
+///
+/// **非ブロッキング。** プリロール完了を待たずに戻る。状態は [`mw_bgm_state`] が
+/// `Ready` を返すまでポーリングすること。
+#[unsafe(no_mangle)]
+pub extern "C" fn mw_bgm_set(handle: u64, sound_id: u64) -> MwResult {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        if !handle_registry::is_music_id(sound_id) {
+            return MwResult::ErrInvalidSoundId;
+        }
+
+        let result = handle_registry::with_instance(handle, |instance| {
+            let Some(bytes) = instance.get_music_bytes(sound_id) else {
+                return MwResult::ErrInvalidSoundId;
+            };
+            let output_sample_rate = instance.backend_sample_rate();
+
+            let decoder =
+                match mw_core::SymphoniaDecoder::open((*bytes).clone(), output_sample_rate) {
+                    Ok(decoder) => decoder,
+                    Err(err) => {
+                        mw_backend::mw_log!("[mw-ffi] mw_bgm_set: decode open failed: {err}");
+                        return match err {
+                            mw_core::DecodeError::InvalidSampleRate(_) => {
+                                MwResult::ErrUnsupportedSampleRate
+                            }
+                            mw_core::DecodeError::UnsupportedChannelCount(_) => {
+                                MwResult::ErrUnsupportedFormat
+                            }
+                            mw_core::DecodeError::Symphonia(_)
+                            | mw_core::DecodeError::NoAudioTrack
+                            | mw_core::DecodeError::Resample(_)
+                            | mw_core::DecodeError::ResetRequired => MwResult::ErrDecodeFailed,
+                        };
+                    }
+                };
+
+            // `mw_music_set` と同じ順序厳守(デコーダ差し替え → Prepare → Seek{0})。
+            // 理由はこの関数のドキュメント、および `mw_music_set` 実装内コメント参照。
+            if !instance.send_bgm_decoder(Box::new(decoder)) {
+                return MwResult::ErrCommandQueueFull;
+            }
+
+            let sent = instance.command_sender.send(mw_core::Command::BgmPrepare)
+                && instance
+                    .command_sender
+                    .send(mw_core::Command::BgmSeek { frames: 0 });
+            if sent {
+                MwResult::Ok
+            } else {
+                MwResult::ErrCommandQueueFull
+            }
+        });
+        result.unwrap_or(MwResult::ErrInvalidHandle)
+    }));
+
+    match outcome {
+        Ok(result) => result,
+        Err(_) => MwResult::ErrPanic,
+    }
+}
+
+/// BGM ボイスの再生状態を取得する(`mw_music_state` の BGM 版)。
+///
+/// `out_state` には [`crate::types::MwMusicState`] の判別子を書き込む(`mw_music_state`
+/// と同じ理由で素の `i32`。`crates/mw-ffi/CLAUDE.md`「enum を FFI 引数に直接使わない
+/// 理由」参照)。**クロックの一部ではない**——BGM は曲位置・世代カウンタを持たない
+/// (M14)ため、`mw_music_get_position` に相当する BGM 版の関数は無い。
+///
+/// # Safety
+/// `out_state` は書き込み可能な `i32` を指す有効なポインタであるか、null で
+/// なければならない(null は書き込みを行わず `MwResult::ErrNullPointer`)。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mw_bgm_state(handle: u64, out_state: *mut i32) -> MwResult {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        if out_state.is_null() {
+            return MwResult::ErrNullPointer;
+        }
+        let result = handle_registry::with_instance(handle, |instance| {
+            MwMusicState::from_core(instance.bgm_state()) as i32
+        });
+        match result {
+            Some(value) => {
+                // SAFETY: 上で null チェック済み。
+                unsafe {
+                    *out_state = value;
+                }
+                MwResult::Ok
+            }
+            None => MwResult::ErrInvalidHandle,
+        }
+    }));
+
+    match outcome {
+        Ok(result) => result,
+        Err(_) => MwResult::ErrPanic,
+    }
+}
+
+/// BGM を再生する(`Ready` からのみ有効、既定ランプでフェードインする。初期構築仕様
+/// 『§2』M14「フェード」)。`Ready` 以外からの呼び出しは音声スレッド側で無視される
+/// (クラッシュしない。`mw_core::MusicVoice::play` 参照)。
+#[unsafe(no_mangle)]
+pub extern "C" fn mw_bgm_play(handle: u64) -> MwResult {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        let result = handle_registry::with_instance(handle, |instance| {
+            let sent = instance.command_sender.send(mw_core::Command::BgmPlay);
+            if sent {
+                MwResult::Ok
+            } else {
+                MwResult::ErrCommandQueueFull
+            }
+        });
+        result.unwrap_or(MwResult::ErrInvalidHandle)
+    }));
+
+    match outcome {
+        Ok(result) => result,
+        Err(_) => MwResult::ErrPanic,
+    }
+}
+
+/// BGM を停止する(`mw_music_stop` の BGM 版)。`Playing` 中は既定ランプでフェード
+/// アウトしてから位置を 0 に戻し `Ready` へ、`Paused` 中は即座に `Ready` へ
+/// (`mw_core::MusicVoice::stop` 参照)。
+#[unsafe(no_mangle)]
+pub extern "C" fn mw_bgm_stop(handle: u64) -> MwResult {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        let result = handle_registry::with_instance(handle, |instance| {
+            let sent = instance.command_sender.send(mw_core::Command::BgmStop);
+            if sent {
+                MwResult::Ok
+            } else {
+                MwResult::ErrCommandQueueFull
+            }
+        });
+        result.unwrap_or(MwResult::ErrInvalidHandle)
+    }));
+
+    match outcome {
+        Ok(result) => result,
+        Err(_) => MwResult::ErrPanic,
+    }
+}
+
+/// BGM のループ区間を設定・解除する(`mw_music_set_loop` の BGM 版。初期構築仕様
+/// 『§2』M14「ループ再生」)。「BGM トラック全体をループさせたい」場合は、呼び出し側が
+/// 既に把握している総フレーム数を使って `(0, total_frames)` を渡すこと——
+/// `mw_music_set_loop` と同様、ネイティブ側は総フレーム数を問い合わせる API を
+/// 持たない(呼び出し側が素材メタデータ等から把握している前提。同じ設計判断)。
+///
+/// `begin_frames == 0 && end_frames == 0` はループ解除([`LOOP_CLEAR_SENTINEL`] と
+/// 同じ規約)。それ以外で `begin_frames >= end_frames` は `MwResult::ErrInvalidLoopRegion`。
+#[unsafe(no_mangle)]
+pub extern "C" fn mw_bgm_set_loop(handle: u64, begin_frames: u64, end_frames: u64) -> MwResult {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        let region = if (begin_frames, end_frames) == LOOP_CLEAR_SENTINEL {
+            None
+        } else if begin_frames >= end_frames {
+            return MwResult::ErrInvalidLoopRegion;
+        } else {
+            Some((begin_frames, end_frames))
+        };
+
+        let result = handle_registry::with_instance(handle, |instance| {
+            let sent = instance
+                .command_sender
+                .send(mw_core::Command::BgmSetLoop { region });
+            if sent {
+                MwResult::Ok
+            } else {
+                MwResult::ErrCommandQueueFull
+            }
+        });
+        result.unwrap_or(MwResult::ErrInvalidHandle)
+    }));
+
+    match outcome {
+        Ok(result) => result,
+        Err(_) => MwResult::ErrPanic,
+    }
+}
+
 /// 出力レイテンシ(ns)を取得する(初期構築仕様『§5.5』`mw_get_output_latency_ns`)。
 ///
 /// `Backend::output_latency_ns` の実測値をそのまま返す。**0 は「まだ不明」を
@@ -1295,6 +1505,7 @@ mod tests {
 
         run_event_poll_checks(handle);
         run_music_lifecycle(handle);
+        run_bgm_lifecycle(handle);
     }
 
     /// M2-7: 楽曲再生の一連の流れ(実ハンドル越し)。`run_se_lifecycle` と同じ理由
@@ -1434,6 +1645,99 @@ mod tests {
             "releasing a music id must not affect unrelated SE storage"
         );
         assert_eq!(mw_sound_release(handle, se_id), MwResult::Ok);
+    }
+
+    /// M4-3: BGM の一連の流れ(実ハンドル越し)。`run_music_lifecycle` と対称の
+    /// 構成にしてあるが、BGM には無いもの(サンプル精度の予約再生・巻き戻し付き
+    /// 再開・音楽クロックのスナップショット)は当然テストしない
+    /// (`ffi.rs` の「M4-3: BGM のネイティブ化」ブロック doc「共有するもの/分けるもの」参照)。
+    fn run_bgm_lifecycle(handle: u64) {
+        // 楽曲と同じロード経路(mode = Music)を共有していることをここでも確認する
+        // (ID 空間・ストレージが共有である以上、当然ロードも同じ関数で済む)。
+        let bgm_bytes = make_pcm16_wav(48_000, 2, &vec![9999i16; 400]);
+
+        let mut bgm_id: u64 = 0;
+        let load_result = unsafe {
+            mw_sound_load(
+                handle,
+                bgm_bytes.as_ptr(),
+                bgm_bytes.len(),
+                1, // MwSoundMode::Music
+                &mut bgm_id as *mut u64,
+            )
+        };
+        assert_eq!(load_result, MwResult::Ok);
+        assert_ne!(bgm_id, 0);
+        assert!(
+            handle_registry::is_music_id(bgm_id),
+            "BGM tracks share the Music-mode id space with the song voice"
+        );
+
+        // SE の ID は BGM API に渡せない(音楽 ID 空間の分離は BGM でも同じ)。
+        let se_bytes = make_pcm16_wav(48_000, 2, &[10, -10]);
+        let mut se_id: u64 = 0;
+        assert_eq!(
+            unsafe {
+                mw_sound_load(
+                    handle,
+                    se_bytes.as_ptr(),
+                    se_bytes.len(),
+                    0,
+                    &mut se_id as *mut u64,
+                )
+            },
+            MwResult::Ok
+        );
+        assert_eq!(
+            mw_bgm_set(handle, se_id),
+            MwResult::ErrInvalidSoundId,
+            "an SE id must not be usable as a BGM id"
+        );
+        assert_eq!(mw_sound_release(handle, se_id), MwResult::Ok);
+
+        // mw_bgm_set: 非ブロッキング。プリロール完了は待たない。
+        assert_eq!(mw_bgm_set(handle, bgm_id), MwResult::Ok);
+
+        let mut state = -1i32;
+        let became_ready = wait_until(
+            || {
+                let r = unsafe { mw_bgm_state(handle, &mut state as *mut i32) };
+                r == MwResult::Ok && state == MwMusicState::Ready as i32
+            },
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            became_ready,
+            "BGM must become Ready once preroll completes; last observed state={state}"
+        );
+
+        // ループ区間: 不正な区間は拒否、有効な区間→解除で通る(楽曲 API と同じ規約)。
+        assert_eq!(
+            mw_bgm_set_loop(handle, 5, 3),
+            MwResult::ErrInvalidLoopRegion
+        );
+        assert_eq!(
+            mw_bgm_set_loop(handle, 7, 7),
+            MwResult::ErrInvalidLoopRegion
+        );
+        assert_eq!(mw_bgm_set_loop(handle, 0, 200), MwResult::Ok);
+        assert_eq!(
+            mw_bgm_set_loop(handle, 0, 0),
+            MwResult::Ok,
+            "(0, 0) must be accepted as \"clear the loop\""
+        );
+
+        // 再生 → 停止(コマンドが素通りすることのみ確認。フェードの数値検証は
+        // mw-core 側のオフラインレンダリングテストで実施済み)。
+        assert_eq!(mw_bgm_play(handle), MwResult::Ok);
+        assert_eq!(mw_bgm_stop(handle), MwResult::Ok);
+
+        assert_eq!(mw_sound_release(handle, bgm_id), MwResult::Ok);
+        assert_eq!(
+            mw_sound_release(handle, bgm_id),
+            MwResult::ErrInvalidSoundId,
+            "double release of a BGM id must be rejected, not crash"
+        );
     }
 
     /// `f` が `true` を返すまで短い間隔でポーリングする(タイムアウト付き)。

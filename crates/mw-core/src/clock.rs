@@ -15,6 +15,51 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering, fe
 
 use crate::music::MusicState;
 
+/// BGM ボイス(初期構築仕様『§2』M14, M4-3)の状態だけをロック無しで公開する。
+///
+/// `music_clock.rs::MusicClockPublisher` が seqlock を使うのは「複数フィールドの
+/// 整合を取る」必要があるからだが、BGM は**クロックを持たない**(発行元は楽曲ボイス
+/// 〔M2〕に固定。初期構築仕様『§2』M14)ため、公開すべき値はこの1フィールドだけで
+/// 済む。単一の `AtomicU8` の load/store だけで書き手・読み手の整合が保証できるため、
+/// seqlock は不要(`RenderedFrameCounter` と同じ「単一フィールドは単純な atomic で足りる」
+/// 考え方)。
+///
+/// 書き手は**音声スレッドただ1つ**(`Mixer::render` 末尾)。読み手は任意のスレッドから
+/// ロック無しで [`Self::read`] できる。
+#[derive(Debug)]
+pub struct BgmStatePublisher {
+    state: AtomicU8,
+}
+
+impl Default for BgmStatePublisher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BgmStatePublisher {
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(MusicState::Loading.to_u8()),
+        }
+    }
+
+    /// BGM ボイスの現在の状態を公開する。音声スレッドから、レンダリング後に呼ぶこと。
+    ///
+    /// リアルタイム安全: アロケーションもロックも行わない(atomic ストア1回のみ)。
+    pub fn write(&self, state: MusicState) {
+        // Release: この直前までの(このコールバックで書いた)出力データが、読み手が
+        // Acquire で state を観測した時点で見えているようにする(`RenderedFrameCounter::add`
+        // と同じ片方向の制約)。
+        self.state.store(state.to_u8(), Ordering::Release);
+    }
+
+    /// 現在の状態を取得する。どのスレッドからでも呼べる。
+    pub fn read(&self) -> MusicState {
+        MusicState::from_u8(self.state.load(Ordering::Acquire))
+    }
+}
+
 /// 音声コールバックがこれまでにレンダリングしたフレーム数を数えるカウンタ。
 ///
 /// - `add` は音声スレッドから呼ぶ(リアルタイム安全: ロック・アロケーション無し)。
@@ -98,6 +143,40 @@ mod tests {
         };
         writer.join().unwrap();
         assert_eq!(counter.get(), 1_000);
+    }
+
+    #[test]
+    fn bgm_state_publisher_starts_at_loading() {
+        let publisher = BgmStatePublisher::new();
+        assert_eq!(publisher.read(), MusicState::Loading);
+    }
+
+    #[test]
+    fn bgm_state_publisher_write_is_reflected_in_read() {
+        let publisher = BgmStatePublisher::new();
+        for state in [
+            MusicState::Loading,
+            MusicState::Ready,
+            MusicState::Playing,
+            MusicState::Paused,
+        ] {
+            publisher.write(state);
+            assert_eq!(publisher.read(), state);
+        }
+    }
+
+    #[test]
+    fn bgm_state_publisher_is_shareable_across_threads() {
+        use std::sync::Arc;
+        let publisher = Arc::new(BgmStatePublisher::new());
+        let writer = {
+            let publisher = Arc::clone(&publisher);
+            std::thread::spawn(move || {
+                publisher.write(MusicState::Playing);
+            })
+        };
+        writer.join().unwrap();
+        assert_eq!(publisher.read(), MusicState::Playing);
     }
 
     #[test]

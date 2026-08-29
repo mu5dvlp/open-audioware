@@ -13,7 +13,7 @@
 |---|---|
 | M0 基盤 / M1 SE 再生 / M2 楽曲とクロック | **完了** |
 | M3 実運用耐性 | **着手**(iOS の割り込み・バックグラウンド復帰・ルート変化〔OldDeviceUnavailable〕は実装済み。Android の AAudio disconnect 再オープン・アンダーラン検知テレメトリは未着手) |
-| M4 仕上げ機能 | **着手中**(M4-1 予約発音の C# ラッパ 完了 / M4-2 キャリブレーション連携 完了) |
+| M4 仕上げ機能 | **着手中**(M4-1 予約発音の C# ラッパ 完了 / M4-2 キャリブレーション連携 完了 / M4-3 BGM のネイティブ化 完了) |
 | M5 ハードニング | 未着手 |
 
 ⚠️ **M3 を飛ばして M4 を進めている。** テンプレート側から `AudioSource` を剥がすのに
@@ -21,6 +21,78 @@
 ユーザー方針「AudioSource には頼らず全面 middleware へ移行したい」に沿って順序を入れ替えた。
 
 ## 作業記録
+
+#### 2026-08-29(middleware: M4-3 BGM のネイティブ化)
+
+**背景**: タスク #30。client 側の #109(SE をネイティブミドルウェア経由にする際、
+BGM だけ既定実装〔`UnityAudioService`〕へ委譲していた暫定ブリッジ)を外すのに
+必要な最後のピース。初期構築仕様『§2』M8「フルネイティブのみ(BGM も SE も
+ミドルウェア経由)」に揃える本線タスク。
+
+**仕様確認**: `init.md` §2 M14「クロックを持つ楽曲ボイスは1本のみ。M4 で BGM 用に
+2本目を足したが、音楽クロックの発行元は1本目に固定する。BGM 側はクロックを
+持たず、ループ再生とフェードだけを扱う」が答えそのものだった。楽曲(M2, ライブ中に
+判定対象になる曲)との違い: 同時に鳴りうる(BGM はメタ画面、楽曲はライブ中で
+排他運用が前提だが、画面遷移をまたぐクロスフェードは両方が短時間同時に鳴ることを
+要求する)・サンプル精度の予約再生や巻き戻し付き再開が不要・クロックを持たない。
+
+**共有/分離の判断**:
+- 共有: 圧縮バイト列のストレージと ID 空間(`mw_sound_load(mode=Music)` /
+  `mw_sound_release` をそのまま流用。「デコード前の圧縮バイト列を保持する」という
+  表現そのものへの分離であり、どちらのボイスで鳴らすかとは無関係)、ストリーミング
+  デコードの仕組み一式(`SymphoniaDecoder`・`decode_thread::spawn` は「楽曲用」
+  「BGM 用」を一切区別しない汎用実装だったため、変更無しでもう1本立てるだけで
+  済んだ)、状態機械(`mw_core::MusicVoice` を BGM 用にもそのまま転用。フェード・
+  ループの数値的な正しさは既存のテストで担保済み)、Bgm バス(新設せず楽曲と共有。
+  両者が同時に鳴っても単純加算されるだけで壊れない設計にしたことで、クロスフェードが
+  各ボイス自身のフェード〔独立したゲイン〕だけで自然に成立する)。
+- 分離: リングバッファ・デコードスレッドはもう1組(`bgm_voice`/`bgm_source`/
+  BGM 専用デコードスレッド)。クロックは一切発行せず(`MusicClockPublisher` には
+  触れない)、代わりに軽量な `BgmStatePublisher`(単一 `AtomicU8`、seqlock 不要)で
+  状態だけを公開する。予約再生・巻き戻し付き再開のコマンドは意図的に持たせていない。
+
+**Rust 実装**: `mw-core`(`clock::BgmStatePublisher` / `command::{BgmPrepare,
+BgmSeek, BgmPlay, BgmStop, BgmSetLoop}` / `mixer::{BgmHandles, Mixer::bgm_voice,
+bgm_source, bgm_state}`)。`Mixer::render` は `output` を既に楽曲の生 PCM 保持に
+使っているため、BGM 用に固定長スタック配列(`BGM_CHUNK_FRAMES = 256`、【仮】)へ
+チャンク単位で読み直しながら周波数ループの中で都度リフィルする設計にした
+(ヒープ確保禁止・§5.3 のため `Vec` は使えない)。`mixer::build`/`Renderer::build` の
+戻り値タプルに `BgmHandles` を追加(既存の呼び出し元は軒並み `_bgm` で受けるだけの
+機械的な変更)。
+
+**FFI 実装**: `mw-ffi`(`mw_bgm_set` / `mw_bgm_state` / `mw_bgm_play` / `mw_bgm_stop`
+/ `mw_bgm_set_loop`)。`mw_music_set` と同じ「デコーダ差し替え → Prepare → Seek{0}」
+の順序で前トラックの PCM 漏れに対処する。`handle::Instance` に BGM 専用デコード
+スレッド一式と `Arc<BgmStatePublisher>` を追加、`init`/`shutdown` で対称に
+spawn/stop+join する。
+
+**C# ラッパ**: `Mw.Native.MwNative`(`SetBgm` / `GetBgmState` / `PlayBgm` / `StopBgm`
+/ `SetBgmLoop` / `ClearBgmLoop`)。`make bindgen` で `NativeMethods.g.cs` を再生成し、
+`make build-macos` で dylib を作り直して `mw_bgm_*` のシンボルが実際にエクスポート
+されていることを `nm` で確認した。EditMode テスト `MwNativeBgmEditModeTests` を
+`MwNativeMusicEditModeTests` と対称の構成で追加(Unity は起動していないため
+`make unity-test` 未実施——次回セッションで確認すること)。
+
+**テスト**: mw-core のオフラインレンダリングに BGM 専用シナリオを6本追加
+(フェードイン/アウト・楽曲との Bgm バス共有による加算・音楽クロックへの無干渉・
+Prepare/Seek による前トラック掃除・ループ折り返し)。`tests/realtime_safety.rs` は
+「`#[global_allocator]` の計測が丸ごとプロセス静的状態のため `#[test]` は1本に保つ」
+という既存の制約に従い、新しい関数を足すのではなく既存シナリオへ BGM の
+再生+ループを追記した。mw-ffi は `run_bgm_lifecycle` を `run_music_lifecycle` と
+対称に追加し、実ハンドル越しに ID 空間の共有・SE との分離・ループ区間の拒否/受理を
+検証した。`cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets --
+-D warnings` / `cargo test --workspace`(mw-backend 13 / mw-core 162 / mw-ffi 52 /
+realtime_safety 1、計228)すべて green。
+
+**残作業(このリポジトリの範囲内)**: `make unity-test` での EditMode 実行確認、
+iOS/Android バイナリの再ビルド(次回の実機確認時にまとめて)。BGM のポーズ/レジューム
+API は「ループ再生とフェードだけを扱う」という M14 の記述と client 側
+`IAudioService.PlayBgm`/`StopBgm` のインターフェース(Pause/Resume 無し)に合わせて
+意図的にスコープ外とした——必要になった場合は `MusicVoice::resume_at` を BGM の
+現在位置で呼ぶ形で追加できる(ただし内部でシーク〔再バッファリング〕を伴うため、
+無音区間が生じない「その場ポーズ」が要るなら `MusicVoice` に専用メソッドを足す
+判断が要る)。client 側(#109 のブリッジ除去・`NativeAudioServiceCore.RoutesToMiddleware`
+の更新)はこのリポジトリの範囲外(タスク指示により touch していない)。
 
 #### 2026-08-28(middleware: M3 追撃 —— iOS 実機バグ修正その2「Bluetooth 解除で SE が無音になる」)
 

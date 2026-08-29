@@ -31,13 +31,13 @@ pub mod wav;
 
 pub use bus::{ALL_BUSES, BUS_COUNT, Bus, BusId, BusSet};
 pub use clipper::SoftClipper;
-pub use clock::{MusicClockPublisher, MusicClockSnapshot, RenderedFrameCounter};
+pub use clock::{BgmStatePublisher, MusicClockPublisher, MusicClockSnapshot, RenderedFrameCounter};
 pub use command::{Command, ScheduledSe};
 pub use config::Config;
 pub use decode::{DecodeError, MusicDecoder, SymphoniaDecoder};
 pub use event::{Event, EventQueue, StreamErrorReason};
 pub use format::{AudioFormat, CHANNELS, Sample};
-pub use mixer::{CommandSender, Mixer, ReclaimReceiver};
+pub use mixer::{BgmHandles, CommandSender, Mixer, ReclaimReceiver};
 pub use music::{MusicFrameSource, MusicRenderOutcome, MusicState, MusicVoice};
 pub use ramp::{Ramp, ms_to_samples};
 pub use renderer::Renderer;

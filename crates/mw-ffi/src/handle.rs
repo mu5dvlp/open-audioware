@@ -25,8 +25,8 @@ use std::thread::JoinHandle;
 
 use mw_backend::{Backend, CpalBackend};
 use mw_core::{
-    CommandSender, Config, EventQueue, MusicClockPublisher, MusicClockSnapshot, MusicDecoder,
-    ReclaimReceiver, Renderer, SoundStorage,
+    BgmStatePublisher, CommandSender, Config, EventQueue, MusicClockPublisher, MusicClockSnapshot,
+    MusicDecoder, MusicState, ReclaimReceiver, Renderer, SoundStorage,
 };
 
 use crate::decode_thread::{self, DecoderSender};
@@ -84,6 +84,20 @@ pub struct Instance {
     /// デコードスレッドの join ハンドル。`shutdown()` で必ず取り出して join する
     /// (`Option` なのは `shutdown()` が `&mut self` で `take` するため)。
     decode_thread: Option<JoinHandle<()>>,
+    /// BGM ボイスの状態(初期構築仕様『§2』M14, M4-3)。`mw_bgm_state` はここから
+    /// ロック無しで読む(`mw_core::mixer::BgmHandles::state` と同じ `Arc`)。
+    /// 音楽クロック(`music_clock`)とは別物——BGM はクロックを持たない。
+    bgm_state: Arc<BgmStatePublisher>,
+    /// BGM 専用のデコードスレッドへ新しいデコーダを渡すハンドル(`mw_bgm_set` から使う)。
+    /// 楽曲用の `decoder_tx` とは完全に独立した別スレッド(`decode_thread::spawn` を
+    /// もう一度呼んで立てる。`crate::decode_thread` はどちらの用途にも汎用に使える
+    /// 設計になっている——`MusicStreamProducer` を受け取って回すだけで、
+    /// 「楽曲用」「BGM 用」という区別を一切知らない)。
+    bgm_decoder_tx: DecoderSender,
+    /// BGM 用デコードスレッドの停止フラグ(`decode_thread_stop` の BGM 版)。
+    bgm_decode_thread_stop: Arc<AtomicBool>,
+    /// BGM 用デコードスレッドの join ハンドル(`decode_thread` の BGM 版)。
+    bgm_decode_thread: Option<JoinHandle<()>>,
 }
 
 impl Instance {
@@ -202,6 +216,18 @@ impl Instance {
         self.decoder_tx.send(decoder).is_ok()
     }
 
+    /// BGM ボイスの現在の状態(初期構築仕様『§2』M14, M4-3)。ロック無し
+    /// (`BgmStatePublisher::read` そのもの)。`mw_bgm_state` が使う。
+    pub fn bgm_state(&self) -> MusicState {
+        self.bgm_state.read()
+    }
+
+    /// BGM 用デコードスレッドへ新しいデコーダを渡す(`mw_bgm_set` が使う。
+    /// [`Instance::send_decoder`] の BGM 版)。
+    pub fn send_bgm_decoder(&self, decoder: Box<dyn MusicDecoder + Send>) -> bool {
+        self.bgm_decoder_tx.send(decoder).is_ok()
+    }
+
     /// 出力レイテンシの実測値([`Backend::output_latency_ns`])を取得する
     /// (`mw_get_output_latency_ns` が使う)。
     pub fn output_latency_ns(&self) -> u64 {
@@ -263,9 +289,18 @@ pub fn init() -> InitOutcome {
     // `CpalBackend::open` の両方へ同じ `Arc` を配る)。`music_stream_producer`
     // (楽曲PCM供給の生産側)と `music_clock`(音楽クロックの読み手)は M2-7 で
     // 実際に使い道ができた——前者はデコードスレッドへムーブし、後者は `Instance`
-    // へ保持して `mw_music_get_position`/`mw_music_state` から読む。
-    let (renderer, command_sender, reclaim_receiver, music_stream_producer, music_clock, events) =
-        Renderer::build(Config::default(), PROVISIONAL_SAMPLE_RATE);
+    // へ保持して `mw_music_get_position`/`mw_music_state` から読む。`bgm`(BGM 専用
+    // ハンドル一式)は M4-3 で追加した——`stream_producer` は楽曲とは別のもう1本の
+    // デコードスレッドへムーブし、`state` は `Instance` へ保持して `mw_bgm_state` から読む。
+    let (
+        renderer,
+        command_sender,
+        reclaim_receiver,
+        music_stream_producer,
+        music_clock,
+        events,
+        bgm,
+    ) = Renderer::build(Config::default(), PROVISIONAL_SAMPLE_RATE);
 
     let mut backend = CpalBackend::new();
     if let Err(err) = backend.open(renderer, Arc::clone(&events)) {
@@ -287,6 +322,12 @@ pub fn init() -> InitOutcome {
     // `JoinHandle`)がどこにも保持されないまま孤立してしまう。
     let (decoder_tx, decode_thread_stop, decode_thread_handle) =
         decode_thread::spawn(music_stream_producer, Arc::clone(&events));
+    // M4-3: BGM 専用のもう1本のデコードスレッド。`decode_thread::spawn` は
+    // 「楽曲用」「BGM 用」を一切区別しない汎用実装なので、独立した
+    // `MusicStreamProducer`(`bgm.stream_producer`)を渡すだけでそのまま使い回せる
+    // (`crate::decode_thread` モジュール doc 参照)。
+    let (bgm_decoder_tx, bgm_decode_thread_stop, bgm_decode_thread_handle) =
+        decode_thread::spawn(bgm.stream_producer, Arc::clone(&events));
 
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
     *guard = Some(Instance {
@@ -304,6 +345,10 @@ pub fn init() -> InitOutcome {
         decoder_tx,
         decode_thread_stop,
         decode_thread: Some(decode_thread_handle),
+        bgm_state: bgm.state,
+        bgm_decoder_tx,
+        bgm_decode_thread_stop,
+        bgm_decode_thread: Some(bgm_decode_thread_handle),
     });
     InitOutcome::Opened(handle)
 }
@@ -347,6 +392,14 @@ pub fn shutdown(handle: u64) -> ShutdownOutcome {
                 // (`crate::decode_thread` 参照)なので、ここでの `Err`(パニック伝播)
                 // は理論上起こらない。万一起きても shutdown 自体は続行する
                 // (join 失敗を理由にハンドルを不定状態のまま残さない)。
+                let _ = join_handle.join();
+            }
+            // M4-3: BGM 専用デコードスレッドも同様に停止・join する(楽曲用と
+            // 対称。どちらか一方だけ回収し忘れるとスレッドリークになる)。
+            instance
+                .bgm_decode_thread_stop
+                .store(true, Ordering::Relaxed);
+            if let Some(join_handle) = instance.bgm_decode_thread.take() {
                 let _ = join_handle.join();
             }
             match instance.backend.close() {
