@@ -92,6 +92,11 @@
 //! **`AVAudioSessionRouteChangeReason::OldDeviceUnavailable` のときだけ復帰を試みる**
 //! ([`RouteChangeReason::requires_recovery`] 参照)。判断根拠:
 //!
+//! (🔴 2026-08-29 追記: この判断のうち `NewDeviceAvailable` を除外する部分は、
+//! 後日実機で否定された。詳細は下記「追記: Bluetooth 再接続で無音になるケース」節
+//! 参照。現在の実装は `OldDeviceUnavailable` と `NewDeviceAvailable` の両方で
+//! 復帰を試みる。以下は当時の判断とその根拠——経緯として残す。)
+//!
 //! - Apple のドキュメント上 `OldDeviceUnavailable` は「直前まで使っていたデバイスが
 //!   無くなった(例: ヘッドフォンが抜かれた)」——BT 切断はまさにこれで、実機報告と一致する。
 //!   cpal 自身もこの reason だけを他(`CategoryChange`/`Override`/
@@ -99,6 +104,9 @@
 //! - `NewDeviceAvailable`(BT 接続・イヤホン挿し込み)や `Override`
 //!   は音が途切れず自動的に継続するのが通例。ここで復帰を試みると**正常なルート切替の
 //!   たびに不要な音切れを生む**(`on_app_became_active` と同じ配慮。依頼書の警告どおり)
+//!   ——🔴 **`NewDeviceAvailable` についてこの判断は実機で否定された**(Bluetooth
+//!   再接続で無音になる実機報告 R13。「追記: Bluetooth 再接続で無音になるケース」節
+//!   参照)。`Override` は実機報告が無いため据え置いている
 //! - `CategoryChange` には反応しない——`ios_session::configure()` 自身が
 //!   `setCategory_error` を呼ぶため、復帰処理が自分自身のカテゴリ再設定をトリガーに
 //!   拾ってしまう自己誘発ループの懸念がある(実機で確認できていないため、疑わしきは
@@ -169,6 +177,84 @@
 //!   このモジュールの復帰処理自体は正常に動いており、原因は別の層
 //!   (`Renderer`/`Mixer` 側やそもそもの音声グラフ)にあると切り分けられる。
 //!
+//! ## 追記: 実機ログで R12 の修正を確認・Began 未達を確定(2026-08-29)
+//!
+//! 上の「追記: `DidBecomeActive` 安全網の前提が崩れていたケース」節を実装した後、
+//! ユーザーの実機ログで結果が確認できた:
+//!
+//! ```text
+//! -> applicationDidEnterBackground()
+//! [mw-backend] app entered background (previous_state=Running); will attempt recovery on next activation
+//! -> applicationDidBecomeActive()
+//! [mw-backend] app became active while unresolved (previous_state=Backgrounded); attempting recovery
+//! [mw-backend] ios_interruption: stream restart succeeded (pause+play, trigger=AppBecameActive { previous_state: Backgrounded })
+//! ```
+//!
+//! 🔴 **`previous_state=Running` が重要。** `DidEnterBackground` に到達した時点で
+//! `InterruptionState` は `Running` のままだった——つまり `AVAudioSessionInterruptionNotification`
+//! の Began は**一度も飛んでいない**。上の「実装方針」節が前提にしていた「上記の Began は
+//! 確実に飛んでくる」は、**この実機ログにより誤りだったことが確定した**(前の追記時点
+//! では「症状と整合していた」という状況証拠に留まっていたが、これは推測ではなく確定した
+//! 事実になった)。そのうえで `previous_state=Backgrounded` から復帰要求へ、
+//! `stream restart succeeded` まで到達しており、**R12(ホーム復帰で無音になる)はこの
+//! 修正で直ったことが実機で確認できた**。
+//!
+//! ## 追記: Bluetooth 再接続で無音になるケース(実機 R13、2026-08-29)
+//!
+//! ユーザー実機報告その3:
+//!
+//! | 操作 | 結果 |
+//! |---|---|
+//! | Bluetooth **切断** → 内蔵スピーカーへ | 鳴る |
+//! | Bluetooth **再接続** | **鳴らない** |
+//! | ホームに戻ってアプリに戻る | 鳴るようになった |
+//!
+//! 3行目(ホーム復帰で鳴るようになった)は、上の「追記: 実機ログで R12 の修正を確認」節の
+//! 経路(`DidEnterBackground`→`DidBecomeActive`→`attempt_recovery`)がそのまま動いた結果で、
+//! **`attempt_recovery` 自体は正しく動作することの傍証になる**。足りなかったのは
+//! 「Bluetooth 再接続」という契機を復帰のトリガーとして拾っていなかったことだけ。
+//!
+//! 上の「追記: ルート変化」節はこう書いていた——「`NewDeviceAvailable`(BT 接続・イヤホン
+//! 挿し込み)や `Override` は音が途切れず自動的に継続するのが通例。ここで復帰を試みると
+//! 正常なルート切替のたびに不要な音切れを生む」。**この `NewDeviceAvailable` に関する
+//! 判断は実機で否定された。** Bluetooth 再接続(`NewDeviceAvailable`)では音が自動的には
+//! 継続せず、無音のまま固まる——おそらく cpal 0.18.1 の `playing` フラグが OS 主導の
+//! ルート切替(出力先が変わってユニットが再構成される)に追随しないという、モジュール doc
+//! 冒頭「実機バグの原因」に書いた根本原因が、`OldDeviceUnavailable` だけでなく
+//! `NewDeviceAvailable` でも起きるということ。
+//!
+//! **対応: [`RouteChangeReason::requires_recovery`] に `NewDeviceAvailable` を追加した。**
+//! `OldDeviceUnavailable` と `NewDeviceAvailable` の両方で復帰(`pause()`→`play()`)を
+//! 試みる。
+//!
+//! 他の reason をどうしたかの判断根拠:
+//!
+//! - 🔴 **`CategoryChange` は引き続き除外する。** `attempt_recovery` は
+//!   `crate::ios_session::configure()` を呼び、これ自身が内部で `setCategory_error` を
+//!   呼ぶ。`CategoryChange` にも反応させると「復帰処理が自分自身のカテゴリ再設定を
+//!   トリガーに拾って再度復帰処理を呼ぶ」自己誘発ループになりうる——ここは実機報告が
+//!   無いまま緩めるにはリスクが高すぎるため、当初の判断のまま維持する。
+//! - `Override` は今回も実機報告が無いため据え置く(復帰を試みない)。`NewDeviceAvailable`
+//!   について判断が覆ったからといって `Override` も同様に覆ると推測する根拠が無い——
+//!   実機報告があった reason だけを直し、無い reason は現状維持という最小変更に留めた。
+//! - `RouteConfigurationChange`/`WakeFromSleep`/`Unknown`/`NoSuitableRouteForCategory`
+//!   (= `RouteChangeReason::Other`)も同じ理由で据え置く。
+//!
+//! **観測性の穴も見つかった:** ユーザーが貼った実機ログには、BT の切断・再接続の前後で
+//! `route changed` のログが1行も出ていなかった。原因の切り分けとして3通り考えられる——
+//! (a) ログの貼り漏れ、(b) `AVAudioSessionRouteChangeNotification` の observer が
+//! そもそも発火していない、(c) `route_change_reason()` が `None` を返し、
+//! `handle_route_change_notification` が**ログを出す前に** `return` していた。
+//!
+//! ⚠️ **(c) は実際にあり得た。** 修正前の実装は
+//! `let Some(reason) = route_change_reason(notif) else { return; };` で、reason の解釈に
+//! 失敗すると**何も記録せずに黙って捨てる**形になっていた。**このプロジェクトが何度も
+//! 踏んできた「黙って捨てる」罠**そのものなので、通知を受け取った事実そのものを reason の
+//! 解釈より前にログするよう `handle_route_change_notification` を直した
+//! (`AVAudioSession route change notification received` を先に出し、reason の解釈に
+//! 失敗した場合もそれを明示的にログする)。次に実機で BT 切断・再接続を試したとき、
+//! この行が出るかどうかで (a)(b)(c) を切り分けられる。
+//!
 //! ## パニック安全性
 //!
 //! Objective-C ランタイムから直接呼ばれるブロックの内部で panic が Rust スタックを
@@ -185,14 +271,19 @@
 //! 状態機械)として切り出し、遷移だけをこのファイル末尾の `tests` で固定化している。
 //! 「割り込みで止まった → 再開要求 → 実際に再開できた」の一連の流れ、
 //! 「ベニンな(実際には中断していない)アクティブ化では何もしない」ガード、
-//! 「`OldDeviceUnavailable` だけが復帰を要求し、それ以外のルート変化 reason は
-//! 状態を一切変えない」ガード([`RouteChangeReason::requires_recovery`] /
-//! [`InterruptionState::on_route_changed`])、そして追記で足した
+//! 「`OldDeviceUnavailable` と `NewDeviceAvailable` が復帰を要求し、それ以外の
+//! ルート変化 reason(`CategoryChange` を含む——自己誘発ループ防止のため意図的に除外。
+//! 「追記: Bluetooth 再接続で無音になるケース」参照)は状態を一切変えない」ガード
+//! ([`RouteChangeReason::requires_recovery`] / [`InterruptionState::on_route_changed`])、
+//! そして追記で足した
 //! 「Began が一度も来ないままバックグラウンドへ行っても、前面復帰したら復帰を試みる」
 //! ([`InterruptionState::Backgrounded`] / [`InterruptionState::on_app_entered_background`])
-//! の4つをカバーする。OS 通知が実機で本当に発火するか(特に `DidEnterBackground` が
-//! このバグシナリオで本当に飛んでくるか)、`pause()`→`play()` の順序で
-//! `AudioOutputUnitStart` が実際に音を復活させるかは実機検証でしか確認できない。
+//! の4つをカバーする。`DidEnterBackground` が実機で本当に飛んでくるか、`pause()`→`play()`
+//! の順序で `AudioOutputUnitStart` が実際に音を復活させるかは実機検証でしか確認できない
+//! ——前者は上の「追記: 実機ログで R12 の修正を確認」節で確認済み。`NewDeviceAvailable`
+//! を復帰要求に追加したことが Bluetooth 再接続で実際に無音を解消するか、また
+//! `AVAudioSessionRouteChangeNotification` がそもそも実機で発火しているかは、
+//! 「追記: Bluetooth 再接続で無音になるケース」節に書いた次の実機テストでのみ確認できる。
 
 use std::sync::Arc;
 
@@ -290,8 +381,9 @@ impl InterruptionState {
     /// ルート変化(`AVAudioSessionRouteChangeNotification`)。`reason` は
     /// [`RouteChangeReason::requires_recovery`] で復帰要否を判断済みの値を渡す。
     ///
-    /// 復帰が要る reason(`OldDeviceUnavailable` のみ、モジュール doc「追記: ルート変化」
-    /// 参照)ならどの状態からでも `RecoveryPending` へ(割り込み中に新しい割り込みが来る
+    /// 復帰が要る reason(`OldDeviceUnavailable` と `NewDeviceAvailable`。モジュール doc
+    /// 「追記: ルート変化」および「追記: Bluetooth 再接続で無音になるケース」参照)
+    /// ならどの状態からでも `RecoveryPending` へ(割り込み中に新しい割り込みが来る
     /// のと同じ「最新の事実を優先」設計)。**要らない reason は現状を一切変えない**
     /// (`self` をそのまま返す)——正常なルート切替(ヘッドフォン挿し込み等)のたびに
     /// `Interrupted`/`RecoveryFailed` を握りつぶして未解決の割り込みを覆い隠さないため、
@@ -337,6 +429,10 @@ pub enum RouteChangeReason {
     /// 実機報告「Bluetooth を解除すると SE が鳴らなくなる」に対応する reason。
     OldDeviceUnavailable,
     /// 新しいデバイスが使えるようになった(例: Bluetooth 接続・イヤホン挿し込み)。
+    /// 実機報告「Bluetooth を再接続すると SE が鳴らなくなる」(R13)に対応する reason
+    /// ——当初は「音が途切れず自動的に継続するのが通例」としてここに反応しない判断
+    /// だったが、実機で否定された(モジュール doc「追記: Bluetooth 再接続で無音になる
+    /// ケース」参照)。
     NewDeviceAvailable,
     /// オーディオカテゴリが変わった。`ios_session::configure()` 自身が
     /// `setCategory_error` 経由で引き起こしうる。
@@ -351,13 +447,16 @@ pub enum RouteChangeReason {
 impl RouteChangeReason {
     /// この reason で復帰(セッション再アクティブ化 + `pause()`→`play()`)を試みるべきか。
     ///
-    /// **`OldDeviceUnavailable` のみ `true`。** 判断根拠はモジュール doc「追記: ルート変化」
-    /// に詳述——要約すると、これだけが Apple のドキュメント上「直前まで使えていたものが
-    /// 無くなった」ことを意味し、他の reason(`NewDeviceAvailable`/`Override` は自動的に
-    /// 継続するのが通例、`CategoryChange` は自己誘発の懸念、それ以外は復帰しても改善しない)
-    /// では復帰を試みても効果が無いか、正常なルート切替のたびに不要な音切れを生む。
+    /// **`OldDeviceUnavailable` と `NewDeviceAvailable` が `true`。** 判断根拠はモジュール
+    /// doc「追記: ルート変化」および「追記: Bluetooth 再接続で無音になるケース」に詳述——
+    /// 要約すると、当初は `OldDeviceUnavailable` だけが Apple のドキュメント上「直前まで
+    /// 使えていたものが無くなった」ことを意味すると判断していたが、`NewDeviceAvailable`
+    /// (Bluetooth 再接続等)でも音が自動的には継続せず無音になることが実機報告(R13)で
+    /// 確認され、対象に追加した。`CategoryChange` は `ios_session::configure()` 自身が
+    /// 引き起こしうる自己誘発ループの懸念があるため引き続き除外し、`Override`/`Other`
+    /// は実機報告が無いため据え置いている。
     pub fn requires_recovery(self) -> bool {
-        matches!(self, Self::OldDeviceUnavailable)
+        matches!(self, Self::OldDeviceUnavailable | Self::NewDeviceAvailable)
     }
 }
 
@@ -672,7 +771,17 @@ mod imp {
         stream: &cpal::Stream,
         events: &EventQueue,
     ) {
+        // 通知を受け取った事実そのものを reason の解釈より前にログする。以前は
+        // `route_change_reason` が `None` を返すとログより先に `return` していたため、
+        // userInfo の取得やキャストに失敗すると何も記録せずに黙って捨てていた
+        // (このプロジェクトが何度も踏んできた罠。モジュール doc「追記: Bluetooth
+        // 再接続で無音になるケース」参照)。
+        crate::mw_log!("[mw-backend] AVAudioSession route change notification received");
         let Some(reason) = route_change_reason(notif) else {
+            crate::mw_log!(
+                "[mw-backend] ios_interruption: failed to interpret route change reason from \
+                 notification userInfo (missing userInfo/key, or unexpected value type)"
+            );
             return;
         };
         crate::mw_log!("[mw-backend] AVAudioSession route changed (reason={reason:?})");
@@ -740,8 +849,9 @@ mod imp {
         #[allow(dead_code)]
         AppBecameActive { previous_state: InterruptionState },
         /// `AVAudioSessionRouteChangeNotification`(`reason` は
-        /// `RouteChangeReason::OldDeviceUnavailable` のはず——他の reason は
-        /// `needs_recovery_attempt()` が `false` になるため、そもそもここへ来ない)。
+        /// `RouteChangeReason::OldDeviceUnavailable` または `NewDeviceAvailable` のはず
+        /// ——他の reason は `needs_recovery_attempt()` が `false` になるため、そもそも
+        /// ここへ来ない)。
         #[allow(dead_code)]
         RouteChange { reason: RouteChangeReason },
     }
@@ -1003,13 +1113,14 @@ mod tests {
         }
     }
 
-    /// 依頼書の警告どおり:正常なルート切替(BT/イヤホン接続・カテゴリ変更・
-    /// オーバーライド等)では状態を一切変えない——毎回 `pause()`→`play()` すると
-    /// 通常プレイ中に不要な音切れを生むため。
+    /// 依頼書の警告どおり:正常なルート切替(カテゴリ変更・オーバーライド等)では状態を
+    /// 一切変えない——毎回 `pause()`→`play()` すると通常プレイ中に不要な音切れを生むため。
+    /// `NewDeviceAvailable`(BT 接続・イヤホン挿し込み)はここに含めない——実機報告 R13で
+    /// 復帰が要ることが判明したため
+    /// ([`route_changed_with_new_device_available_requests_recovery_from_any_state`] 参照)。
     #[test]
     fn route_changed_with_benign_reasons_does_not_change_state() {
         for reason in [
-            RouteChangeReason::NewDeviceAvailable,
             RouteChangeReason::CategoryChange,
             RouteChangeReason::Override,
             RouteChangeReason::Other,
@@ -1031,13 +1142,63 @@ mod tests {
         }
     }
 
+    /// 旧名 `only_old_device_unavailable_requires_recovery`。実機報告 R13(Bluetooth
+    /// 再接続で無音になる)を受けて `NewDeviceAvailable` も復帰対象に加わったため、
+    /// 「old device unavailable だけ」という名前のままでは実態と食い違う。名前を
+    /// 実態に合わせて変更した(モジュール doc「追記: Bluetooth 再接続で無音になる
+    /// ケース」参照)。
     #[test]
-    fn only_old_device_unavailable_requires_recovery() {
+    fn old_device_unavailable_and_new_device_available_require_recovery_other_reasons_do_not() {
         assert!(RouteChangeReason::OldDeviceUnavailable.requires_recovery());
-        assert!(!RouteChangeReason::NewDeviceAvailable.requires_recovery());
+        assert!(RouteChangeReason::NewDeviceAvailable.requires_recovery());
         assert!(!RouteChangeReason::CategoryChange.requires_recovery());
         assert!(!RouteChangeReason::Override.requires_recovery());
         assert!(!RouteChangeReason::Other.requires_recovery());
+    }
+
+    /// 実機報告 R13 の最小シナリオ:「Bluetooth を再接続すると SE が鳴らなくなる」——
+    /// `NewDeviceAvailable` はどの状態からでも復帰要求(`RecoveryPending`)へ遷移する
+    /// (`route_changed_with_old_device_unavailable_requests_recovery_from_any_state` と
+    /// 同じ形。モジュール doc「追記: Bluetooth 再接続で無音になるケース」参照)。
+    #[test]
+    fn route_changed_with_new_device_available_requests_recovery_from_any_state() {
+        for state in [
+            InterruptionState::Running,
+            InterruptionState::Interrupted,
+            InterruptionState::RecoveryPending,
+            InterruptionState::Recovered,
+            InterruptionState::RecoveryFailed,
+            InterruptionState::Backgrounded,
+        ] {
+            assert_eq!(
+                state.on_route_changed(RouteChangeReason::NewDeviceAvailable),
+                InterruptionState::RecoveryPending
+            );
+        }
+    }
+
+    /// `CategoryChange` は引き続き復帰を要求しない——`attempt_recovery` が呼ぶ
+    /// `ios_session::configure()` 自身が `setCategory_error` を呼ぶため、ここで復帰に
+    /// 反応すると自分自身のカテゴリ再設定をトリガーに拾う自己誘発ループになりうる
+    /// (モジュール doc「追記: ルート変化」および「追記: Bluetooth 再接続で無音になる
+    /// ケース」参照)。`NewDeviceAvailable` を復帰対象に追加した際もここは意図的に
+    /// 据え置いた設計判断であることを、独立したテストとして固定化する。
+    #[test]
+    fn category_change_does_not_require_recovery_to_avoid_self_triggered_loop() {
+        assert!(!RouteChangeReason::CategoryChange.requires_recovery());
+        for state in [
+            InterruptionState::Running,
+            InterruptionState::Interrupted,
+            InterruptionState::RecoveryPending,
+            InterruptionState::Recovered,
+            InterruptionState::RecoveryFailed,
+            InterruptionState::Backgrounded,
+        ] {
+            assert_eq!(
+                state.on_route_changed(RouteChangeReason::CategoryChange),
+                state
+            );
+        }
     }
 
     /// ルート変化による復帰要求と、割り込みによる復帰要求は同じ `RecoveryPending` へ
