@@ -35,6 +35,17 @@ pub struct CpalBackend {
     /// 音声スレッドが書き、ゲームスレッドが読む「直近のコールバックのフレーム数」。
     /// 詳細は [`Backend::last_callback_frames`]。
     callback_frames: Arc<AtomicU32>,
+    /// 音声コールバックが実際に呼ばれた回数(単調増加、`fetch_add` のみ)。
+    ///
+    /// `ios_interruption::Watcher` が「`pause()`→`play()` の戻り値」ではなく
+    /// 「コールバックが実際に前進したか」を実測するために使う
+    /// (`ios_interruption.rs` モジュール doc「追記: `pause()`→`play()` が Ok を返しても
+    /// 無音のままだったケース」参照)。`callback_frames` と役割が近いが、こちらは
+    /// 「呼ばれた回数そのもの」を見る専用のカウンタにしてある——`callback_frames`
+    /// (直近のフレーム数)の値を比較する方式だと、同じバッファ長のコールバックが
+    /// 連続した場合に「進んだかどうか」を値の変化だけでは区別できない。単調増加の
+    /// カウンタなら、値が変わっていれば必ず「少なくとも1回呼ばれた」ことを意味する。
+    callback_ticks: Arc<AtomicU64>,
     /// 音声スレッドが書き、ゲームスレッドが読む「直近の出力レイテンシ(ns)」。
     /// 詳細は [`Backend::output_latency_ns`]。
     output_latency_ns: Arc<AtomicU64>,
@@ -51,6 +62,7 @@ impl CpalBackend {
             stream: None,
             ios_interruption: None,
             callback_frames: Arc::new(AtomicU32::new(0)),
+            callback_ticks: Arc::new(AtomicU64::new(0)),
             output_latency_ns: Arc::new(AtomicU64::new(0)),
             logged_output_latency: AtomicBool::new(false),
             sample_rate: 0,
@@ -142,6 +154,9 @@ impl Backend for CpalBackend {
             renderer,
             Arc::clone(&self.callback_frames),
             Arc::clone(&self.output_latency_ns),
+            // `ios_interruption::Watcher::new` へも同じカウンタを渡すため、ここでは
+            // clone を渡す(コールバッククロージャへムーブされる分)。
+            Arc::clone(&self.callback_ticks),
             // `events` はこの後 `ios_interruption::Watcher::new` へも渡すため、ここでは
             // clone を渡す(`err_fn` クロージャへムーブされる分)。
             Arc::clone(&events),
@@ -155,7 +170,11 @@ impl Backend for CpalBackend {
         // ストリームを `Arc` で共有する理由・`ios_interruption` の役割は `CpalBackend` の
         // フィールド doc を参照。iOS / tvOS 以外では no-op(`ios_interruption.rs`)。
         let stream = Arc::new(stream);
-        self.ios_interruption = Some(ios_interruption::Watcher::new(Arc::clone(&stream), events));
+        self.ios_interruption = Some(ios_interruption::Watcher::new(
+            Arc::clone(&stream),
+            events,
+            Arc::clone(&self.callback_ticks),
+        ));
 
         self.sample_rate = config.sample_rate;
         self.stream = Some(stream);
@@ -173,6 +192,7 @@ impl Backend for CpalBackend {
                 drop(stream);
                 self.sample_rate = 0;
                 self.callback_frames.store(0, Ordering::Relaxed);
+                self.callback_ticks.store(0, Ordering::Relaxed);
                 self.output_latency_ns.store(0, Ordering::Relaxed);
                 self.logged_output_latency.store(false, Ordering::Relaxed);
                 Ok(())
@@ -319,6 +339,7 @@ fn build_output_stream(
     mut renderer: Renderer,
     callback_frames: Arc<AtomicU32>,
     output_latency_ns: Arc<AtomicU64>,
+    callback_ticks: Arc<AtomicU64>,
     events: Arc<EventQueue>,
 ) -> Result<cpal::Stream, BackendError> {
     let err_fn = move |err: cpal::Error| {
@@ -340,6 +361,13 @@ fn build_output_stream(
                 // I/O バッファ長の実測用。アトミックストア1回だけで、アロケーション・
                 // ロック・IO をしないためリアルタイム安全性規約(§5.3)に抵触しない。
                 callback_frames.store((data.len() / CHANNELS) as u32, Ordering::Relaxed);
+
+                // 復帰確認用のカウンタ(`CpalBackend::callback_ticks` のdoc、
+                // `ios_interruption.rs` モジュール doc「追記: `pause()`→`play()` が Ok を
+                // 返しても無音のままだったケース」参照)。relaxed な加算1回のみ——
+                // アロケーション・ロック・IO を伴わないためリアルタイム安全性規約
+                // (§5.3)に抵触しない。
+                callback_ticks.fetch_add(1, Ordering::Relaxed);
 
                 let timestamp = info.timestamp();
 

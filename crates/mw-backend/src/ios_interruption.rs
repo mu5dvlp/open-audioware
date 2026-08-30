@@ -255,6 +255,73 @@
 //! 失敗した場合もそれを明示的にログする)。次に実機で BT 切断・再接続を試したとき、
 //! この行が出るかどうかで (a)(b)(c) を切り分けられる。
 //!
+//! ## 追記: `pause()`→`play()` が Ok を返しても無音のままだったケース(実機 R24、2026-08-30)
+//!
+//! ユーザー実機報告その4——今度は Bluetooth を**切断**したときの実機ログ:
+//!
+//! ```text
+//! [mw-backend] output stream error: Audio route changed
+//! [mw-backend] AVAudioSession route change notification received
+//! [mw-backend] AVAudioSession route changed (reason=OldDeviceUnavailable)
+//! [mw-backend] ios_interruption: attempting recovery (trigger=RouteChange { reason: OldDeviceUnavailable })
+//! [mw-backend] AVAudioSession configured: sample_rate=48000 Hz, io_buffer=5.000 ms, output_latency=17.917 ms, output_channels=2
+//! [mw-backend] ios_interruption: stream restart succeeded (pause+play, trigger=RouteChange { reason: OldDeviceUnavailable })
+//! -> applicationDidEnterBackground
+//! [mw-backend] app entered background (previous_state=Recovered); will attempt recovery on next activation
+//! -> applicationDidBecomeActive
+//! [mw-backend] app became active while unresolved (previous_state=Backgrounded); attempting recovery
+//! [mw-backend] ios_interruption: stream restart succeeded (pause+play, trigger=AppBecameActive { previous_state: Backgrounded })
+//! ```
+//!
+//! 🔴 **1回目の `stream restart succeeded` ログが出ているのに、実際には無音のままだった。**
+//! `previous_state=Recovered` から分かる通り、`InterruptionState` は「復帰済み」に
+//! 遷移していた——つまり `on_recovery_attempted(true)` が呼ばれていた。ところが2回目
+//! (バックグラウンド往復を経て `AppBecameActive` から再試行された)の、**全く同じ**
+//! `pause()`→`play()` 呼び出しで実際に音が戻った。同じ呼び出しが1回目は空振り、
+//! 2回目は効いたということは、**AudioUnit 自体は死んでおらず、`AudioOutputUnitStart`
+//! が実際に効果を持つまでのタイミングの問題**である可能性が高いと判断した——
+//! cpal 0.18.1 の `err_fn` はルート変化時に `AudioUnit`/`playing` フラグへ一切触れない
+//! ことは「追記: ルート変化」節で確認済みなので、cpal 自身による二重処理が原因ではない。
+//!
+//! **根本原因: `attempt_recovery` が「復帰できたか」を `stream.play()` の戻り値だけで
+//! 判定していた。** `Result::Ok` は「`AudioOutputUnitStart` の呼び出し自体がエラーを
+//! 返さなかった」ことしか意味せず、「実際に音声コールバックが再び呼ばれているか」を
+//! 何も保証しない。今回のログはこの2つが乖離した実例そのもの——1回目は `Ok` だが
+//! コールバックは進んでおらず、それでも `InterruptionState` は `Recovered` になった。
+//! 直後の `DidBecomeActive` は `on_app_became_active` の既存ガード(`Running`/
+//! `RecoveryPending`/`Recovered` では何もしない——「実装方針」節参照)に阻まれて
+//! 何も試みない。たまたまユーザーがホームへ行って `DidEnterBackground`→
+//! `DidBecomeActive` の安全網(R12 の修正)を踏んだから音が戻っただけで、**アプリを
+//! 前面に置いたままでは永久に無音のままだったはず**。
+//!
+//! **対応: 「復帰できたか」の判定を `play()` の戻り値ではなく、音声コールバックが実際に
+//! 前進したかの実測へ置き換えた。** `CpalBackend` に単調増加のカウンタ
+//! `callback_ticks`(`cpal_backend.rs::CpalBackend::callback_ticks` 参照)を足し、
+//! `attempt_recovery` は `pause()`→`play()` の前後でこのカウンタを比較する。進んで
+//! いなければ `pause()`→`play()` を**呼び直し**、段階的に待機時間を伸ばしながら
+//! 再確認する([`RECOVERY_WAIT_SCHEDULE_MS`] / [`confirm_recovery_progress`] 参照)。
+//! 全ステップで進行が確認できなければ `InterruptionState::RecoveryFailed` として扱う
+//! ——これにより次の `DidBecomeActive`(または新しいルート変化・割り込み)で
+//! 自動的に再試行される。「ユーザーが手動でホームへ行かないと直らない」という
+//! 偶然の救済に頼らない設計にした。
+//!
+//! **判定ロジック(`RECOVERY_WAIT_SCHEDULE_MS` / `confirm_recovery_progress`)は
+//! CoreAudio に一切依存しない純粋な関数として`imp`モジュールの外に切り出した**
+//! ——`InterruptionState`/`RouteChangeReason` と同じ設計判断(下記「自動テストで守れる
+//! 範囲・守れない範囲」参照)。副作用(`pause()`→`play()` の呼び直し・実際のスリープ・
+//! カウンタの読み出し)はすべて呼び出し側からクロージャで注入する形にしたので、
+//! macOS/Linux でも単体テストで固定化できる(本ファイル末尾の `tests` モジュール参照)。
+//!
+//! **待機は `std::thread::sleep` を使う(ブロッキング)。** この経路は音声スレッドでは
+//! なく、通知センターの observer ブロックを実行する非リアルタイムスレッドなので
+//! §5.3 の対象外(「パニック安全性」節・`ios_session::configure()` の呼び出しと同じ扱い)。
+//! ただし**全ステップ空振りした最悪ケースでは合計 370ms(= 20+50+100+200ms)このスレッド
+//! をブロックする**——復帰確認のためだけの待機で音声スレッド・UI スレッドを
+//! ブロックするわけではないため実害は無いと判断したが、observer ブロックを呼んだ
+//! OS 側のスレッドが最大370ms占有されること自体は事実として明記しておく。
+//! **復帰が1回目で確認できる通常ケースでは20msしか待たない**ため、頻繁に起きる
+//! ルート変化・割り込み終了のたびに370msのヒッチが出るわけではない。
+//!
 //! ## パニック安全性
 //!
 //! Objective-C ランタイムから直接呼ばれるブロックの内部で panic が Rust スタックを
@@ -284,8 +351,19 @@
 //! を復帰要求に追加したことが Bluetooth 再接続で実際に無音を解消するか、また
 //! `AVAudioSessionRouteChangeNotification` がそもそも実機で発火しているかは、
 //! 「追記: Bluetooth 再接続で無音になるケース」節に書いた次の実機テストでのみ確認できる。
+//!
+//! **5つ目: `pause()`→`play()` が実際にコールバックを前進させたかの判定
+//! ([`confirm_recovery_progress`])。** これも `InterruptionState` と同じ理由で
+//! CoreAudio 非依存の純粋な関数として切り出し、「成功が1回目で確認できる」「途中の
+//! 再試行で確認できる」「最後まで確認できない」の3ケースを単体テストで固定化した
+//! (モジュール doc「追記: `pause()`→`play()` が Ok を返しても無音のままだったケース」
+//! 参照)。ただし `AudioOutputUnitStart` 後に実際に何 ms で音声コールバックが再開する
+//! かという実機の生の値そのものは自動テスト不可——`RECOVERY_WAIT_SCHEDULE_MS` の
+//! 妥当性(20msで足りるか、370ms待っても復帰しない実機ケースがあるか)は次の実機
+//! テストで確認する。
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use mw_core::EventQueue;
 
@@ -460,6 +538,60 @@ impl RouteChangeReason {
     }
 }
 
+/// [`confirm_recovery_progress`] が「1回目の確認」から「最後の再試行」まで辿る待機
+/// スケジュール(ミリ秒)。CoreAudio に一切依存しない定数——`InterruptionState`/
+/// `RouteChangeReason` と同じ理由で、macOS/Linux でもコンパイル・テストできるように
+/// `imp`(iOS/tvOS 専用)モジュールの外に置いてある(モジュール doc「追記:
+/// `pause()`→`play()` が Ok を返しても無音のままだったケース」参照)。
+///
+/// 各要素は「その回で(2回目以降は追加の `pause()`→`play()` を呼んだ後に)待つ時間」。
+/// index 0(20ms)は追加の呼び出し無し——呼び出し側が既に済ませた1回目の
+/// `pause()`→`play()` の結果を確認するだけなので、1回目で復帰していれば追加の
+/// コストは20ms待つだけで済む。全部空振りした場合の合計待機時間は
+/// 20+50+100+200 = 370ms(依頼書の「合計 400ms 程度を上限に」の範囲)。
+pub const RECOVERY_WAIT_SCHEDULE_MS: [u64; 4] = [20, 50, 100, 200];
+
+/// [`RECOVERY_WAIT_SCHEDULE_MS`] を1ステップずつ辿りながら、音声コールバックが実際に
+/// 前進した(=本当に鳴り出した)かどうかを確認する。CoreAudio / cpal に一切触れない
+/// 純粋な関数——OS 呼び出しを伴う副作用(2回目以降の `pause()`→`play()` の呼び直し、
+/// 指定時間のブロッキング待機、現在のカウンタの読み出し)はすべて呼び出し側から
+/// クロージャで注入する形にしてあり、`InterruptionState`/`RouteChangeReason` と同じ
+/// 「判定ロジックはここに閉じ込め、副作用は呼び出し側」という設計に倣った
+/// (モジュール doc「追記: `pause()`→`play()` が Ok を返しても無音のままだったケース」
+/// 参照)。これにより本ファイル末尾の `tests` で macOS 上でも固定化できる。
+///
+/// - `ticks_before`: 呼び出し側が1回目の `pause()`→`play()` を呼ぶ**前**に読んでおいた
+///   カウンタの値(`CpalBackend::callback_ticks` 相当)。
+/// - `read_ticks`: 現在のカウンタ値を読む。
+/// - `retry`: 2回目以降の `pause()`→`play()` の呼び直し(1回目の呼び出しは呼び出し側が
+///   既に済ませている前提——`RECOVERY_WAIT_SCHEDULE_MS` の doc参照)。
+/// - `sleep_ms`: 指定ミリ秒だけブロックする(`attempt_recovery` の doc「待機は
+///   `std::thread::sleep` を使う」参照)。
+///
+/// 戻り値: `Some((attempt, waited_ms))`——`attempt` は進行が確認できた試行番号
+/// (1始まり。1なら追加の再試行無しで確認できた)、`waited_ms` はそこまでの累計待機
+/// ミリ秒。`RECOVERY_WAIT_SCHEDULE_MS` を最後まで辿っても進行が確認できなければ
+/// `None`(呼び出し側は復帰失敗として扱う)。
+pub fn confirm_recovery_progress(
+    ticks_before: u64,
+    mut read_ticks: impl FnMut() -> u64,
+    mut retry: impl FnMut(),
+    mut sleep_ms: impl FnMut(u64),
+) -> Option<(u32, u64)> {
+    let mut waited_ms = 0u64;
+    for (index, &wait_ms) in RECOVERY_WAIT_SCHEDULE_MS.iter().enumerate() {
+        if index > 0 {
+            retry();
+        }
+        sleep_ms(wait_ms);
+        waited_ms += wait_ms;
+        if read_ticks() != ticks_before {
+            return Some((index as u32 + 1, waited_ms));
+        }
+    }
+    None
+}
+
 /// `AVAudioSessionInterruptionNotification` / `UIApplicationDidBecomeActiveNotification` /
 /// `UIApplicationDidEnterBackgroundNotification` / `AVAudioSessionRouteChangeNotification` の
 /// 監視・復帰処理。iOS / tvOS 以外では何もしない no-op(`ios_session::configure` と同じ
@@ -476,19 +608,31 @@ impl Watcher {
     /// `stream` は復帰時に `pause()`→`play()` を呼び直す対象。`events` は
     /// `Event::AudioInterruptionBegan`/`AudioInterruptionEnded` を積む先
     /// (`EventQueue::push_side_channel`。ここは音声スレッドではないので §5.3 の対象外)。
+    /// `callback_ticks` は `CpalBackend` が持つ「音声コールバックが呼ばれた回数」の
+    /// 単調増加カウンタ(`Arc` 共有)——`pause()`→`play()` が実際にコールバックを
+    /// 前進させたかを実測するために使う(モジュール doc「追記: `pause()`→`play()` が
+    /// Ok を返しても無音のままだったケース」参照)。
     ///
     /// `CpalBackend::open` から、ストリームを `play()` した直後に呼ぶこと
     /// (`cpal_backend.rs` 参照)。
     #[cfg(any(target_os = "ios", target_os = "tvos"))]
-    pub fn new(stream: Arc<cpal::Stream>, events: Arc<EventQueue>) -> Self {
+    pub fn new(
+        stream: Arc<cpal::Stream>,
+        events: Arc<EventQueue>,
+        callback_ticks: Arc<AtomicU64>,
+    ) -> Self {
         Self {
-            inner: imp::Watcher::new(stream, events),
+            inner: imp::Watcher::new(stream, events, callback_ticks),
         }
     }
 
     /// iOS / tvOS 以外では何もしない。
     #[cfg(not(any(target_os = "ios", target_os = "tvos")))]
-    pub fn new(_stream: Arc<cpal::Stream>, _events: Arc<EventQueue>) -> Self {
+    pub fn new(
+        _stream: Arc<cpal::Stream>,
+        _events: Arc<EventQueue>,
+        _callback_ticks: Arc<AtomicU64>,
+    ) -> Self {
         Self {}
     }
 }
@@ -497,7 +641,9 @@ impl Watcher {
 mod imp {
     use std::panic::{self, AssertUnwindSafe};
     use std::ptr::NonNull;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use block2::RcBlock;
     use cpal::traits::StreamTrait;
@@ -512,7 +658,9 @@ mod imp {
     };
     use objc2_foundation::{NSNotification, NSNotificationCenter, NSNumber, NSString, ns_string};
 
-    use super::{InterruptionState, RouteChangeReason};
+    use super::{
+        InterruptionState, RECOVERY_WAIT_SCHEDULE_MS, RouteChangeReason, confirm_recovery_progress,
+    };
 
     pub(super) struct Watcher {
         observers: Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
@@ -526,7 +674,11 @@ mod imp {
     unsafe impl Sync for Watcher {}
 
     impl Watcher {
-        pub(super) fn new(stream: Arc<cpal::Stream>, events: Arc<EventQueue>) -> Self {
+        pub(super) fn new(
+            stream: Arc<cpal::Stream>,
+            events: Arc<EventQueue>,
+            callback_ticks: Arc<AtomicU64>,
+        ) -> Self {
             let nc = NSNotificationCenter::defaultCenter();
             let state = Arc::new(Mutex::new(InterruptionState::new()));
             let mut observers = Vec::new();
@@ -535,12 +687,19 @@ mod imp {
                 let state = Arc::clone(&state);
                 let stream = Arc::clone(&stream);
                 let events = Arc::clone(&events);
+                let callback_ticks = Arc::clone(&callback_ticks);
                 let block = RcBlock::new(move |notif: NonNull<NSNotification>| {
                     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
                         // SAFETY: OS が有効な NSNotification を渡してくる(この block の
                         // 契約)。
                         let notif = unsafe { notif.as_ref() };
-                        handle_interruption_notification(notif, &state, &stream, &events);
+                        handle_interruption_notification(
+                            notif,
+                            &state,
+                            &stream,
+                            &events,
+                            &callback_ticks,
+                        );
                     }));
                     if outcome.is_err() {
                         crate::mw_log!(
@@ -601,9 +760,10 @@ mod imp {
                 let state = Arc::clone(&state);
                 let stream = Arc::clone(&stream);
                 let events = Arc::clone(&events);
+                let callback_ticks = Arc::clone(&callback_ticks);
                 let block = RcBlock::new(move |_: NonNull<NSNotification>| {
                     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-                        handle_became_active(&state, &stream, &events);
+                        handle_became_active(&state, &stream, &events, &callback_ticks);
                     }));
                     if outcome.is_err() {
                         crate::mw_log!(
@@ -628,11 +788,18 @@ mod imp {
                 let state = Arc::clone(&state);
                 let stream = Arc::clone(&stream);
                 let events = Arc::clone(&events);
+                let callback_ticks = Arc::clone(&callback_ticks);
                 let block = RcBlock::new(move |notif: NonNull<NSNotification>| {
                     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
                         // SAFETY: OS が有効な NSNotification を渡してくる(この block の契約)。
                         let notif = unsafe { notif.as_ref() };
-                        handle_route_change_notification(notif, &state, &stream, &events);
+                        handle_route_change_notification(
+                            notif,
+                            &state,
+                            &stream,
+                            &events,
+                            &callback_ticks,
+                        );
                     }));
                     if outcome.is_err() {
                         crate::mw_log!(
@@ -685,6 +852,7 @@ mod imp {
         state: &Mutex<InterruptionState>,
         stream: &cpal::Stream,
         events: &EventQueue,
+        callback_ticks: &AtomicU64,
     ) {
         let Some(kind) = interruption_type(notif) else {
             return;
@@ -709,7 +877,13 @@ mod imp {
             let attempt = guard.needs_recovery_attempt();
             drop(guard);
             if attempt {
-                attempt_recovery(state, stream, events, RecoveryTrigger::InterruptionEnded);
+                attempt_recovery(
+                    state,
+                    stream,
+                    events,
+                    callback_ticks,
+                    RecoveryTrigger::InterruptionEnded,
+                );
             } else {
                 events.push_side_channel(Event::AudioInterruptionEnded { recovered: false });
             }
@@ -745,6 +919,7 @@ mod imp {
         state: &Mutex<InterruptionState>,
         stream: &cpal::Stream,
         events: &EventQueue,
+        callback_ticks: &AtomicU64,
     ) {
         let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
         let previous_state = *guard;
@@ -760,6 +935,7 @@ mod imp {
                 state,
                 stream,
                 events,
+                callback_ticks,
                 RecoveryTrigger::AppBecameActive { previous_state },
             );
         }
@@ -770,6 +946,7 @@ mod imp {
         state: &Mutex<InterruptionState>,
         stream: &cpal::Stream,
         events: &EventQueue,
+        callback_ticks: &AtomicU64,
     ) {
         // 通知を受け取った事実そのものを reason の解釈より前にログする。以前は
         // `route_change_reason` が `None` を返すとログより先に `return` していたため、
@@ -799,6 +976,7 @@ mod imp {
                 state,
                 stream,
                 events,
+                callback_ticks,
                 RecoveryTrigger::RouteChange { reason },
             );
         }
@@ -856,37 +1034,102 @@ mod imp {
         RouteChange { reason: RouteChangeReason },
     }
 
-    /// セッション再アクティブ化 + ストリーム再始動を試みる。
+    /// セッション再アクティブ化 + ストリーム再始動を試み、**音声コールバックが実際に
+    /// 前進したか**を実測してから成否を判定する。
     ///
     /// `stream.play()` だけでは復帰しない(モジュール doc の「実機バグの原因」参照:
     /// cpal 0.18.1 の内部 `playing` フラグが OS 主導の停止に追随しないため、まず
     /// `pause()` でフラグを倒してから `play()` を呼ぶ)。
     ///
-    /// `trigger` と `stream.play()` の成否は必ずログへ出す——実機で「succeeded のログは
-    /// 出ているのに無音」であれば、この関数自体は正常に動いており原因は別の層にあると
-    /// 切り分けられる(モジュール doc「追記: `DidBecomeActive` 安全網の前提が崩れていた
-    /// ケース」の観測性節参照)。
+    /// 🔴 **`stream.play()` が `Ok` を返しても実際には無音のままのケースが実機で
+    /// 確認された**(モジュール doc「追記: `pause()`→`play()` が Ok を返しても無音の
+    /// ままだったケース」参照)。`Result::Ok` は「`AudioOutputUnitStart` の呼び出し
+    /// 自体がエラーを返さなかった」ことしか意味せず、コールバックが実際に再開したかは
+    /// 何も保証しない。そのためこの関数は `play()` の戻り値を成否判定に使わない——
+    /// `CpalBackend` が持つ単調増加カウンタ `callback_ticks`(このカウンタの意味は
+    /// `cpal_backend.rs::CpalBackend::callback_ticks` のdoc参照)を `pause()`→`play()`
+    /// の前後で比較し、進んでいなければ [`confirm_recovery_progress`] が
+    /// `pause()`→`play()` を呼び直しながら段階的に(`RECOVERY_WAIT_SCHEDULE_MS`)
+    /// 再確認する。
+    ///
+    /// **待機は `std::thread::sleep`(ブロッキング)。** この経路は音声スレッドではなく
+    /// 通知センターの observer ブロックを実行する非リアルタイムスレッドなので §5.3 の
+    /// 対象外(`ios_session::configure()` の呼び出しと同じ扱い。モジュール doc「パニック
+    /// 安全性」節参照)。ただし**全ステップ空振りした最悪ケースでは、このスレッドを
+    /// 合計 370ms(= `RECOVERY_WAIT_SCHEDULE_MS` の総和)ブロックする**——音声スレッドや
+    /// UI スレッドをブロックするわけではないため実害は無いと判断したが、観測用の
+    /// ヒッチが出うることは明記しておく。**復帰が1回目で確認できる通常ケースでは
+    /// 20ms しか待たない**ため、頻繁に起きるルート変化・割り込み終了のたびに
+    /// 370msのヒッチが出るわけではない。
+    ///
+    /// `trigger`・`stream.play()` の成否・実測による最終判定は必ずログへ出す——
+    /// 「`play()` は成功したが実測では確認できなかった」ケースをログだけで判別できる
+    /// ようにする(モジュール doc「追記: `DidBecomeActive` 安全網の前提が崩れていた
+    /// ケース」の観測性節、および今回の追記の両方を踏襲)。
     fn attempt_recovery(
         state: &Mutex<InterruptionState>,
         stream: &cpal::Stream,
         events: &EventQueue,
+        callback_ticks: &AtomicU64,
         trigger: RecoveryTrigger,
     ) {
         crate::mw_log!("[mw-backend] ios_interruption: attempting recovery (trigger={trigger:?})");
+
+        // 1回目の pause()→play() の前に読んでおく。この値と比較してカウンタが
+        // 進んだかどうかで「本当に鳴り出したか」を判定する(`play()` の戻り値だけでは
+        // 分からない——上のdoc参照)。
+        let ticks_before = callback_ticks.load(Ordering::Relaxed);
+
         crate::ios_session::configure();
-        let _ = stream.pause();
-        let success = stream.play().is_ok();
-        if success {
-            crate::mw_log!(
-                "[mw-backend] ios_interruption: stream restart succeeded (pause+play, \
-                 trigger={trigger:?})"
-            );
-        } else {
-            crate::mw_log!(
-                "[mw-backend] ios_interruption: stream restart failed (stream.play() returned \
-                 Err, trigger={trigger:?})"
-            );
+        if let Err(err) = stream.pause() {
+            crate::mw_log!("[mw-backend] ios_interruption: stream.pause() returned Err: {err}");
         }
+        match stream.play() {
+            Ok(()) => crate::mw_log!(
+                "[mw-backend] ios_interruption: stream.play() returned Ok (pause+play, \
+                 trigger={trigger:?}); confirming via callback progress"
+            ),
+            Err(err) => crate::mw_log!(
+                "[mw-backend] ios_interruption: stream.play() returned Err: {err} \
+                 (trigger={trigger:?}); still confirming via callback progress in case a \
+                 retry recovers"
+            ),
+        }
+
+        let outcome = confirm_recovery_progress(
+            ticks_before,
+            || callback_ticks.load(Ordering::Relaxed),
+            || {
+                // 空振り: pause()→play() を呼び直す。既に停止/再生中のユニットへ
+                // 呼んでも安全というのが CoreAudio の一般的な契約(モジュール doc
+                // 「実機バグの原因」参照)なので、戻り値は無視してよい——最終的な
+                // 成否は `confirm_recovery_progress` の実測で決まる。
+                let _ = stream.pause();
+                let _ = stream.play();
+            },
+            |wait_ms| std::thread::sleep(Duration::from_millis(wait_ms)),
+        );
+
+        let success = match outcome {
+            Some((attempt, waited_ms)) => {
+                crate::mw_log!(
+                    "[mw-backend] ios_interruption: stream restart confirmed by callback \
+                     progress (attempt={attempt}, waited={waited_ms}ms, trigger={trigger:?})"
+                );
+                true
+            }
+            None => {
+                let total_ms: u64 = RECOVERY_WAIT_SCHEDULE_MS.iter().sum();
+                crate::mw_log!(
+                    "[mw-backend] ios_interruption: 🔴 stream restart NOT confirmed — callback \
+                     did not advance after {total_ms}ms across {attempts} attempts \
+                     (trigger={trigger:?}); the cpal stream likely needs to be rebuilt (M3 \
+                     design proper)",
+                    attempts = RECOVERY_WAIT_SCHEDULE_MS.len(),
+                );
+                false
+            }
+        };
 
         let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
         *guard = guard.on_recovery_attempted(success);
@@ -924,7 +1167,9 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
-    use super::{InterruptionState, RouteChangeReason};
+    use super::{
+        InterruptionState, RECOVERY_WAIT_SCHEDULE_MS, RouteChangeReason, confirm_recovery_progress,
+    };
 
     /// 依頼書が明示した最小シナリオ:「停止した → 再開要求 → 再開した」。
     #[test]
@@ -1213,5 +1458,103 @@ mod tests {
 
         let state = state.on_app_became_active();
         assert_eq!(state, InterruptionState::RecoveryPending);
+    }
+
+    // --- `confirm_recovery_progress`(実機 R24 の修正。モジュール doc「追記:
+    // `pause()`→`play()` が Ok を返しても無音のままだったケース」参照)---
+    //
+    // ここは CoreAudio に一切触れない純粋なロジックなので、`cpal::Stream`/`AtomicU64`
+    // すら使わずクロージャだけで実機の「カウンタが進む/進まない」を模擬できる
+    // (`InterruptionState`/`RouteChangeReason` のテストと同じ設計思想)。
+
+    /// 依頼書が明示した最小シナリオ1つ目:「成功が1回目に来る」——1回目の
+    /// `pause()`→`play()`(呼び出し側が既に済ませている前提)の結果が、最初の待機
+    /// (`RECOVERY_WAIT_SCHEDULE_MS[0]` = 20ms)の直後に確認できるケース。
+    /// 追加の `retry` は一度も呼ばれないこと(=通常時のコストが20ms待つだけで
+    /// 済むこと)も合わせて固定化する。
+    #[test]
+    fn confirm_recovery_progress_succeeds_on_the_first_check_without_retrying() {
+        let ticks_before = 41u64;
+        // 1回目の pause()→play()(呼び出し側が既に済ませた分)で既に進んでいた、
+        // というシナリオ。
+        let ticks_now = ticks_before + 1;
+        let mut retry_calls = 0u32;
+        let mut waits = Vec::new();
+
+        let outcome = confirm_recovery_progress(
+            ticks_before,
+            || ticks_now,
+            || retry_calls += 1,
+            |wait_ms| waits.push(wait_ms),
+        );
+
+        assert_eq!(outcome, Some((1, RECOVERY_WAIT_SCHEDULE_MS[0])));
+        assert_eq!(retry_calls, 0, "1回目で確認できたら追加の再試行は不要");
+        assert_eq!(waits, vec![RECOVERY_WAIT_SCHEDULE_MS[0]]);
+    }
+
+    /// 依頼書が明示した最小シナリオ2つ目:「成功が途中(最後より前)に来る」——
+    /// 最初の2ステップは空振りし、3回目の再試行後にようやくカウンタが進むケース。
+    /// 累計待機時間・`retry` の呼び出し回数(2回)も合わせて固定化する。
+    #[test]
+    fn confirm_recovery_progress_succeeds_after_a_couple_of_retries() {
+        let ticks_before = 100u64;
+        // read_ticks の呼び出し回数で「今どのステップの確認中か」を数える:
+        // 1回目(index 0, 追加retry無し)・2回目(index 1, retry後)は空振り、
+        // 3回目(index 2, retry後)で進む。
+        let mut read_calls = 0u32;
+        let mut retry_calls = 0u32;
+
+        let outcome = confirm_recovery_progress(
+            ticks_before,
+            || {
+                read_calls += 1;
+                if read_calls < 3 {
+                    ticks_before
+                } else {
+                    ticks_before + 1
+                }
+            },
+            || retry_calls += 1,
+            |_| {},
+        );
+
+        let expected_waited: u64 = RECOVERY_WAIT_SCHEDULE_MS[..3].iter().sum();
+        assert_eq!(outcome, Some((3, expected_waited)));
+        assert_eq!(
+            retry_calls, 2,
+            "3回目の確認に到達するまでに2回 retry するはず"
+        );
+    }
+
+    /// 依頼書が明示した最小シナリオ3つ目:「最後まで確認できない」——実機 R24 の
+    /// ログのうち、もし2回目の `AppBecameActive` 経由の再試行も効かなかったら、
+    /// という想定シナリオに対応する。スケジュールを最後まで使い切り、`None` を返し、
+    /// 呼び出し側が `InterruptionState::RecoveryFailed` として扱えるようにする。
+    #[test]
+    fn confirm_recovery_progress_gives_up_after_exhausting_the_schedule() {
+        let ticks_before = 7u64;
+        let mut retry_calls = 0u32;
+        let mut waits = Vec::new();
+
+        let outcome = confirm_recovery_progress(
+            ticks_before,
+            || ticks_before, // 一度も進まない
+            || retry_calls += 1,
+            |wait_ms| waits.push(wait_ms),
+        );
+
+        assert_eq!(outcome, None);
+        assert_eq!(
+            retry_calls,
+            RECOVERY_WAIT_SCHEDULE_MS.len() as u32 - 1,
+            "1回目(index 0)は追加retry無しなので、retryはスケジュール長-1回のはず"
+        );
+        assert_eq!(waits, RECOVERY_WAIT_SCHEDULE_MS.to_vec());
+        assert_eq!(
+            waits.iter().sum::<u64>(),
+            370,
+            "合計待機時間は依頼書の目安どおり370ms"
+        );
     }
 }
