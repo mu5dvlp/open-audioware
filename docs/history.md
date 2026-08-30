@@ -22,6 +22,77 @@
 
 ## 作業記録
 
+#### 2026-08-30(middleware: R24「`pause()`→`play()` が Ok でも無音」—— 復帰確認を実測に置き換え)
+
+**R13 の修正(`NewDeviceAvailable` も復帰対象に追加)を実機で試した結果、新しい実機報告
+その4が来た。** 今度は Bluetooth の**切断**(`OldDeviceUnavailable`、以前からある経路)で、
+ログ上は復帰に成功しているのに実際には無音のままだった:
+
+```text
+[mw-backend] output stream error: Audio route changed
+[mw-backend] AVAudioSession route change notification received
+[mw-backend] AVAudioSession route changed (reason=OldDeviceUnavailable)
+[mw-backend] ios_interruption: attempting recovery (trigger=RouteChange { reason: OldDeviceUnavailable })
+[mw-backend] AVAudioSession configured: sample_rate=48000 Hz, io_buffer=5.000 ms, output_latency=17.917 ms, output_channels=2
+[mw-backend] ios_interruption: stream restart succeeded (pause+play, trigger=RouteChange { reason: OldDeviceUnavailable })   ← 「成功」ログなのに無音
+-> applicationDidEnterBackground
+[mw-backend] app entered background (previous_state=Recovered); will attempt recovery on next activation
+-> applicationDidBecomeActive
+[mw-backend] app became active while unresolved (previous_state=Backgrounded); attempting recovery
+[mw-backend] ios_interruption: stream restart succeeded (pause+play, trigger=AppBecameActive { previous_state: Backgrounded })   ← これで音が戻った
+```
+
+🔴 **同じ `pause()`→`play()` 呼び出しが、1回目は空振り・2回目(バックグラウンド往復後)は
+効いた。** AudioUnit 自体は死んでおらず、`AudioOutputUnitStart` が実際に効果を持つまでの
+タイミングの問題である可能性が高いと判断した(cpal 自身はルート変化時に `AudioUnit`/
+`playing` フラグへ一切触れないことは既に確認済みなので、二重処理ではない)。
+
+**なぜ戻り値だけでは不十分か**: `attempt_recovery` は `stream.play().is_ok()` だけを
+成否として扱っていた。`Result::Ok` は「`AudioOutputUnitStart` 呼び出し自体がエラーを
+返さなかった」ことしか意味せず、コールバックが実際に再開したかは何も保証しない。
+今回のログはこれが乖離した実例そのもの——1回目は `Ok` だが無音のまま
+`InterruptionState::Recovered` に遷移し、直後の `DidBecomeActive` は既存ガード
+(`Recovered` では何もしない)に阻まれて再試行しない。ユーザーがたまたまホームへ
+往復した(R12 の安全網を踏んだ)から音が戻っただけで、前面に居続けたら直らなかったはず。
+「保険を足した」(R12/R13 のガード追加)ことと「保険が前提から独立している」ことは
+別物、という教訓がここでも成立していた——今回の前提は「`play()` が `Ok` を返せば
+鳴っている」であり、これ自体が検証されていなかった。
+
+**採った方法: 推測を重ねず、コールバックの前進を実測する。**
+
+1. `crates/mw-backend/src/cpal_backend.rs`: `CpalBackend` に単調増加カウンタ
+   `callback_ticks: Arc<AtomicU64>` を追加。音声コールバック内で `fetch_add(1,
+   Relaxed)` するだけ(アロケーション・ロック無し、§5.3 適合)。`close()` で
+   リセットし、`build_output_stream` と `ios_interruption::Watcher::new` へ
+   `Arc` を共有する。
+2. `crates/mw-backend/src/ios_interruption.rs`: `attempt_recovery` を
+   「`configure()`→`pause()`→`play()` の前に `callback_ticks` を読む → 短い待機の後に
+   進んだか確認 → 進んでいなければ `pause()`→`play()` をやり直して待機を伸ばしながら
+   再確認(20ms→50ms→100ms→200ms、合計370ms上限)」という形に変更した。
+   全部空振りしたら初めて `RecoveryFailed` として扱う——これで次の `DidBecomeActive`
+   や新しいルート変化・割り込みで自動再試行される(ユーザーの手動ホーム往復に
+   頼らない)。
+3. 判定ロジック(`RECOVERY_WAIT_SCHEDULE_MS` 定数 + `confirm_recovery_progress`
+   関数)は `InterruptionState`/`RouteChangeReason` と同じ設計に倣い、CoreAudio に
+   一切依存しない純粋な形へ切り出した。副作用(`pause()`→`play()` の呼び直し・
+   `std::thread::sleep`・カウンタ読み出し)はすべてクロージャで注入するため、
+   macOS でも単体テストで固定化できる(成功が1回目/途中/最後まで来ない、の3ケース)。
+4. ログを強化: 復帰確認できた場合は試行回数・待機ms・トリガーを、確認できなかった
+   場合は 🔴 付きで「コールバックが再開しなかった = cpal ストリームの作り直しが要る
+   (M3 の設計本体)」と読める行を出す。
+
+**待機はブロッキング(`std::thread::sleep`)だが、observer ブロックを実行する
+非リアルタイムスレッド(音声スレッドではない)なので §5.3 の対象外。** 最悪ケース
+(全ステップ空振り)では 370ms このスレッドを占有するが、通常の1回目で確認できる
+ケースでは 20ms しか待たない。
+
+**検証**: `cargo fmt --all -- --check` 緑 / `cargo clippy --workspace --all-targets
+-- -D warnings` 警告0(macOS ホスト、`aarch64-apple-ios` ターゲットの両方で確認) /
+`cargo test --workspace` **238/238 緑**(mw-backend 20→**23**〔新規3件〕/ mw-core 162 /
+mw-core realtime_safety 1 / mw-ffi 52)。**ローカルで緑でも CI(GitHub Actions)を
+実際に通した証拠にはならない**——ネイティブバイナリの再ビルド・実機確認はこの
+コミットの範囲外(別途行う)。
+
 #### 2026-08-29(middleware: R12 の実機確認 + R13「Bluetooth 再接続で無音」)
 
 **R12 は実機ログで解決を確認した。しかも「たまたま」でないことまで確定した。**
