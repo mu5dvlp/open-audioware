@@ -5,14 +5,49 @@
 //! バイナリ全体)に適用されるため、専用の統合テストファイルとして分離してある
 //! (`mw-core` の他ユニットテストと同じバイナリに混ぜない)。
 //!
-//! 手法: `TRACKING` フラグが立っている間だけアロケーション/デアロケーション回数を数える。
-//! `Renderer::render`(= 音声コールバック相当の経路)呼び出しの前後だけフラグを立てることで、
+//! 手法: **このスレッドの thread-local な `TRACKING` フラグ**が立っている間だけ
+//! アロケーション/デアロケーション回数を数える。`Renderer::render`(= 音声コールバック
+//! 相当の経路)呼び出しの前後だけ [`RenderTrackingGuard`] でフラグを立てることで、
 //! セットアップ側(ボイスコマンドの用意、バッファ確保等)のアロケーションを除外し、
 //! 音声スレッド経路そのものだけを検証する。
+//!
+//! # なぜ thread-local か(CI フレークの真因、2026-08-29 発生・実測で確定)
+//!
+//! 当初 `TRACKING` は **プロセス全体で共有される `AtomicBool`** だった。これだと
+//! 計測ウィンドウ中に**別スレッドが行った確保も無差別に数えてしまう**——CI
+//! (ubuntu-24.04 ランナー)でだけ不定期に `left: 4 right: 0` で落ちるフレークの
+//! 原因はこれだった。ローカル(macOS / docker `rust:1.98` / docker `ubuntu:24.04` +
+//! rustup 1.98.0)で一度も再現しなかったのは、CI ランナーの方がスレッド生成・
+//! スケジューリングの背景ノイズ(テストランナー自体のスレッドプール等)が多く、
+//! 計測ウィンドウとたまたま重なる確率が高かったためと考えられる。
+//!
+//! もう一つの仮説(遅延初期化された `Mutex` 等の未ウォーム経路が BGM 側に増えた)は、
+//! 調査の結果**採らなかった**——音声コールバック経路(`Mixer::render` 以下)には
+//! `event.rs::EventQueue::push_side_channel` 用の `Mutex` 以外の遅延初期化状態が無く、
+//! かつこの `Mutex` は `push_realtime`(音声スレッド専用経路)からは触れられない
+//! (`event.rs` モジュール doc 参照)。しかも BGM 側の初回 `render` 呼び出しは
+//! このテストで元から計測対象外(`renderer.render(&mut warmup, 0)` によるウォームアップ、
+//! 下記)になっており、M4-3 の時点で既にこの対策が入っていたにもかかわらず CI で
+//! 発生したことも、原因が BGM 固有の未ウォーム経路ではないことの傍証になる。
+//!
+//! 真因を測定で確定させるため、[`render_tracking_is_isolated_from_concurrent_background_allocation`]
+//! で「計測ウィンドウ中、バックグラウンドスレッドが確保し続けていても
+//! カウントは0のまま」であることを回帰テストとして固定化した。このテストは
+//! **旧方式(プロセス全体で共有する `AtomicBool`)に戻すと実際に落ちる**ことを
+//! 手元で確認済み(`docs/history.md` 参照)。
+//!
+//! thread-local 化により、計測用のグローバル状態(`ALLOC_COUNT`/`DEALLOC_COUNT`)は
+//! 依然としてプロセス全体で共有されるが、**加算するかどうかの判定が呼び出しスレッド
+//! ごとに独立する**ため、複数の `#[test]` 関数が並行して自分自身の計測ウィンドウを
+//! 持てるようになった(各テストは計測開始直前・直後のカウンタ値の差分〔delta〕を見る
+//! ことで、他のテストが同時に計測していても正しく動く——お互いのウィンドウで
+//! 起きているのは実際には「0 加算」なので、足し合わせても 0 のままのため)。
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread;
 
 use mw_core::{
     CHANNELS, Command, Config, DecodeError, Event, MusicDecoder, MusicState, Renderer, ScheduledSe,
@@ -21,29 +56,54 @@ use mw_core::{
 
 struct CountingAllocator;
 
-static TRACKING: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    /// このスレッドが現在「レンダー経路の計測ウィンドウ」の中にいるかどうか。
+    /// プロセス全体で共有する `AtomicBool` だった旧方式が CI フレークの真因だった
+    /// ため(上のモジュール doc 参照)、thread-local にしてある——他スレッドの
+    /// 確保・解放を一切拾わない。
+    static TRACKING: Cell<bool> = const { Cell::new(false) };
+}
 static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
 static DEALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// [`TRACKING`] を RAII で立て下げするガード。`new()` で自スレッドのフラグを立て、
+/// `Drop` で必ず下ろす(途中の `assert!` 失敗等でパニックしてもフラグが立ちっぱなしに
+/// ならない——`Drop` はパニック解放(unwind)の途中でも走る)。
+struct RenderTrackingGuard;
+
+impl RenderTrackingGuard {
+    fn new() -> Self {
+        TRACKING.with(|t| t.set(true));
+        RenderTrackingGuard
+    }
+}
+
+impl Drop for RenderTrackingGuard {
+    fn drop(&mut self) {
+        TRACKING.with(|t| t.set(false));
+    }
+}
+
 // SAFETY: すべての呼び出しをそのまま `System` へ委譲するだけの薄いラッパ。
-// 追加の状態はアトミックカウンタのみで、`GlobalAlloc` の安全性契約に影響しない。
+// 追加の状態はアトミックカウンタと thread-local フラグのみで、`GlobalAlloc` の
+// 安全性契約に影響しない。
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if TRACKING.load(Ordering::SeqCst) {
+        if TRACKING.with(Cell::get) {
             ALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
         }
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if TRACKING.load(Ordering::SeqCst) {
+        if TRACKING.with(Cell::get) {
             DEALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
         }
         unsafe { System.dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if TRACKING.load(Ordering::SeqCst) {
+        if TRACKING.with(Cell::get) {
             ALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
         }
         unsafe { System.realloc(ptr, layout, new_size) }
@@ -265,27 +325,35 @@ fn render_path_never_allocates_or_deallocates() {
     let mut saw_underrun = false;
     let mut saw_clipper_engaged = false;
 
-    TRACKING.store(true, Ordering::SeqCst);
-    let mut host_time_ns = 0u64;
-    for _ in 0..200 {
-        renderer.render(&mut buffer, host_time_ns);
-        host_time_ns += buffer_duration_ns;
+    // delta(計測開始直前/直後の差分)で判定する: `ALLOC_COUNT`/`DEALLOC_COUNT` は
+    // プロセス全体で共有するグローバルカウンタなので、cargo test がこのファイル内の
+    // 他の `#[test]`(下記の回帰テスト)を並行実行していても、絶対値ではなく差分を
+    // 見ることで正しく動く(お互いの計測ウィンドウは「自スレッドの加算だけ」を
+    // 見ており、期待値は両方とも0なので足し合わせても0のまま)。
+    let alloc_before = ALLOC_COUNT.load(Ordering::SeqCst);
+    let dealloc_before = DEALLOC_COUNT.load(Ordering::SeqCst);
+    {
+        let _tracking = RenderTrackingGuard::new();
+        let mut host_time_ns = 0u64;
+        for _ in 0..200 {
+            renderer.render(&mut buffer, host_time_ns);
+            host_time_ns += buffer_duration_ns;
 
-        events.drain(64, |event| match event {
-            Event::Underrun { .. } => saw_underrun = true,
-            Event::ClipperEngaged => saw_clipper_engaged = true,
-            _ => {}
-        });
+            events.drain(64, |event| match event {
+                Event::Underrun { .. } => saw_underrun = true,
+                Event::ClipperEngaged => saw_clipper_engaged = true,
+                _ => {}
+            });
+        }
     }
-    TRACKING.store(false, Ordering::SeqCst);
 
     assert_eq!(
-        ALLOC_COUNT.load(Ordering::SeqCst),
+        ALLOC_COUNT.load(Ordering::SeqCst) - alloc_before,
         0,
         "audio callback path must not allocate (§5.3)"
     );
     assert_eq!(
-        DEALLOC_COUNT.load(Ordering::SeqCst),
+        DEALLOC_COUNT.load(Ordering::SeqCst) - dealloc_before,
         0,
         "audio callback path must not deallocate — Arc<SoundData> release must happen \
          on the game thread via the reclaim queue, not inside the callback"
@@ -306,5 +374,108 @@ fn render_path_never_allocates_or_deallocates() {
     }
 
     // 後片付け(トラッキング外)。
+    reclaim.drain();
+}
+
+/// 回帰テスト: CI(ubuntu-24.04)で不定期に落ちていたフレークの真因を固定化する。
+///
+/// 計測ウィンドウ(=このスレッドの [`RenderTrackingGuard`] が生きている区間)の間、
+/// **別スレッドが確保・解放をひたすら回し続けていても**、レンダー経路の計測は
+/// 0 のままであることを確認する。
+///
+/// **旧方式(`TRACKING` がプロセス全体で共有する `AtomicBool` だった実装)へ
+/// 一時的に戻すと、このテストは実測で毎回落ちる**
+/// (`ALLOC_COUNT`/`DEALLOC_COUNT` が背景スレッドの確保分だけ非0になる)。
+/// これは実際の CI フレーク(`render_path_never_allocates_or_deallocates` が
+/// 「left: 4 right: 0」のような小さな非ゼロ値で落ちる)と同じ形の失敗であり、
+/// 「プロセス全体で共有するカウンタが他スレッドの確保を拾ってしまう」ことが
+/// 真因だったことの実測による裏取りになっている(詳細は `docs/history.md`)。
+#[test]
+fn render_tracking_is_isolated_from_concurrent_background_allocation() {
+    let config = Config {
+        preroll_ms: 1.0,
+        ..Config::default()
+    };
+    let (mut renderer, sender, mut reclaim, mut music_producer, _music_clock, _events, _bgm) =
+        Renderer::build(config, 48_000);
+
+    let mut decoder = UnboundedMusicDecoder { cursor: 0 };
+    music_producer
+        .pump(&mut decoder)
+        .expect("pump must succeed");
+    let mut warmup = vec![0.0f32; 4 * CHANNELS];
+    renderer.render(&mut warmup, 0); // Loading -> Ready(セットアップ、計測対象外)。
+    assert_eq!(renderer.music_state(), MusicState::Ready);
+    assert!(sender.send(Command::MusicPlayScheduled { host_time_ns: 0 }));
+
+    // バックグラウンドスレッド: このテストのレンダー計測とは無関係の、確保し続けるだけの
+    // スレッド。旧方式(プロセス全体で共有する `AtomicBool`)ならこのスレッドの確保も
+    // カウントへ混入してしまう。
+    let stop = Arc::new(AtomicBool::new(false));
+    let bg_iterations = Arc::new(AtomicUsize::new(0));
+    let bg_stop = Arc::clone(&stop);
+    let bg_counter = Arc::clone(&bg_iterations);
+    let handle = thread::spawn(move || {
+        while !bg_stop.load(Ordering::Relaxed) {
+            let v: Vec<u8> = Vec::with_capacity(64);
+            std::hint::black_box(&v);
+            drop(v);
+            bg_counter.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    // sleep には頼らない: バックグラウンドスレッドが実際に確保を回し始めた
+    // (=一定回数ループした)ことを、観測されたイテレーション数そのもので確認してから
+    // 計測ウィンドウへ入る。
+    while bg_iterations.load(Ordering::Relaxed) < 10_000 {
+        std::hint::spin_loop();
+    }
+
+    // `buffer` は計測ウィンドウの**外**で確保する(このテスト自身のセットアップであり、
+    // 計測対象の「レンダー経路」そのものではない)。guard の内側に置くと `Vec` 自身の
+    // 確保/解放を計測してしまい「レンダー経路がアロケーションした」という誤検出になる
+    // (作成時に実際にこの取り違えで `left: 1` の誤検出を踏んだため、明示的に警告として残す)。
+    let mut buffer = vec![0.0f32; 512 * CHANNELS];
+    let buffer_duration_ns = 512u64 * 1_000_000_000 / 48_000;
+
+    let alloc_before = ALLOC_COUNT.load(Ordering::SeqCst);
+    let dealloc_before = DEALLOC_COUNT.load(Ordering::SeqCst);
+    let bg_iterations_before = bg_iterations.load(Ordering::Relaxed);
+    {
+        let _tracking = RenderTrackingGuard::new();
+        let mut host_time_ns = 0u64;
+        for _ in 0..200 {
+            renderer.render(&mut buffer, host_time_ns);
+            host_time_ns += buffer_duration_ns;
+        }
+    }
+    let alloc_after = ALLOC_COUNT.load(Ordering::SeqCst);
+    let dealloc_after = DEALLOC_COUNT.load(Ordering::SeqCst);
+    let bg_iterations_after = bg_iterations.load(Ordering::Relaxed);
+
+    stop.store(true, Ordering::Relaxed);
+    handle
+        .join()
+        .expect("background allocator thread must not panic");
+
+    // このテスト自体が無意味(背景スレッドがたまたま計測ウィンドウ中に止まっていた)
+    // ではないことを確認する: ウィンドウの間も背景スレッドは確保を回し続けていたはず。
+    assert!(
+        bg_iterations_after > bg_iterations_before,
+        "background thread must have kept allocating throughout the measured window"
+    );
+    assert_eq!(
+        alloc_after - alloc_before,
+        0,
+        "render path allocation tracking must stay isolated to this thread and must not \
+         pick up a concurrently running background thread's allocations"
+    );
+    assert_eq!(
+        dealloc_after - dealloc_before,
+        0,
+        "render path deallocation tracking must stay isolated to this thread and must not \
+         pick up a concurrently running background thread's deallocations"
+    );
+
     reclaim.drain();
 }

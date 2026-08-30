@@ -22,6 +22,70 @@
 
 ## 作業記録
 
+#### 2026-08-30(middleware: CI で4カウント落ちたフレークの真因と対策)
+
+**`crates/mw-core/tests/realtime_safety.rs` の `render_path_never_allocates_or_deallocates` が
+M4-3(`55c7ceb`)の push で CI(ubuntu-24.04 ランナー)だけ不定期に落ちていた**
+(`left: 4 right: 0` のような小さな非ゼロ値。同じコミットの再実行では緑。ローカル
+〔macOS / docker `rust:1.98` / docker `ubuntu:24.04` + rustup 1.98.0〕では一度も
+再現しなかった。詳細は移設前の `HANDOFF.md` の記録を参照)。
+
+**真因を推測ではなく計測で確定させた。** 疑っていた2つの仮説のうち:
+
+- **仮説1(採用)**: 計測フラグ `TRACKING` とカウンタがプロセス全体で共有される
+  `static AtomicBool`/`AtomicUsize` だったため、計測ウィンドウ中に**別スレッドが
+  行った確保・解放まで無差別に数えてしまう**。
+- **仮説2(棄却)**: 遅延初期化(`Mutex` の初回ロック等)の未ウォーム経路が BGM 側に
+  増えた。音声コールバック経路(`Mixer::render` 以下)には
+  `event.rs::EventQueue::push_side_channel` 用の `Mutex` 以外に遅延初期化状態が無く、
+  この `Mutex` は音声スレッド専用の `push_realtime` からは触れられない。しかも
+  BGM 側の初回 `render` 呼び出しは M4-3 の時点で既に計測対象外(ウォームアップ済み)に
+  なっていたため、この仮説は当初から可能性が低いと判断していた。
+
+**仮説1を実測で裏取りした手順**: テストファイルをコード改変で一時的に旧方式
+(`TRACKING` をプロセス全体の `AtomicBool` に戻す)に戻し、「バックグラウンドスレッドが
+確保し続けている状態でレンダー経路のカウントを取る」回帰テスト
+(`render_tracking_is_isolated_from_concurrent_background_allocation`、後述)を単独実行した
+ところ、**毎回確実に落ちた**(`left: 443243 right: 0` のように、背景スレッドの確保が
+まるごと数えられてしまう)。同じテストを新方式(thread-local)に戻すと確実に緑になった。
+これで「プロセス全体で共有するカウンタが他スレッドの確保を拾う」という仮説1の
+メカニズムが実際にこの形の失敗(小さな非ゼロ値からの逸脱)を引き起こすことを実測で確認した
+——CI で観測された `left: 4` も、同じメカニズムが軽い背景ノイズ(CI ランナー側の
+スレッド生成・スケジューリングの揺らぎ)で発生したものと整合する。
+
+**対策**: `TRACKING` を `thread_local! { static TRACKING: Cell<bool> }` にし、
+`RenderTrackingGuard`(RAII。`new()` で自スレッドのフラグを立て、`Drop` で必ず下ろす
+——`assert!` 失敗によるパニック解放中でも漏れない)経由でのみ立て下げする形にした。
+これにより「レンダー呼び出しを行っているスレッド自身の確保・解放だけ」を数えるようになり、
+他スレッド(テストランナー自体のスレッドプール、並走する別テスト、背景ノイズ)の
+確保を一切拾わなくなる。カウンタ本体(`ALLOC_COUNT`/`DEALLOC_COUNT`)はプロセス全体の
+`static` のままだが、各テストは計測開始直前/直後の**差分(delta)**を見るため、
+複数の `#[test]` が並行しても正しく動く。
+
+この修正は**テストファイル内で完結**しており、製品コード(`mw-core::src` 以下)は
+一切変更していない。
+
+**検証**(すべて実測。しきい値緩和・アサーション削除・`#[ignore]`・sleep によるごまかしは
+一切行っていない):
+
+- `cargo test --workspace`: **239 / 239 緑**(着手前 238 から +1。新規回帰テスト1件ぶん)
+- 対象テスト(新方式)を**250回連続実行(デフォルトの並行 `#[test-threads]` のまま)で
+  0失敗**(所要 約23秒)。加えて `render_path_never_allocates_or_deallocates` だけを
+  `--exact` で**220回連続実行して0失敗**(所要 約14秒)
+- 新しい回帰テスト `render_tracking_is_isolated_from_concurrent_background_allocation`
+  を追加。「バックグラウンドスレッドが確保を回し続けている間もレンダー経路の計測が
+  0のまま」であることを固定化する。旧方式(プロセス全体で共有する `AtomicBool`)へ
+  一時的に戻して単独実行すると `left: 443243 right: 0` で確実に落ちることを実測し、
+  新方式に戻すと確実に緑になることを確認済み(上記)
+- `make lint`(`cargo fmt --check` / `cargo clippy --workspace --all-targets -- -D warnings` /
+  `cargo deny check`)緑(`cargo deny` の重複クレート警告は既存かつ無関係の
+  `thiserror`/`bitflags` 等のバージョン重複で、今回の変更とは無関係)
+
+変更ファイル: `crates/mw-core/tests/realtime_safety.rs`(thread-local 化・
+`RenderTrackingGuard` 新設・回帰テスト追加・delta 判定への変更)、
+`crates/mw-core/CLAUDE.md`(検証手段の節を更新——「`#[test]` を1本だけに保つ」制約は
+thread-local 化により解消されたため)。
+
 #### 2026-08-30(middleware: R24「`pause()`→`play()` が Ok でも無音」—— 復帰確認を実測に置き換え)
 
 **R13 の修正(`NewDeviceAvailable` も復帰対象に追加)を実機で試した結果、新しい実機報告
