@@ -40,7 +40,24 @@ C ABI 境界。`mw-core` / `mw-backend` 両方に依存する唯一のクレー�
   **`music_bytes` ストレージと ID 空間は楽曲と共有する**——`mw_bgm_set` は同じ
   `get_music_bytes` を呼ぶだけで、専用のストレージ・ID 空間を新設していない
   (「デコード前の圧縮バイト列を保持する」という表現そのものへの分離であり、
-  どちらのボイスで鳴らすかとは無関係なため)。
+  どちらのボイスで鳴らすかとは無関係なため)。**M3(初期構築仕様『§6』案A)**で
+  Android(AAudio)切断からの内部再オープンを追加した——`command_sender`/
+  `reclaim_receiver`/`music_clock`/`bgm_state`/デコードスレッド一式は型を変えず、
+  `Instance::attempt_reopen(&mut self, ...)`(`handle::init`/`handle::shutdown` と
+  同じ、レジストリの `Mutex<Option<Instance>>` を直接ロックする `&mut Instance`
+  経路)がフィールドを単純代入で差し替える。復元用の追加フィールド
+  (`last_music_sound_id`/`last_music_loop`/`last_bgm_sound_id`/`last_bgm_loop`/
+  `bus_volumes`)と、再試行の可否を判定する `reopen: crate::reopen::ReopenPolicy`
+  を持つ。起点は `crate::handle::maybe_reopen(handle)`(`ffi.rs::mw_poll_events`
+  から呼ぶ。iOS/tvOS では `cfg` で丸ごと除去——`mw-backend::ios_interruption` の
+  既存経路と競合しないため)。設計判断・実機未検証の範囲は
+  `docs/history/04-2026-08-31.md`「M3 完了」参照。
+- `src/reopen.rs`(M3)— `ReopenPolicy`: 内部再オープンを**いつ試すか/いつ諦めるか**
+  だけを判定する、バックエンド呼び出しを一切含まない純粋な状態機械
+  (`mw-backend::ios_interruption::InterruptionState` と同じ設計方針)。バックオフ
+  スケジュール `REOPEN_BACKOFF_SCHEDULE_MS`(既定 `[250, 500, 1000, 2000, 4000]`ms、
+  合計6回試行で諦める。無限リトライはしない)。実際の副作用(`CpalBackend::close/
+  open`・コマンド再送)は持たず、`handle.rs::Instance::attempt_reopen` へ委譲する。
 - `src/decode_thread.rs` — 楽曲のデコードスレッド(M2-7)。`mw_core::stream` が
   意図的に持たないスレッドをここで1本立て、`mw_init`〜`mw_shutdown` の間
   生かし続ける。`mw_music_set` のたびに立て直すのではなく、

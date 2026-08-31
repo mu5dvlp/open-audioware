@@ -64,17 +64,21 @@
   単体テストで遷移を固定化してある(実機の割り込みそのものは自動テスト不可のため)。
   `mw_core::Event::AudioInterruptionBegan`/`AudioInterruptionEnded { recovered }`
   として `mw_poll_events` 経由で C# 側からも観測できる。iOS / tvOS 以外では no-op。
-  Android の AAudio disconnect は同じ経路では塞げていない(`docs/history.md` 2026-08-28
-  「M3 着手」参照——`Renderer` の再構築が要るため今回は見送り)。cpal の AAudio ホストは
-  切断を `err_fn`(`cpal_backend.rs::build_output_stream` の一般エラー通知経路)経由で
-  既に `Event::StreamError { reason: DeviceUnavailable }` として報告できている
-  (`classify_stream_error` の単体テストで固定化済み)——足りないのは通知ではなく、
-  それを受けて内部で再オープンする処理そのもの。AAudio の切断は ndk/AAudio の API 契約上
-  終端的(`AudioError::Disconnected` のドキュメント「the stream cannot be used after the
-  device is disconnected」)で、iOS のような同一ストリームへの `pause()`→`play()` 再試行は
-  原理的に効かない。2026-08-31 に設計を再調査し、`mw-ffi::handle::Instance` の所有モデル
-  再設計が要る案2つを報告して判断待ちで止めてある(`docs/history/03-2026-08-31.md`
-  「M3 最後の残り」参照)。
+  Android の AAudio disconnect は同じ経路では塞げない(iOS のような同一ストリームへの
+  `pause()`→`play()` 再試行は、AAudio の切断が ndk/AAudio の API 契約上終端的
+  〔`AudioError::Disconnected` のドキュメント「the stream cannot be used after the
+  device is disconnected」〕なため原理的に効かない)。cpal の AAudio ホストは切断を
+  `err_fn`(`cpal_backend.rs::build_output_stream` の一般エラー通知経路)経由で
+  `Event::StreamError { reason: DeviceUnavailable }` として報告し
+  (`classify_stream_error` の単体テストで固定化済み)、**それを受けての内部再オープン
+  (初期構築仕様『§6』案A)は `mw-ffi` 側に実装済み**(`crates/mw-ffi/src/reopen.rs`
+  ——バックオフ付きの再試行判定 `ReopenPolicy`。`crates/mw-ffi/src/handle.rs::
+  Instance::attempt_reopen` ——実際の `CpalBackend::close()`→`Renderer::
+  build_with_events()`→`CpalBackend::open()` と状態復元。`mw_poll_events`
+  〔`ffi.rs`〕から `#[cfg(not(any(target_os = "ios", target_os = "tvos")))]` で
+  ゲーティングして呼ぶため、iOS/tvOS ではこのモジュール自身の `ios_interruption`
+  経路と一切競合しない)。経緯・実装判断の詳細は `docs/history/04-2026-08-31.md`
+  「M3 完了」参照。⚠️ 実機(Android)での動作確認はまだ行っていない。
 
 - `underrun::OutputUnderrunTracker`(M3「アンダーラン検知・テレメトリ」)— 音声
   コールバックの間隔が想定より大きく開いたこと(「アンダーラン(の疑い)」)を検知する。
