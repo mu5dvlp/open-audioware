@@ -165,6 +165,33 @@ pub struct MwMusicPosition {
     pub generation: u32,
 }
 
+/// `mw_get_output_underrun_stats` が書き込む、出力コールバックのアンダーラン
+/// (の疑い)統計(初期構築仕様『§2』M3「アンダーラン検知・テレメトリ」)。
+/// blittable(`#[repr(C)]`)。
+///
+/// **`mw_core::Event::Underrun`(`mw_poll_events` 経由)とは別物。** あちらは
+/// 楽曲/BGM のデコードリングバッファ側のアンダーラン、こちらは音声コールバック
+/// 自体の間隔異常(OS 側出力バッファの枯渇の兆候)。詳細な違いは
+/// `mw_backend::underrun` モジュール doc / `mw_backend::Backend::output_underrun_count`
+/// のドキュメントを参照。
+///
+/// フィールドは `mw_backend::Backend` の `output_underrun_count` /
+/// `last_output_underrun_host_time_ns` / `consecutive_output_underrun_count` に
+/// 1:1で対応する。`MwMusicPosition` と同じ設計方針(Marshal を挟まず直接読める
+/// 構造体、GC アロケーションゼロ)。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MwOutputUnderrunStats {
+    /// 累計検知回数。
+    pub count: u64,
+    /// 直近に検知したコールバックのホスト単調時刻(ns)。`mw_host_time_ns()` と
+    /// 同じ時計。まだ1度も検知していなければ 0。
+    pub last_host_time_ns: u64,
+    /// 直近まで連続して検知した回数。検知されなかったコールバックが1回でも
+    /// 挟まると 0 に戻る。
+    pub consecutive_count: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +223,14 @@ mod tests {
     #[test]
     fn mw_music_position_size_is_32_bytes() {
         assert_eq!(std::mem::size_of::<MwMusicPosition>(), 32);
+    }
+
+    /// blittable であることの直接的な確認(`mw_music_position_size_is_32_bytes` と
+    /// 同じ流儀)。8/8/4 バイトのフィールド列は末尾の `consecutive_count`(4バイト)
+    /// の後に4バイトのパディングが入り、8バイト境界に揃って24バイトになる。
+    #[test]
+    fn mw_output_underrun_stats_size_is_24_bytes() {
+        assert_eq!(std::mem::size_of::<MwOutputUnderrunStats>(), 24);
     }
 
     #[test]

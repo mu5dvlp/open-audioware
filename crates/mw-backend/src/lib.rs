@@ -12,6 +12,7 @@ pub mod host_time;
 pub mod ios_interruption;
 pub mod ios_session;
 pub mod platform_log;
+pub mod underrun;
 
 pub use backend::{Backend, BackendError};
 pub use cpal_backend::CpalBackend;

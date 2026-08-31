@@ -241,6 +241,28 @@ impl Instance {
     pub fn log_output_latency_once(&self) {
         self.backend.log_output_latency_once();
     }
+
+    /// 出力コールバックのアンダーラン(の疑い)統計([`Backend::output_underrun_count`]
+    /// 等)を取得する(`mw_get_output_underrun_stats` が使う)。
+    ///
+    /// **`mw_core::Event::Underrun`(`mw_poll_events` 経由)とは別物。**
+    /// `mw_backend::underrun` モジュール doc / `crate::types::MwOutputUnderrunStats`
+    /// のドキュメント参照。
+    pub fn output_underrun_stats(&self) -> (u64, u64, u32) {
+        (
+            self.backend.output_underrun_count(),
+            self.backend.last_output_underrun_host_time_ns(),
+            self.backend.consecutive_output_underrun_count(),
+        )
+    }
+
+    /// 出力コールバックのアンダーラン(の疑い)を新たに検知していれば、その分だけ
+    /// ログへ出す(`CpalBackend::log_new_output_underruns` へ委譲)。
+    /// `mw_get_output_underrun_stats`(ゲームスレッド経路)から呼ぶこと。
+    /// コールバック内から呼んではいけない(`mw_log!` はアロケーションとロックを伴う)。
+    pub fn log_new_output_underruns(&self) {
+        self.backend.log_new_output_underruns();
+    }
 }
 
 /// ハンドルは 1 から始まる単調増加の不透明 ID。0 は「未割当」を意味する予約値として使わない

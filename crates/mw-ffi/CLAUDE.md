@@ -18,6 +18,9 @@ C ABI 境界。`mw-core` / `mw-backend` 両方に依存する唯一のクレー�
   `mw_music_get_position` の実引数型として現れ、そのフィールド `state:
   MwMusicState` を辿って `MwMusicState` も生成される(`event.rs::MwEvent`/
   `MwEventKind` と同じ仕掛け。詳細は `types.rs` の `MwMusicState` ドキュメント参照)。
+  M3 で `MwOutputUnderrunStats`(`#[repr(C)]`、blittable。`mw_get_output_underrun_stats`
+  の out 引数)を追加した——`MwMusicPosition` と同じ設計方針(count/last_host_time_ns/
+  consecutive_count の3値をひとまとめに返す)。
 - `src/handle.rs` — init/shutdown のグローバルレジストリ(`OnceLock<Mutex<Option<Instance>>>`)。
   ハンドルは不透明な `u64`(ポインタを C# に渡さない)。二重 init は同一ハンドルを返す
   (冪等)、無効ハンドルの shutdown はエラーコードで検出する。`Instance` は M1 で
@@ -122,6 +125,14 @@ mw_bgm_set_loop(handle, begin_frames, end_frames) -> MwResult
 
 mw_get_output_latency_ns(handle, out_ns: *mut u64) -> MwResult
     // 出力レイテンシの実測値(ns)。0 は「まだ不明」(コールバック未実行)
+
+mw_get_output_underrun_stats(handle, out: *mut MwOutputUnderrunStats) -> MwResult
+    // 出力コールバックのアンダーラン(の疑い)統計(初期構築仕様『§2』M3)。
+    // count(累計)/ last_host_time_ns(直近検知時刻、未検知なら0)/
+    // consecutive_count(直近まで連続した検知回数)。mw_poll_events の
+    // MwEventKind.Underrun(楽曲/BGM のデコードリングバッファ枯渇)とは別物——
+    // こちらは音声コールバック自体の間隔異常(OS 側出力バッファの枯渇の兆候)。
+    // 詳細は mw_backend::underrun モジュール doc 参照
 
 mw_poll_events(handle, buf: *mut MwEvent, cap: i32, out_dropped: *mut u32) -> i32
     // 初期構築仕様 §4.6。C → C# のコールバックはしない(M4)——C# 側が毎フレーム

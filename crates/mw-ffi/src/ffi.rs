@@ -17,7 +17,7 @@ use crate::event::MwEvent;
 use crate::handle as handle_registry;
 use crate::handle::{InitOutcome, ShutdownOutcome};
 use crate::result::MwResult;
-use crate::types::{MwBus, MwMusicPosition, MwMusicState, MwSoundMode};
+use crate::types::{MwBus, MwMusicPosition, MwMusicState, MwOutputUnderrunStats, MwSoundMode};
 
 /// ABI バージョン。ABI 互換の破壊は semver メジャーバージョンでのみ許可する(§4.8)。
 const ABI_VERSION: u32 = 1;
@@ -1251,6 +1251,65 @@ pub unsafe extern "C" fn mw_get_output_latency_ns(handle: u64, out_ns: *mut u64)
     }
 }
 
+/// 出力コールバックのアンダーラン(の疑い)統計を取得する(初期構築仕様『§2』M3
+/// 「アンダーラン検知・テレメトリ」)。
+///
+/// **`mw_poll_events` で読める `MwEventKind::Underrun` とは別物。** あちらは
+/// 楽曲/BGM のデコードリングバッファがデータ供給に追いつかず無音で埋めたことの
+/// 検知(M2)。こちらは音声コールバック自体の間隔が想定より開いたこと——OS 側の
+/// 出力バッファが実際に枯渇した(音が途切れた)ことの直接的な兆候、またはその
+/// 一歩手前の状態を示す検知(M3)。両者の関係・検知方法の詳細は
+/// `mw_backend::underrun` モジュール doc / [`MwOutputUnderrunStats`] のドキュメント
+/// を参照。
+///
+/// `out` には累計検知回数(`count`)・直近の検知時刻(`last_host_time_ns`、
+/// `mw_host_time_ns()` と同じ時計。未検知なら 0)・直近まで連続して検知した回数
+/// (`consecutive_count`)を書き込む。GC アロケーションゼロ。
+///
+/// あわせて、新たに検知した分があれば[`CpalBackend::log_new_output_underruns`]
+/// (`mw_backend::CpalBackend`)をこのゲームスレッド経路から呼ぶ(**コールバック内
+/// から呼んではいけない**——`mw_log!` はアロケーションとロックを伴うため、初期構築
+/// 仕様『§5.3』のリアルタイム安全性規約に抵触する。`mw_get_output_latency_ns` と
+/// 同じ配線パターン)。
+///
+/// # Safety
+/// `out` は書き込み可能な [`MwOutputUnderrunStats`] を指す有効なポインタである
+/// か、null でなければならない(null は書き込みを行わず `MwResult::ErrNullPointer`)。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mw_get_output_underrun_stats(
+    handle: u64,
+    out: *mut MwOutputUnderrunStats,
+) -> MwResult {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        if out.is_null() {
+            return MwResult::ErrNullPointer;
+        }
+        let result = handle_registry::with_instance(handle, |instance| {
+            instance.log_new_output_underruns();
+            instance.output_underrun_stats()
+        });
+        match result {
+            Some((count, last_host_time_ns, consecutive_count)) => {
+                // SAFETY: 上で null チェック済み。
+                unsafe {
+                    *out = MwOutputUnderrunStats {
+                        count,
+                        last_host_time_ns,
+                        consecutive_count,
+                    };
+                }
+                MwResult::Ok
+            }
+            None => MwResult::ErrInvalidHandle,
+        }
+    }));
+
+    match outcome {
+        Ok(result) => result,
+        Err(_) => MwResult::ErrPanic,
+    }
+}
+
 // --- M2-6: イベント通知 -----------------------------------------------------
 //
 // 初期構築仕様 §4.6(確定)/ §5.4(GC アロケーションゼロ)/ §2 M4(C → C# の
@@ -1628,6 +1687,29 @@ mod tests {
             unsafe { mw_get_output_latency_ns(handle, &mut latency_ns as *mut u64) },
             MwResult::Ok
         );
+
+        // 出力コールバックのアンダーラン(の疑い)統計。実デバイスの有無に関わらず
+        // 書き込み自体は成功し、このテストでは実際のコールバックに人工的な間隔異常を
+        // 混ぜていないので count は 0 のはず(アンダーラン検知そのものの単体テストは
+        // `mw_backend::underrun` — 実デバイス無しで「モックの」コールバック系列を
+        // 直接駆動して確認済み)。
+        let mut underrun_stats = MwOutputUnderrunStats {
+            count: 1,
+            last_host_time_ns: 1,
+            consecutive_count: 1,
+        };
+        assert_eq!(
+            unsafe {
+                mw_get_output_underrun_stats(
+                    handle,
+                    &mut underrun_stats as *mut MwOutputUnderrunStats,
+                )
+            },
+            MwResult::Ok
+        );
+        assert_eq!(underrun_stats.count, 0);
+        assert_eq!(underrun_stats.last_host_time_ns, 0);
+        assert_eq!(underrun_stats.consecutive_count, 0);
 
         // 楽曲バイト列を release しても SE 側は無事(ID 空間分離が効いていることの
         // 実ハンドル越しの確認、依頼書のテスト要件)。
@@ -2191,6 +2273,25 @@ mod tests {
     fn get_output_latency_ns_with_invalid_handle_is_invalid_handle_not_a_crash() {
         let mut out_ns = 0u64;
         let result = unsafe { mw_get_output_latency_ns(0xDEAD_BEEF_u64, &mut out_ns as *mut u64) };
+        assert_eq!(result, MwResult::ErrInvalidHandle);
+    }
+
+    #[test]
+    fn get_output_underrun_stats_rejects_null_out() {
+        let result = unsafe { mw_get_output_underrun_stats(1, std::ptr::null_mut()) };
+        assert_eq!(result, MwResult::ErrNullPointer);
+    }
+
+    #[test]
+    fn get_output_underrun_stats_with_invalid_handle_is_invalid_handle_not_a_crash() {
+        let mut out = MwOutputUnderrunStats {
+            count: 0,
+            last_host_time_ns: 0,
+            consecutive_count: 0,
+        };
+        let result = unsafe {
+            mw_get_output_underrun_stats(0xDEAD_BEEF_u64, &mut out as *mut MwOutputUnderrunStats)
+        };
         assert_eq!(result, MwResult::ErrInvalidHandle);
     }
 

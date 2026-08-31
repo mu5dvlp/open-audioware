@@ -67,6 +67,21 @@
   Android の AAudio disconnect は同じ経路では塞げていない(`docs/history.md` 2026-08-28
   「M3 着手」参照——`Renderer` の再構築が要るため今回は見送り)。
 
+- `underrun::OutputUnderrunTracker`(M3「アンダーラン検知・テレメトリ」)— 音声
+  コールバックの間隔が想定より大きく開いたこと(「アンダーラン(の疑い)」)を検知する。
+  **`mw_core::Event::Underrun`(楽曲/BGM のデコードリングバッファ枯渇の検知、M2)とは
+  別物**——こちらは音声コールバック自体の間隔異常で、OS 側出力バッファの実際の
+  枯渇の兆候を指す。cpal 自身のアンダーラン通知(`ErrorKind::Xrun`)は cpal 0.18.1
+  時点で本プロジェクトが使う3ホスト(macOS/iOS の `coreaudio`、Android の `aaudio`)
+  のどれも生成しないため採用できず(調査結果は `underrun.rs` モジュール doc 参照)、
+  代わりに `OutputCallbackInfo::timestamp().callback` の間隔を毎コールバック追跡する
+  ヒューリスティックにしてある。`CpalBackend` が累計検知回数・直近検知時刻・連続検知数の
+  3値を `Arc<Atomic*>` で持ち(`callback_frames` 等と同じ設計。複数インスタンス・
+  複数テストの並列実行で混ざらないよう `static` にはしていない)、
+  `Backend::output_underrun_count` 等でゲームスレッドから読める。
+  `CpalBackend::log_new_output_underruns`(ゲームスレッド専用、`log_output_latency_once`
+  と同じ配線)が新規検知分だけ日和見的にログへ出す。
+
 ## 設計意図
 
 - 初期構築仕様 M6(【仮】): 立ち上げは cpal で macOS Editor / iOS / Android を1系統に揃える。

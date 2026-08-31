@@ -14,6 +14,7 @@ use mw_core::{CHANNELS, Event, EventQueue, Renderer, StreamErrorReason};
 
 use crate::backend::{Backend, BackendError};
 use crate::ios_interruption;
+use crate::underrun::OutputUnderrunTracker;
 
 /// 既定の出力デバイスに f32 ステレオストリームを開く `Backend` 実装。
 ///
@@ -54,6 +55,19 @@ pub struct CpalBackend {
     logged_output_latency: AtomicBool,
     /// オープン時にネゴシエートしたサンプルレート(未オープンなら 0)。
     sample_rate: u32,
+    /// 出力コールバックのアンダーラン(の疑い)検知の累計回数。
+    /// 詳細は [`crate::underrun`] モジュール doc / [`Backend::output_underrun_count`]。
+    output_underrun_count: Arc<AtomicU64>,
+    /// 直近にアンダーラン(の疑い)を検知したコールバックのホスト単調時刻(ns)。
+    /// [`Backend::last_output_underrun_host_time_ns`] 参照。
+    last_output_underrun_host_time_ns: Arc<AtomicU64>,
+    /// 直近まで連続して検知した回数。[`Backend::consecutive_output_underrun_count`] 参照。
+    consecutive_output_underrun_count: Arc<AtomicU32>,
+    /// [`CpalBackend::log_new_output_underruns`] が直近にログへ出した
+    /// `output_underrun_count` の値(まだログしていなければ 0)。1オープンにつき
+    /// 何度でも呼べる(`logged_output_latency` と異なり `AtomicBool` ではなく値そのもの
+    /// を持つ——「初回だけ」ではなく「新しく増えた分だけ都度」ログしたいため)。
+    logged_output_underrun_count: AtomicU64,
 }
 
 impl CpalBackend {
@@ -66,6 +80,10 @@ impl CpalBackend {
             output_latency_ns: Arc::new(AtomicU64::new(0)),
             logged_output_latency: AtomicBool::new(false),
             sample_rate: 0,
+            output_underrun_count: Arc::new(AtomicU64::new(0)),
+            last_output_underrun_host_time_ns: Arc::new(AtomicU64::new(0)),
+            consecutive_output_underrun_count: Arc::new(AtomicU32::new(0)),
+            logged_output_underrun_count: AtomicU64::new(0),
         }
     }
 
@@ -93,6 +111,33 @@ impl CpalBackend {
         crate::mw_log!(
             "[mw-backend] output latency (measured, cpal playback - callback timestamp): \
              {latency_ns} ns = {latency_ms:.3} ms"
+        );
+    }
+
+    /// 出力コールバックのアンダーラン(の疑い、[`crate::underrun`] モジュール doc参照)
+    /// を新たに検知していれば、その分だけログへ出す。`log_output_latency_once` と同じ
+    /// 配線パターン(**ゲームスレッドから、FFI 呼び出しの合間に日和見的に呼ぶこと**。
+    /// `mw_log!` はヒープアロケーションとロックを伴うため音声コールバック経路からは
+    /// 呼んではならない、`crates/mw-core/CLAUDE.md` のリアルタイム安全性規約)。
+    ///
+    /// `log_output_latency_once` と異なり「初回だけ」ではなく、**呼ぶたびに前回ログ時
+    /// からの増分があればその都度**出す——アンダーランは起動時に1回きりの情報ではなく、
+    /// 実運用中いつ何回起きたかを追いたいテレメトリのため。
+    pub fn log_new_output_underruns(&self) {
+        let current = self.output_underrun_count.load(Ordering::Relaxed);
+        let last_logged = self.logged_output_underrun_count.load(Ordering::Relaxed);
+        if current <= last_logged {
+            return;
+        }
+        self.logged_output_underrun_count
+            .store(current, Ordering::Relaxed);
+        let new_count = current - last_logged;
+        let consecutive = self
+            .consecutive_output_underrun_count
+            .load(Ordering::Relaxed);
+        crate::mw_log!(
+            "[mw-backend] output underrun suspected: +{new_count} since last check \
+             (cumulative={current}, consecutive={consecutive})"
         );
     }
 }
@@ -148,18 +193,30 @@ impl Backend for CpalBackend {
         // 使えるよう、コールバックが動き出す(`stream.play()`)前に確定させる。
         renderer.set_sample_rate(config.sample_rate);
 
+        // `clippy::too_many_arguments` を避けるため、コールバッククロージャへ渡す
+        // アトミック群を用途ごとに2つへ束ねる(`CallbackTelemetry`/`OutputUnderrunTracker`)。
+        let telemetry = CallbackTelemetry {
+            frames: Arc::clone(&self.callback_frames),
+            output_latency_ns: Arc::clone(&self.output_latency_ns),
+            // `ios_interruption::Watcher::new` へも同じカウンタを渡すため、ここでは
+            // clone を渡す(コールバッククロージャへムーブされる分)。
+            ticks: Arc::clone(&self.callback_ticks),
+        };
+        let underrun_tracker = OutputUnderrunTracker::new(
+            Arc::clone(&self.output_underrun_count),
+            Arc::clone(&self.last_output_underrun_host_time_ns),
+            Arc::clone(&self.consecutive_output_underrun_count),
+        );
+
         let stream = build_output_stream(
             &device,
             &config,
             renderer,
-            Arc::clone(&self.callback_frames),
-            Arc::clone(&self.output_latency_ns),
-            // `ios_interruption::Watcher::new` へも同じカウンタを渡すため、ここでは
-            // clone を渡す(コールバッククロージャへムーブされる分)。
-            Arc::clone(&self.callback_ticks),
+            telemetry,
             // `events` はこの後 `ios_interruption::Watcher::new` へも渡すため、ここでは
             // clone を渡す(`err_fn` クロージャへムーブされる分)。
             Arc::clone(&events),
+            underrun_tracker,
         )?;
         stream
             .play()
@@ -195,6 +252,13 @@ impl Backend for CpalBackend {
                 self.callback_ticks.store(0, Ordering::Relaxed);
                 self.output_latency_ns.store(0, Ordering::Relaxed);
                 self.logged_output_latency.store(false, Ordering::Relaxed);
+                self.output_underrun_count.store(0, Ordering::Relaxed);
+                self.last_output_underrun_host_time_ns
+                    .store(0, Ordering::Relaxed);
+                self.consecutive_output_underrun_count
+                    .store(0, Ordering::Relaxed);
+                self.logged_output_underrun_count
+                    .store(0, Ordering::Relaxed);
                 Ok(())
             }
             None => Err(BackendError::NotOpen),
@@ -215,6 +279,20 @@ impl Backend for CpalBackend {
 
     fn output_latency_ns(&self) -> u64 {
         self.output_latency_ns.load(Ordering::Relaxed)
+    }
+
+    fn output_underrun_count(&self) -> u64 {
+        self.output_underrun_count.load(Ordering::Relaxed)
+    }
+
+    fn last_output_underrun_host_time_ns(&self) -> u64 {
+        self.last_output_underrun_host_time_ns
+            .load(Ordering::Relaxed)
+    }
+
+    fn consecutive_output_underrun_count(&self) -> u32 {
+        self.consecutive_output_underrun_count
+            .load(Ordering::Relaxed)
     }
 }
 
@@ -333,15 +411,39 @@ fn log_available_configs(device: &cpal::Device) {
     }
 }
 
+/// [`build_output_stream`] へ渡すコールバック計測用アトミック群
+/// (`clippy::too_many_arguments` を避けるための束ね。§5.3 のリアルタイム安全性には
+/// 影響しない——各フィールドは従来どおり個別の `Arc<Atomic*>` のまま)。
+struct CallbackTelemetry {
+    /// [`CpalBackend::callback_frames`] へ渡す `Arc`。
+    frames: Arc<AtomicU32>,
+    /// [`CpalBackend::output_latency_ns`] へ渡す `Arc`。
+    output_latency_ns: Arc<AtomicU64>,
+    /// [`CpalBackend::callback_ticks`] へ渡す `Arc`。
+    ticks: Arc<AtomicU64>,
+}
+
 fn build_output_stream(
     device: &cpal::Device,
     config: &StreamConfig,
     mut renderer: Renderer,
-    callback_frames: Arc<AtomicU32>,
-    output_latency_ns: Arc<AtomicU64>,
-    callback_ticks: Arc<AtomicU64>,
+    telemetry: CallbackTelemetry,
     events: Arc<EventQueue>,
+    // コールバック間隔異常(「アンダーラン(の疑い)」)を検知するトラッカー
+    // (`crate::underrun` モジュール doc参照)。`prev_*` フィールドは音声コールバック
+    // スレッドが単独で所有する非アトミック状態なので、呼び出し側(`CpalBackend::open`)
+    // が構築したものをそのままこのクロージャへムーブする(`renderer` と同じ
+    // 「単一の書き手」設計、§5.3)。
+    mut underrun_tracker: OutputUnderrunTracker,
 ) -> Result<cpal::Stream, BackendError> {
+    let CallbackTelemetry {
+        frames: callback_frames,
+        output_latency_ns,
+        ticks: callback_ticks,
+    } = telemetry;
+    // ストリーム構成時に確定するサンプルレート。オープン中は変わらないため、
+    // アトミックにせずクロージャへそのまま値でムーブする(`Copy`)。
+    let sample_rate = config.sample_rate;
     let err_fn = move |err: cpal::Error| {
         // 音声スレッドではなく cpal のエラー通知経路から呼ばれる(§5.3 の対象外)。
         // ここは音声コールバックそのものとは別スレッドなので、`EventQueue` の
@@ -360,7 +462,8 @@ fn build_output_stream(
             move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
                 // I/O バッファ長の実測用。アトミックストア1回だけで、アロケーション・
                 // ロック・IO をしないためリアルタイム安全性規約(§5.3)に抵触しない。
-                callback_frames.store((data.len() / CHANNELS) as u32, Ordering::Relaxed);
+                let frames_this_callback = (data.len() / CHANNELS) as u32;
+                callback_frames.store(frames_this_callback, Ordering::Relaxed);
 
                 // 復帰確認用のカウンタ(`CpalBackend::callback_ticks` のdoc、
                 // `ios_interruption.rs` モジュール doc「追記: `pause()`→`play()` が Ok を
@@ -393,6 +496,10 @@ fn build_output_stream(
                     buffer_start_host_time_ns.saturating_sub(callback_host_time_ns),
                     Ordering::Relaxed,
                 );
+
+                // アンダーラン(の疑い)検知用。整数演算+アトミック操作のみ
+                // (ヒープ確保・ロック・IO なし。§5.3。`crate::underrun` モジュール doc参照)。
+                underrun_tracker.observe(callback_host_time_ns, frames_this_callback, sample_rate);
 
                 // ここが音声スレッド上のオーディオコールバック本体。`renderer` はこの
                 // クロージャへムーブ済みで、以後は音声スレッドの単一の書き手が
