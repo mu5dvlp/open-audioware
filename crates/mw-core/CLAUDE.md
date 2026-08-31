@@ -106,9 +106,11 @@ OS 非依存・デバイス非依存のコア。ミキサ、ボイス管理、�
   `MusicPrepare` は M2-7 後半(`mw_music_set` の実装)で追加——同様に `MusicVoice`
   側に既にあった `prepare`(新しい曲として `Loading` から仕切り直す)への配線を
   足しただけ。mw-ffi の `mw_music_set` が「デコーダ差し替え → `MusicPrepare` →
-  `MusicStop` → `MusicSeek{0}`」の順でコマンドを送ることで、前の曲が `Playing` 中
-  でも状態機械・ゲイン・リングバッファの3つを矛盾なく初期化できる
-  (`command.rs::Command::MusicPrepare` のドキュメント、`mixer.rs` の
+  `MusicSeek{0}`」の順でコマンドを送ることで、前の曲が `Playing` 中でも状態機械・
+  ゲイン・リングバッファの3つを矛盾なく初期化できる。`MusicPrepare` の直後に
+  `MusicStop` を挟む必要は無い(挟んでも安全だが完全な no-op になるだけ)ため、
+  現在の実装では省かれている(`command.rs::Command::MusicPrepare` のドキュメント、
+  `mixer.rs` の
   `music_set_command_sequence_recovers_cleanly_from_a_song_still_playing` テスト参照)。
 - `mixer`: `Mixer::render(output, buffer_start_host_time_ns)` — 「コマンド消化 →
   楽曲ボイスのレンダリング(予約発火があればサンプル精度で分割) → BGM ボイスの

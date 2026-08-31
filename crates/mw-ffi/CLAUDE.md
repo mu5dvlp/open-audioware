@@ -92,8 +92,8 @@ mw_music_set(handle, sound_id: u64) -> MwResult
     // mw_sound_load が返した ID であること(SE の ID を渡すと ErrInvalidSoundId)。
     // 非ブロッキング。プリロール完了は待たない——状態は Loading のままで、
     // mw_music_state が Ready を返すまで C# 側がポーリングする契約。
-    // 内部で「デコーダ差し替え → MusicPrepare → MusicStop → MusicSeek{0}」の順に
-    // 処理する(前曲のリングバッファ内 PCM の掃除。順序厳守。ffi.rs のドキュメント参照)
+    // 内部で「デコーダ差し替え → MusicPrepare → MusicSeek{0}」の順に処理する
+    // (前曲のリングバッファ内 PCM の掃除。順序厳守。ffi.rs のドキュメント参照)
 mw_music_state(handle, out_state: *mut i32) -> MwResult
     // MwMusicState(Loading=0/Ready=1/Playing=2/Paused=3)の判別子を i32 で書き込む
 mw_music_pause(handle) -> MwResult                                // 既定ランプでフェードアウトして Paused へ

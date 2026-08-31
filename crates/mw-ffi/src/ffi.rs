@@ -1564,6 +1564,7 @@ mod tests {
 
         run_event_poll_checks(handle);
         run_music_lifecycle(handle);
+        run_music_preview_style_rapid_switch(handle);
         run_bgm_lifecycle(handle);
     }
 
@@ -1727,6 +1728,127 @@ mod tests {
             "releasing a music id must not affect unrelated SE storage"
         );
         assert_eq!(mw_sound_release(handle, se_id), MwResult::Ok);
+    }
+
+    /// M4 終了条件(選曲プレビューのネイティブ化)の回帰テスト。実ハンドル + 実
+    /// デコードスレッド越しに、`mw-core::mixer::tests::preview_style_rapid_track_switch_
+    /// never_leaks_previous_audio_and_settles_on_latest_track` と同じシナリオ
+    /// (連打での曲切り替え、ロード中の切り替え)を踏む。
+    ///
+    /// **選曲プレビューは新しい FFI を必要としない**——`mw_music_set` /
+    /// `mw_music_play_scheduled` / `mw_music_seek` / `mw_music_set_loop` /
+    /// `mw_music_stop` / `mw_music_state` がそのまま「選曲プレビュー用」として
+    /// 初期構築仕様『§4.3』に明記されている(`mw_music_set_loop` の doc 参照)。
+    /// このテストは、その既存の口を「プレビューの実際の使われ方」の形で通して
+    /// 固定化する回帰テストであって、新しい実装を検証するものではない
+    /// (`decode_thread::spawn` の「最新のデコーダを採用する」設計・
+    /// `mw_music_set` の Prepare→Seek リセットは M2-7 で既に実装済み)。
+    fn run_music_preview_style_rapid_switch(handle: u64) {
+        // 3曲ぶんロードしておく(選曲リストを連打で切り替える想定)。値をそれぞれ
+        // 変えておき、「最後に選んだ曲以外の音が紛れ込んでいないか」を機械的な値の
+        // 一致では確認できない(実デバイスが無い CI では実際の出力を録音できない)ため、
+        // ここでは状態遷移(スタックしないこと)とコマンドが素通りすることだけを見る
+        // ——PCM 自体の非混入は `mw-core` 側のオフラインレンダリングテストで
+        // 数値的に確認済み(このファイル冒頭のコメント参照)。
+        let track_a = make_pcm16_wav(48_000, 2, &vec![100i16; 4_000]);
+        let track_b = make_pcm16_wav(48_000, 2, &vec![200i16; 4_000]);
+        let track_c = make_pcm16_wav(48_000, 2, &vec![300i16; 4_000]);
+
+        let mut id_a: u64 = 0;
+        let mut id_b: u64 = 0;
+        let mut id_c: u64 = 0;
+        assert_eq!(
+            unsafe {
+                mw_sound_load(
+                    handle,
+                    track_a.as_ptr(),
+                    track_a.len(),
+                    1,
+                    &mut id_a as *mut u64,
+                )
+            },
+            MwResult::Ok
+        );
+        assert_eq!(
+            unsafe {
+                mw_sound_load(
+                    handle,
+                    track_b.as_ptr(),
+                    track_b.len(),
+                    1,
+                    &mut id_b as *mut u64,
+                )
+            },
+            MwResult::Ok
+        );
+        assert_eq!(
+            unsafe {
+                mw_sound_load(
+                    handle,
+                    track_c.as_ptr(),
+                    track_c.len(),
+                    1,
+                    &mut id_c as *mut u64,
+                )
+            },
+            MwResult::Ok
+        );
+
+        // ユーザーが曲 A を選び、プレビュー再生が始まる(Ready を待ってから
+        // 「今すぐ」再生する——選曲プレビューはサンプル精度の予約が要らないため、
+        // `mw_music_play_scheduled(handle, mw_host_time_ns())` で「今」を渡すだけでよい)。
+        assert_eq!(mw_music_set(handle, id_a), MwResult::Ok);
+        let mut state = -1i32;
+        assert!(
+            wait_until(
+                || {
+                    let r = unsafe { mw_music_state(handle, &mut state as *mut i32) };
+                    r == MwResult::Ok && state == MwMusicState::Ready as i32
+                },
+                std::time::Duration::from_secs(5),
+            ),
+            "track A must become Ready; last observed state={state}"
+        );
+        assert_eq!(
+            mw_music_play_scheduled(handle, mw_host_time_ns()),
+            MwResult::Ok
+        );
+
+        // ここが本題: ユーザーが即座に B → C と連打で切り替える。B の Ready を
+        // 一度も待たない(依頼書の「ロード中に切り替えたらどうなるか」そのもの)。
+        assert_eq!(mw_music_set(handle, id_b), MwResult::Ok);
+        assert_eq!(mw_music_set(handle, id_c), MwResult::Ok);
+
+        // 連打してもスタックせず、最後に指定した曲(C)へ収束する。
+        let mut settled_state = -1i32;
+        let became_ready = wait_until(
+            || {
+                let r = unsafe { mw_music_state(handle, &mut settled_state as *mut i32) };
+                r == MwResult::Ok && settled_state == MwMusicState::Ready as i32
+            },
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            became_ready,
+            "must not get stuck in Loading after two rapid switches while the previous \
+             track was still loading; last observed state={settled_state}"
+        );
+
+        // C も選曲プレビューの一連の操作(途中から再生・ループ・停止)を素直に
+        // 受け付ける(`mw_music_seek`/`mw_music_set_loop` は「選曲プレビュー用」と
+        // 初期構築仕様『§4.3』に明記されている口そのもの)。
+        assert_eq!(mw_music_seek(handle, 100), MwResult::Ok);
+        assert_eq!(mw_music_set_loop(handle, 0, 500), MwResult::Ok);
+        assert_eq!(
+            mw_music_play_scheduled(handle, mw_host_time_ns()),
+            MwResult::Ok
+        );
+        assert_eq!(mw_music_stop(handle), MwResult::Ok);
+        assert_eq!(mw_music_set_loop(handle, 0, 0), MwResult::Ok);
+
+        assert_eq!(mw_sound_release(handle, id_a), MwResult::Ok);
+        assert_eq!(mw_sound_release(handle, id_b), MwResult::Ok);
+        assert_eq!(mw_sound_release(handle, id_c), MwResult::Ok);
     }
 
     /// M4-3: BGM の一連の流れ(実ハンドル越し)。`run_music_lifecycle` と対称の

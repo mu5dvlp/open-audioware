@@ -1931,8 +1931,15 @@ mod tests {
         assert_eq!(mixer.music_voice.loop_region(), None);
     }
 
-    /// `mw-ffi::mw_music_set` が送る3コマンドの並び(`MusicPrepare` → `MusicStop` →
-    /// `MusicSeek { frames: 0 }`)を実際に踏んだときの結果を固定化する回帰テスト。
+    /// `MusicPrepare` → `MusicStop` → `MusicSeek { frames: 0 }` の並びを実際に踏んだ
+    /// ときの結果を固定化する回帰テスト。
+    ///
+    /// **`mw-ffi::mw_music_set` は現在この3つのうち `MusicPrepare` と `MusicSeek` の
+    /// 2つしか送らない**(`MusicStop` を挟む必要が無いことがこのテストで固定化されて
+    /// いる不変条件そのものであるため、送信側から省かれた——`ffi.rs::mw_music_set` の
+    /// ドキュメント参照)。このテストが `MusicStop` を明示的に間に挟んだままにしてある
+    /// のは、「万一どこかが `MusicStop` を送っても壊れない」という不変条件そのものを
+    /// 回帰させないため。
     ///
     /// この順序が肝心な理由: 前の曲が `Playing` 中に曲を切り替えると、`MusicPrepare`
     /// より先に `MusicStop` だけを送った場合は `pending_settle = Stop` を積んで
@@ -1954,7 +1961,9 @@ mod tests {
         mixer.render(&mut buf, 0);
         assert_eq!(mixer.music_state(), MusicState::Playing);
 
-        // mw_music_set が実際に送る3コマンド(この順序で)。
+        // `MusicPrepare` の後に `MusicStop` を挟んでも安全であることを固定化する
+        // (現在の `mw_music_set` はこの `MusicStop` を送らないが、送っても no-op に
+        // なるという不変条件を守り続けるための回帰テスト。上のドキュメント参照)。
         sender.send(Command::MusicPrepare);
         sender.send(Command::MusicStop);
         sender.send(Command::MusicSeek { frames: 0 });
@@ -1985,6 +1994,94 @@ mod tests {
             (last - 1.0).abs() < 1e-4,
             "must fade in to full volume, not stay stuck silent forever; got {last}"
         );
+    }
+
+    /// 選曲プレビュー(M4 終了条件)の実際の使われ方を模した回帰テスト:
+    /// **ユーザーが曲を連打で切り替える** ―― A を再生中に B へ切り替え、B が
+    /// まだプリロールを終える(=Ready になる)前にさらに C へ切り替える。
+    /// `mw-ffi::mw_music_set` が実際に送る2コマンド列(`MusicPrepare` →
+    /// `MusicSeek { frames: 0 }`)をそのまま踏む(このファイル内の
+    /// `music_set_command_sequence_recovers_cleanly_from_a_song_still_playing` と
+    /// 同じ理由でコマンド列を直接送る——`mw-ffi` 側はデコーダを差し替えてから同じ
+    /// 2コマンドを送るだけで、デコーダの差し替え自体はこのテストでは「次にどの
+    /// デコーダを `pump` するか」で表現している)。
+    ///
+    /// 固定化したいのは3点:
+    /// 1. 切り替えの直後(まだ次の曲が Ready になっていない間)は無音のままで、
+    ///    前の曲の PCM が漏れて聞こえたりしない(`prepare()` がゲインを即座に 0 へ
+    ///    落とすため、ランプ経由の残響すら無いはず)。
+    /// 2. 前の曲がまだ Ready になっていないうちにもう一度切り替えても `Loading` に
+    ///    固まったまま(スタック)にならない――最終的に指定した曲(C)が Ready になる。
+    /// 3. 最終的に鳴るのは最後に指定した曲(C)の PCM だけで、途中でキャンセルされた
+    ///    A・B の値がどこにも紛れ込まない。
+    #[test]
+    fn preview_style_rapid_track_switch_never_leaks_previous_audio_and_settles_on_latest_track() {
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events, _bgm) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+
+        // 曲 A: プリロール完了・再生中にする(選曲プレビューでまず1曲目を鳴らした状態)。
+        make_music_ready(&mut mixer, &mut producer, 0.3);
+        sender.send(Command::MusicPlayScheduled { host_time_ns: 0 });
+        let mut buf = vec![0.0; 20 * CHANNELS];
+        mixer.render(&mut buf, 0);
+        assert_eq!(mixer.music_state(), MusicState::Playing);
+
+        // ユーザーが即座に曲 B へ切り替える(`mw_music_set` 相当の2コマンド)。
+        // B はまだ一切 pump していない ―― デコードスレッドがまだ1パケットも
+        // 届けていない、実運用で最もありふれた「ロード中に切り替えた」状態。
+        sender.send(Command::MusicPrepare);
+        sender.send(Command::MusicSeek { frames: 0 });
+        let mut after_switch_to_b = vec![-1.0; 8 * CHANNELS];
+        mixer.render(&mut after_switch_to_b, 0);
+        assert_eq!(mixer.music_state(), MusicState::Loading);
+        assert!(
+            after_switch_to_b.iter().all(|&s| s == 0.0),
+            "switching must be silent immediately, not leak track A's PCM while B loads"
+        );
+
+        // B がまだ Ready にすらなっていないうちに、さらに曲 C へ切り替える(連打)。
+        sender.send(Command::MusicPrepare);
+        sender.send(Command::MusicSeek { frames: 0 });
+        let mut after_switch_to_c = vec![-1.0; 8 * CHANNELS];
+        mixer.render(&mut after_switch_to_c, 0);
+        assert_eq!(
+            mixer.music_state(),
+            MusicState::Loading,
+            "a second switch before the first one finished loading must not get stuck"
+        );
+        assert!(after_switch_to_c.iter().all(|&s| s == 0.0));
+
+        // 曲 C のプリロールが満たされたら、素直に Ready まで到達する(スタックしない)。
+        let mut decoder_c = ConstantDecoder {
+            cursor: 0,
+            value: 0.9,
+        };
+        producer.pump(&mut decoder_c).expect("pump must succeed");
+        let mut warmup = vec![0.0; 4 * CHANNELS];
+        mixer.render(&mut warmup, 0);
+        assert_eq!(
+            mixer.music_state(),
+            MusicState::Ready,
+            "must reach Ready for the *last* requested track (C), not remain stuck in Loading"
+        );
+
+        sender.send(Command::MusicPlayScheduled { host_time_ns: 0 });
+        let ramp_len = ms_to_samples(Config::DEFAULT_RAMP_MS, TEST_SAMPLE_RATE) as usize;
+        let mut settle = vec![0.0; (ramp_len + 20) * CHANNELS];
+        mixer.render(&mut settle, 0);
+        assert_eq!(mixer.music_state(), MusicState::Playing);
+        let last = settle[(ramp_len + 19) * CHANNELS];
+        assert!(
+            (last - 0.9).abs() < 1e-4,
+            "must fade in to track C's value (0.9), got {last}"
+        );
+        for &sample in settle.iter() {
+            assert!(
+                (sample - 0.3).abs() > 1e-3,
+                "track A's PCM value (0.3) must never leak into the output after switching \
+                 tracks twice; got a sample of {sample}"
+            );
+        }
     }
 
     // =====================================================================
