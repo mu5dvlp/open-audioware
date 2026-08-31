@@ -11,6 +11,10 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+// C# 側の手書きラッパ(`unity/Runtime/MwNative.cs`)との判別子同期を `cargo test` で
+// 検証するテスト専用モジュール。詳細・設計根拠はモジュール doc を参照。
+#[cfg(test)]
+mod csharp_abi_sync;
 mod decode_thread;
 mod event;
 mod ffi;

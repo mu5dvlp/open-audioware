@@ -84,6 +84,11 @@ C ABI 境界。`mw-core` / `mw-backend` 両方に依存する唯一のクレー�
 - `src/ffi.rs` — `#[unsafe(no_mangle)] pub extern "C" fn mw_*` 本体。
   **csbindgen の入力**(`build.rs` がここと `result.rs`/`event.rs`/`types.rs` を読む)。
 - `build.rs` — csbindgen で `unity/Runtime/Generated/NativeMethods.g.cs` を生成する。
+- `src/csharp_abi_sync.rs`(`#[cfg(test)]` 専用、2026-08-31)— `unity/Runtime/MwNative.cs`
+  の手書き公開列挙(`MwResult`/`SoundMode`/`Bus`/`MusicState`/`EventKind`/
+  `StreamErrorReason`)と ABI バージョン定数が、Rust 側の判別子・値と一致することを
+  `cargo test` で機械的に検証する。詳細・設計根拠はモジュール doc 参照
+  (「C# 側ラッパ列挙とのズレを自動検出する仕組み」節も参照)。
 
 ## 現状の公開 API(M1: SE 再生 / M2-5: ホスト時刻・予約発音 / M2-6: イベント通知 /
 M2-7: 楽曲再生 / M4-3: BGM のネイティブ化)
@@ -157,7 +162,9 @@ mw_get_output_underrun_stats(handle, out: *mut MwOutputUnderrunStats) -> MwResul
     // consecutive_count(直近まで連続した検知回数)。mw_poll_events の
     // MwEventKind.Underrun(楽曲/BGM のデコードリングバッファ枯渇)とは別物——
     // こちらは音声コールバック自体の間隔異常(OS 側出力バッファの枯渇の兆候)。
-    // 詳細は mw_backend::underrun モジュール doc 参照
+    // 詳細は mw_backend::underrun モジュール doc 参照。
+    // C# 側ラッパ(MwNative.GetOutputUnderrunStats)は 2026-08-31 まで存在せず
+    // 呼び出す手段が無かった(M3 で追加されて以来ずっと)。今回追加した
 
 mw_poll_events(handle, buf: *mut MwEvent, cap: i32, out_dropped: *mut u32) -> i32
     // 初期構築仕様 §4.6。C → C# のコールバックはしない(M4)——C# 側が毎フレーム
@@ -241,3 +248,35 @@ csbindgen 採用の目的、M2)。
 DllImport 先のライブラリ名は `csharp_dll_name("mw_ffi")`(macOS: `libmw_ffi.dylib`,
 Android: `libmw_ffi.so`)、iOS ビルド(`UNITY_IOS && !UNITY_EDITOR`)のみ `__Internal`
 (静的リンクのため)。
+
+## C# 側ラッパ列挙とのズレを自動検出する仕組み(`src/csharp_abi_sync.rs`、2026-08-31)
+
+`NativeMethods.g.cs`(生成物)は csbindgen が毎回上書きするため構造的にズレない。
+ズレるのは **`unity/Runtime/MwNative.cs` が持つ手書きの公開列挙**
+(`MwResult`/`SoundMode`/`Bus`/`MusicState`/`EventKind`/`StreamErrorReason`)——
+生成コードの `internal` 型をパッケージ外へ漏らさないための薄いラッパで、Rust 側の
+判別子が増えても C# 側は自動的には追従しない。実際に `AudioInterruptionBegan`/
+`AudioInterruptionEnded`(値 6/7)が M3 以降ずっと C# 側に欠けていた
+(`docs/history/05-2026-08-31.md`)。`StreamErrorReason` はさらに、定義自体が
+`mw_core`(csbindgen 入力に含まれないクレート)にあり `extern "C"` 関数のシグネチャにも
+直接現れないため、**csbindgen による自動生成が原理的に不可能**——恒久的に手動同期が要る。
+
+対策として `crates/mw-ffi/src/csharp_abi_sync.rs`(`#[cfg(test)]` 専用モジュール)を
+追加した。二重の防御:
+
+1. **コンパイル時**: 各 Rust enum をワイルドカード無しの `match` に通す
+   (`describe_mw_event_kind` 等)。新しい判別子を追加すると、この `match` が
+   非網羅になり **`mw-ffi` のコンパイル自体が失敗する**——「追加したのに
+   C# 側を確認する動線に一度も来ない」という事態を防ぐ。
+2. **実行時**(`cargo test`): `unity/Runtime/MwNative.cs` を `include_str!` で
+   読み込み、`enum <Name> { ... }` ブロックをテキスト抽出して Rust 側の
+   (名前, 判別子)の全件と突き合わせる。名前の過不足・値のズレの両方を検出する。
+
+`unity-sample` の EditMode テストではなくこの形にした理由: Unity テストは CI で
+回さない方針(`../../CLAUDE.md`)のため、Unity 起動無しで `cargo test --workspace`
+だけで完結する形が必須だった。
+
+**実際に壊して確認済み**(2026-08-31 の作業記録参照): `EventKind` から
+`AudioInterruptionEnded` を取り除く/`Bus.Voice` の値を変える/`StreamErrorReason`
+ブロックを丸ごと削除する、の3パターンで対応する `#[test]` が期待通り失敗し、
+差分を名指しするメッセージが出ることを確認した。

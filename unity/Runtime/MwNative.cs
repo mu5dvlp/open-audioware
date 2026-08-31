@@ -149,7 +149,8 @@ namespace Mw.Native
     {
         /// <summary>
         /// 出力ルートが変化した(イヤホン抜け / BT 切替)。
-        /// **検知そのものは M3 の範囲**で、現時点では発火しない(値だけ予約されている)。
+        /// <b>iOS/tvOS では M3 で発火するようになっている</b>(reason を問わずルート変化の
+        /// たびに1回、付随データ無し)。Android では未配線(値だけ予約されている)。
         /// </summary>
         RouteChanged = 0,
 
@@ -162,7 +163,10 @@ namespace Mw.Native
         /// <summary>ループ区間で折り返した。付随データは折り返し先(曲頭からのフレーム位置)。</summary>
         MusicLooped = 3,
 
-        /// <summary>ストリーミングデコードが失敗した。付随データは理由コード。</summary>
+        /// <summary>
+        /// ストリーミングデコードが失敗した。付随データは理由コード
+        /// (<see cref="Mw.Native.StreamErrorReason"/> の判別子を <c>ulong</c> 化したもの)。
+        /// </summary>
         StreamError = 4,
 
         /// <summary>
@@ -196,6 +200,47 @@ namespace Mw.Native
         /// </para>
         /// </summary>
         AudioInterruptionEnded = 7,
+    }
+
+    /// <summary>
+    /// ストリーミングデコード失敗の理由(<see cref="EventKind.StreamError"/> の付随データ、
+    /// 初期構築仕様『§4.6 イベント通知』)。ネイティブ側 <c>mw_core::StreamErrorReason</c>
+    /// (<c>#[repr(u32)]</c>)に対応する公開用の列挙。
+    /// <para>
+    /// 特定のオーディオバックエンドの詳細な分類をそのまま持ち込まず、呼び出し側が
+    /// 実用的に分岐できる粒度へ意図的に丸めてある(詳細な原因は開発ビルドのネイティブ
+    /// ログに残る)。
+    /// </para>
+    /// <para>
+    /// <b>この型は csbindgen の入力に含まれない</b>——ネイティブ側の定義は
+    /// <c>mw-core</c>(<c>mw-ffi</c> ではなく)にあり、かつ <c>extern "C"</c> 関数の
+    /// シグネチャにもどの構造体のフィールド型にも直接現れない(<c>u64</c> へ変換済みの
+    /// 値としてしか FFI 境界を越えない)ため、自動生成の対象にならない
+    /// (<see cref="MusicState"/> が生成される仕掛けの逆のケース)。**値はネイティブ側と
+    /// 1:1 で手動同期させること**——`cargo test` の C# ⇔ Rust 突き合わせテスト
+    /// (`crates/mw-ffi/src/csharp_abi_sync.rs`)がズレを検出する。
+    /// </para>
+    /// <para>
+    /// <see cref="MwEventData.Payload"/> を <c>(StreamErrorReason)(int)payload</c> として
+    /// 解釈する。
+    /// </para>
+    /// </summary>
+    public enum StreamErrorReason
+    {
+        /// <summary>上記以外、またはバックエンド固有で分類しきれないエラー。</summary>
+        Unknown = 0,
+
+        /// <summary>出力デバイス/ホストに到達できない(切断・使用中・ホスト不在)。</summary>
+        DeviceUnavailable = 1,
+
+        /// <summary>ルート変化等でストリーム構成が無効になり、再構築が必要。</summary>
+        Reconfigured = 2,
+
+        /// <summary>OS がデバイスへのアクセスを拒否した。</summary>
+        PermissionDenied = 3,
+
+        /// <summary>上記以外のバックエンド内部エラー。</summary>
+        Backend = 4,
     }
 
     /// <summary>
@@ -265,6 +310,38 @@ namespace Mw.Native
         /// 曲頭からの経過秒。<see cref="SampleRate"/> が 0(未確定)のときは 0 を返す。
         /// </summary>
         public double SongSeconds => SampleRate == 0 ? 0.0 : (double)SongFrames / SampleRate;
+    }
+
+    /// <summary>
+    /// 出力コールバックのアンダーラン(の疑い)統計(初期構築仕様『§2』M3
+    /// 「アンダーラン検知・テレメトリ」)。
+    /// <para>
+    /// <see cref="EventKind.Underrun"/>(<see cref="MwNative.PollEvents"/> 経由)とは別物。
+    /// あちらは楽曲/BGM のデコードリングバッファ側のアンダーラン、こちらは音声コールバック
+    /// 自体の間隔異常(OS 側出力バッファの枯渇の兆候)。
+    /// </para>
+    /// <para>
+    /// <see cref="MusicPosition"/> と同じ理由でネイティブ側 <c>MwOutputUnderrunStats</c> と
+    /// レイアウトを一致させていない(<see cref="MwNative.GetOutputUnderrunStats"/> が
+    /// スタック上の一時変数を経由して詰め替える)。
+    /// </para>
+    /// </summary>
+    public struct OutputUnderrunStats
+    {
+        /// <summary>累計検知回数。</summary>
+        public ulong Count;
+
+        /// <summary>
+        /// 直近に検知したコールバックのホスト単調時刻(ナノ秒)。
+        /// <see cref="MwNative.HostTimeNs"/> と同じ時計。まだ1度も検知していなければ 0。
+        /// </summary>
+        public ulong LastHostTimeNs;
+
+        /// <summary>
+        /// 直近まで連続して検知した回数。検知されなかったコールバックが1回でも
+        /// 挟まると 0 に戻る。
+        /// </summary>
+        public uint ConsecutiveCount;
     }
 
     /// <summary>
@@ -485,6 +562,24 @@ namespace Mw.Native
             Generated.MwResult native = NativeMethods.mw_get_output_latency_ns(handle, &ns);
             nanoseconds = ns;
             return ToPublicResult(native);
+        }
+
+        /// <summary>
+        /// 出力コールバックのアンダーラン(の疑い)統計を取得する(初期構築仕様『§2』M3
+        /// 「アンダーラン検知・テレメトリ」)。<see cref="OutputUnderrunStats"/> のドキュメント
+        /// 「<see cref="EventKind.Underrun"/> とは別物」を参照。
+        /// </summary>
+        public static unsafe MwResult GetOutputUnderrunStats(ulong handle, out OutputUnderrunStats stats)
+        {
+            Generated.MwOutputUnderrunStats native = default;
+            Generated.MwResult result = NativeMethods.mw_get_output_underrun_stats(handle, &native);
+            stats = new OutputUnderrunStats
+            {
+                Count = native.count,
+                LastHostTimeNs = native.last_host_time_ns,
+                ConsecutiveCount = native.consecutive_count,
+            };
+            return ToPublicResult(result);
         }
 
         /// <summary>
