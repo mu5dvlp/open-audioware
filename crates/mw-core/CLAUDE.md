@@ -11,7 +11,12 @@ OS 非依存・デバイス非依存のコア。ミキサ、ボイス管理、�
 
 - `event`: `Event`(§4.6 イベント通知。`RouteChanged`/`Underrun`/`MusicEnded`/
   `MusicLooped`/`StreamError`/`ClipperEngaged`/`AudioInterruptionBegan`/
-  `AudioInterruptionEnded`(M3。`crates/mw-backend/src/ios_interruption.rs` が積む)の8種。
+  `AudioInterruptionEnded`(M3)の8種。`AudioInterruptionBegan`/`AudioInterruptionEnded`
+  は元々 `crates/mw-backend/src/ios_interruption.rs`(iOS/tvOS)専用に追加したが、
+  `AudioInterruptionEnded { recovered }` は M3 完了後に `crates/mw-ffi/src/handle.rs`
+  の Android(AAudio)内部再オープンの成否通知にも転用されている(iOS/tvOS と
+  それ以外でどちらか一方の経路しかコンパイルされないため競合しない。理由は
+  `Event::AudioInterruptionEnded` 自身のドキュメント参照)。
   可変長データは持たず、バリアントごとの付随データは固定サイズの数値のみ)と
   `EventQueue`(固定容量、【仮】既定64。溢れたら古いものから破棄し、破棄数を読み手側で
   逆算する、M2-6)。

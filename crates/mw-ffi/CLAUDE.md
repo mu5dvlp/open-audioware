@@ -50,14 +50,22 @@ C ABI 境界。`mw-core` / `mw-backend` 両方に依存する唯一のクレー�
   `bus_volumes`)と、再試行の可否を判定する `reopen: crate::reopen::ReopenPolicy`
   を持つ。起点は `crate::handle::maybe_reopen(handle)`(`ffi.rs::mw_poll_events`
   から呼ぶ。iOS/tvOS では `cfg` で丸ごと除去——`mw-backend::ios_interruption` の
-  既存経路と競合しないため)。設計判断・実機未検証の範囲は
-  `docs/history/04-2026-08-31.md`「M3 完了」参照。
+  既存経路と競合しないため)。**再オープンが成功した/バックオフを使い切って
+  諦めた**、いずれの結果も `Instance::notify_reopen_outcome` が既存の
+  `Event::AudioInterruptionEnded { recovered }` を再利用して通知する
+  (新しいイベント種別は追加していない。理由は `mw_core::Event::
+  AudioInterruptionEnded` のドキュメント参照。中間の失敗〔バックオフ途中〕では
+  積まない)。設計判断・実機未検証の範囲は `docs/history/04-2026-08-31.md`
+  「M3 完了」および `docs/history/05-2026-08-31.md`「再オープンを諦めたことを
+  C# 側へ通知できるようにする」参照。
 - `src/reopen.rs`(M3)— `ReopenPolicy`: 内部再オープンを**いつ試すか/いつ諦めるか**
   だけを判定する、バックエンド呼び出しを一切含まない純粋な状態機械
   (`mw-backend::ios_interruption::InterruptionState` と同じ設計方針)。バックオフ
   スケジュール `REOPEN_BACKOFF_SCHEDULE_MS`(既定 `[250, 500, 1000, 2000, 4000]`ms、
-  合計6回試行で諦める。無限リトライはしない)。実際の副作用(`CpalBackend::close/
-  open`・コマンド再送)は持たず、`handle.rs::Instance::attempt_reopen` へ委譲する。
+  合計6回試行で諦める。無限リトライはしない。**【仮】**——実機の実測分布を見ずに
+  決めた値で、`mw_core::config::Config` へは意図的に移していない〔理由は定数
+  自身のドキュメント参照〕)。実際の副作用(`CpalBackend::close/open`・コマンド
+  再送)は持たず、`handle.rs::Instance::attempt_reopen` へ委譲する。
 - `src/decode_thread.rs` — 楽曲のデコードスレッド(M2-7)。`mw_core::stream` が
   意図的に持たないスレッドをここで1本立て、`mw_init`〜`mw_shutdown` の間
   生かし続ける。`mw_music_set` のたびに立て直すのではなく、
