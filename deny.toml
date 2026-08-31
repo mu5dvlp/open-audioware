@@ -99,8 +99,12 @@ allow = [
     # MPL-2.0 はファイル単位のコピーレフト。MPL のファイルを**改変**したときにその
     # ファイルだけ公開義務が生じるもので、リンクして使う限り利用側のコードには伝播しない
     # (ゲーム本体のソース公開義務は生じない)。2026-08-23 にユーザー判断で許可した。
-    # 現在の該当クレート: audio_thread_priority(cpal の realtime フィーチャ経由。Android で
-    # AAudio の performance mode を LowLatency にするために必要。docs/measurement-m1.md §9)。
+    # 現在の該当クレートは **9 件**(2026-08-31 に `make third-party-licenses` の出力で確認):
+    #   - audio_thread_priority(cpal の realtime フィーチャ経由。Android で AAudio の
+    #     performance mode を LowLatency にするために必要。docs/measurement-m1.md §9)
+    #   - symphonia 一族 8 件(音声デコーダ。mw-core の直接依存)
+    # 🔴 **利用者は「表記」に加えて「ソースの入手方法の告知」が要る。**
+    # THIRD-PARTY-LICENSES.md がその一覧を自動で作るので、**同梱して渡すこと**。
     "MPL-2.0",
 ]
 # The confidence threshold for detecting a license from license text.

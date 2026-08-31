@@ -9,7 +9,11 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "UNLICENSED"
+# 🔴 このプロジェクト自身は MIT-0(MIT No Attribution)。**利用者に著作権表示の保持を求めない。**
+# 判断の背景と、利用者が実際に負う義務(= 依存クレート側の表記義務)は LICENSE / THIRD-PARTY-LICENSES.md
+# および README の「ライセンス」節を参照。ここを変えるときは3箇所とも揃えること
+# (Cargo.toml / unity/package.json / LICENSE)。
+license = "MIT-0"
 publish = false
 repository = "https://github.com/mu5dvlp/open-audioware"
 

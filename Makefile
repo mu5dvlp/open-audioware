@@ -34,7 +34,9 @@ XCFRAMEWORK           := $(PLUGINS_IOS_DIR)/MwFfi.xcframework
 help:
 	@echo "open-audioware — make ターゲット"
 	@echo "  make setup          - ツールチェーン・ターゲット・cargo-ndk 等の導入確認"
-	@echo "  make lint           - fmt --check + clippy -D warnings + cargo-deny"
+	@echo "  make lint           - fmt --check + clippy -D warnings + cargo-deny + 第三者表記の鮮度検査"
+	@echo "  make third-party-licenses       - THIRD-PARTY-LICENSES.md を再生成(依存を足したら必ず実行)"
+	@echo "  make third-party-licenses-check - 再生成して差分が無いか検査(CI 用)"
 	@echo "  make format         - cargo fmt (自動整形)"
 	@echo "  make test           - cargo test --workspace"
 	@echo "  make bench          - criterion ベンチ(未導入。任意)"
@@ -88,6 +90,25 @@ lint:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo deny check
+	@$(MAKE) --no-print-directory third-party-licenses-check
+
+# --- ライセンス -----------------------------------------------------------
+
+# open-audioware 自身は MIT-0(表記不要)だが、依存クレートの表記義務は消せない。
+# 利用者が自分で調べなくて済むよう、こちらで 1 枚にまとめて同梱する。
+# ⚠️ **依存を足したり消したりしたら必ず再生成すること。** `make lint` が鮮度を検査する。
+third-party-licenses:
+	@python3 scripts/gen-third-party-licenses.py
+
+# 生成物が古いまま公開されるのを防ぐ。CI(= make lint)から呼ばれる。
+# 🔴 差分が出たら `make third-party-licenses` を実行してコミットすること。
+third-party-licenses-check:
+	@python3 scripts/gen-third-party-licenses.py >/dev/null
+	@git diff --quiet -- THIRD-PARTY-LICENSES.md || ( \
+		echo "[error] THIRD-PARTY-LICENSES.md が依存構成と食い違っています。"; \
+		echo "        make third-party-licenses を実行してコミットしてください。"; \
+		exit 1 )
+	@echo "[ok] THIRD-PARTY-LICENSES.md は最新です"
 
 format:
 	cargo fmt --all
