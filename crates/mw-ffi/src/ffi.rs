@@ -605,6 +605,53 @@ pub extern "C" fn mw_bus_fade(handle: u64, bus: i32, target: f32, ms: f32) -> Mw
     }
 }
 
+/// バスの直近設定音量を取得する(R38「ツールバー連打で無音化」調査用に追加、
+/// 2026-08-31)。
+///
+/// `mw_bus_set_volume`/`mw_bus_fade` に渡した最後の目標値をそのまま返す
+/// (`Instance::bus_volume` 参照)。音声スレッドのランプがまだ収束していなくても、
+/// ここで返るのは「最終的にどこへ向かっているか」の値であり、ランプ中の瞬間値では
+/// ない——「SE/BGM/マスターのどれかが意図せず 0 になっていないか」を C# 側から
+/// 確認する診断用途にはこれで十分(何かが `mw_bus_set_volume(.., 0.0)` を呼んでいれば、
+/// 呼ばれた直後にこの値も 0 になる)。ロックフリーのアトミック読み出しのみで、
+/// コマンドは発行しない(ゲームスレッドから任意の頻度で呼んでよい)。
+///
+/// # Safety
+/// `out_volume` は書き込み可能な `f32` を指す有効なポインタであるか、null で
+/// なければならない(null は書き込みを行わず `MwResult::ErrNullPointer`)。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mw_bus_get_volume(
+    handle: u64,
+    bus: i32,
+    out_volume: *mut f32,
+) -> MwResult {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        if out_volume.is_null() {
+            return MwResult::ErrNullPointer;
+        }
+        let Some(bus) = MwBus::from_raw(bus) else {
+            return MwResult::ErrInvalidBus;
+        };
+        let result =
+            handle_registry::with_instance(handle, |instance| instance.bus_volume(bus.to_core()));
+        match result {
+            Some(volume) => {
+                // SAFETY: 上で null チェック済み。
+                unsafe {
+                    *out_volume = volume;
+                }
+                MwResult::Ok
+            }
+            None => MwResult::ErrInvalidHandle,
+        }
+    }));
+
+    match outcome {
+        Ok(result) => result,
+        Err(_) => MwResult::ErrPanic,
+    }
+}
+
 /// 楽曲を予約再生する(初期構築仕様『§4.3 楽曲再生』, M2-5)。
 ///
 /// 指定ホスト時刻にサンプル境界で発音する(`host_time_ns` は `mw_host_time_ns()` と
@@ -1578,6 +1625,25 @@ mod tests {
         assert_eq!(mw_voice_stop(handle, voice_id), MwResult::Ok);
         assert_eq!(mw_bus_set_volume(handle, 2, 0.9), MwResult::Ok);
         assert_eq!(mw_bus_fade(handle, 0, 1.0, 20.0), MwResult::Ok);
+
+        // `mw_bus_get_volume` は直近の目標値をそのまま返す(R38 調査用に追加)。
+        // フェード(`mw_bus_fade`)側も収束後の値〔target〕がすぐ読めることを確認する
+        // ——ランプが実際に収束するまで待つ必要はない(`Instance::note_bus_volume`
+        // のドキュメント参照)。
+        let mut se_volume = -1.0f32;
+        assert_eq!(
+            unsafe { mw_bus_get_volume(handle, 2, &mut se_volume as *mut f32) },
+            MwResult::Ok
+        );
+        assert!((se_volume - 0.9).abs() < 1e-6);
+
+        let mut master_volume = -1.0f32;
+        assert_eq!(
+            unsafe { mw_bus_get_volume(handle, 0, &mut master_volume as *mut f32) },
+            MwResult::Ok
+        );
+        assert!((master_volume - 1.0).abs() < 1e-6);
+
         assert_eq!(mw_sound_release(handle, sound_id), MwResult::Ok);
 
         // 解放済み ID の再利用は無効 ID として検出される(クラッシュしない)。
@@ -2271,7 +2337,7 @@ mod tests {
         //    `note_music_loop`)がこの一連の流れを通じて正しく保持されている
         //    ——`Instance::attempt_reopen` はここから読んでコマンドを再送する。
         let cached_bus_volume = handle_registry::with_instance(handle, |instance| {
-            instance.bus_volume_for_test(mw_core::BusId::Bgm)
+            instance.bus_volume(mw_core::BusId::Bgm)
         });
         assert_eq!(cached_bus_volume, Some(0.42));
         let cached_loop =
@@ -2563,6 +2629,26 @@ mod tests {
     #[test]
     fn bus_fade_rejects_invalid_bus() {
         assert_eq!(mw_bus_fade(1, 99, 1.0, 10.0), MwResult::ErrInvalidBus);
+    }
+
+    #[test]
+    fn bus_get_volume_rejects_invalid_bus() {
+        let mut out_volume = 0f32;
+        let result = unsafe { mw_bus_get_volume(1, 99, &mut out_volume as *mut f32) };
+        assert_eq!(result, MwResult::ErrInvalidBus);
+    }
+
+    #[test]
+    fn bus_get_volume_rejects_null_out_volume() {
+        let result = unsafe { mw_bus_get_volume(1, 0, std::ptr::null_mut()) };
+        assert_eq!(result, MwResult::ErrNullPointer);
+    }
+
+    #[test]
+    fn bus_get_volume_with_invalid_handle_is_invalid_handle_not_a_crash() {
+        let mut out_volume = 0f32;
+        let result = unsafe { mw_bus_get_volume(0xDEAD_BEEF_u64, 0, &mut out_volume as *mut f32) };
+        assert_eq!(result, MwResult::ErrInvalidHandle);
     }
 
     #[test]

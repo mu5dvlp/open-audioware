@@ -116,6 +116,10 @@ mw_voice_stop(handle, voice: u64) -> MwResult                     // 既定ラ�
 mw_voice_set_volume(handle, voice: u64, volume: f32) -> MwResult  // 既定ランプ経由
 mw_bus_set_volume(handle, bus: i32, volume: f32) -> MwResult      // 既定ランプ経由
 mw_bus_fade(handle, bus: i32, target: f32, ms: f32) -> MwResult   // 呼び出し側指定の時間
+mw_bus_get_volume(handle, bus: i32, out_volume: *mut f32) -> MwResult
+    // 直近の mw_bus_set_volume/mw_bus_fade が設定した目標音量を返す(ランプ中の瞬間値
+    // ではない)。R38「ツールバー連打で無音化」調査用に追加(2026-08-31)。ロックフリー
+    // 読み出しのみでコマンドは発行しない
 
 mw_music_set(handle, sound_id: u64) -> MwResult
     // ストリーミング再生の準備(初期構築仕様 §4.3, M2-7)。sound_id は mode=Music の

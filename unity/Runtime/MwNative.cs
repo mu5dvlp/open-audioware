@@ -528,6 +528,26 @@ namespace Mw.Native
             return ToPublicResult(native);
         }
 
+        /// <summary>
+        /// バスの直近設定音量を取得する(R38「ツールバー連打で無音化」調査用に追加、
+        /// 2026-08-31)。
+        /// <para>
+        /// <see cref="BusSetVolume"/>/<see cref="BusFade"/> に渡した最後の目標値をそのまま
+        /// 返す。音声スレッドのランプがまだ収束していなくても、ここで返るのは
+        /// 「最終的にどこへ向かっているか」の値であり、ランプ中の瞬間値ではない。
+        /// 「SE/BGM/マスターのどれかが意図せず 0 になっていないか」を確認する
+        /// 診断用途にはこれで十分。コマンドを発行しないロックフリー読み出しのため、
+        /// ゲームスレッドから任意の頻度で呼んでよい。
+        /// </para>
+        /// </summary>
+        public static unsafe MwResult BusGetVolume(ulong handle, Bus bus, out float volume)
+        {
+            float v = 0f;
+            Generated.MwResult native = NativeMethods.mw_bus_get_volume(handle, (int)bus, &v);
+            volume = v;
+            return ToPublicResult(native);
+        }
+
         // --- 楽曲・クロック(M2)------------------------------------------------
 
         /// <summary>

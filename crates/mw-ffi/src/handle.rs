@@ -366,10 +366,18 @@ impl Instance {
         )
     }
 
-    /// 診断用: 再オープン復元キャッシュのバス音量を覗く。テスト専用
-    /// (`bus_volumes` フィールドは private なので、外から確認するにはこの経路が要る)。
-    #[cfg(test)]
-    pub fn bus_volume_for_test(&self, bus: BusId) -> f32 {
+    /// 直近の `mw_bus_set_volume`/`mw_bus_fade` が設定した目標音量を読む
+    /// (`mw_bus_get_volume` の実体。R38 調査用に追加、2026-08-31)。
+    ///
+    /// <b>ここで返るのは「最後に指定された目標値」であり、音声スレッドのランプが
+    /// 実際に収束済みの瞬間値ではない</b>(`note_bus_volume` のドキュメント参照。
+    /// フェードの途中経過ではなく収束後の値をキャッシュする設計はもともと M3 の
+    /// 再オープン復元キャッシュ用に存在していた)。診断用途(「SE/BGM/マスターの
+    /// どれかが意図せず 0 になっていないか」の確認)にはこれで十分——何かが
+    /// `mw_bus_set_volume(.., 0.0)`/`mw_bus_fade(.., 0.0, ..)` を呼んでいれば、
+    /// 呼ばれた直後にこの値も 0 になる。`bus_volumes` フィールドは private なので、
+    /// 外から読むにはこの経路が要る。
+    pub fn bus_volume(&self, bus: BusId) -> f32 {
         f32::from_bits(self.bus_volumes[bus.index()].load(Ordering::Relaxed))
     }
 
