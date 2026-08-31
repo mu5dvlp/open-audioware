@@ -534,3 +534,101 @@ fn classify_stream_error(err: &cpal::Error) -> StreamErrorReason {
         _ => StreamErrorReason::Backend,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **Android(AAudio)切断の通知経路がまだ生きていることを固定化する回帰テスト。**
+    ///
+    /// M3「Android の AAudio 切断復旧」調査(2026-08-31、`docs/history/03-2026-08-31.md`
+    /// 参照)で、cpal 0.18.1 の AAudio ホスト実装(`~/.cargo/.../cpal-0.18.1/src/host/
+    /// aaudio/mod.rs::build_output_stream` の `error_callback`)と ndk 0.9.0
+    /// (`~/.cargo/.../ndk-0.9.0/src/audio.rs` の `AudioStreamBuilder::error_callback` doc)
+    /// をソースで確認した結果、AAudio が `AAUDIO_ERROR_DISCONNECTED` を出すと
+    /// cpal は `ndk::audio::AudioError::Disconnected` → `cpal::ErrorKind::
+    /// DeviceNotAvailable`(`cpal-0.18.1/src/host/aaudio/convert.rs::impl From<AudioError>
+    /// for Error`)へ変換したうえで、このクレートが `build_output_stream` に渡した
+    /// `err_fn` を呼ぶ(iOS のルート変化と同じ経路、M2-6 から存在)。
+    ///
+    /// つまり **Android の切断通知そのものは既存のコードパスで既に届いている**——
+    /// この `classify_stream_error(ErrorKind::DeviceNotAvailable)` が
+    /// `StreamErrorReason::DeviceUnavailable` を返し続ける限り、C# 側は
+    /// `mw_poll_events` 経由で「デバイスが無くなった」ことを検知できる。
+    ///
+    /// このテストが守っているのはあくまで**分類ロジック**(cpal のホスト実装や
+    /// ndk クレートの実機呼び出しそのものは自動テスト不可)。実機での「AAudio が
+    /// 実際に `AAUDIO_ERROR_DISCONNECTED` を出すか」「その後ストリームを再構築すれば
+    /// 音が戻るか」(iOS の `pause()`→`play()` とは異なり、AAudio の切断は終端的で
+    /// ストリームの作り直しが要る。`ndk-0.9.0/src/audio.rs` の `AudioError::Disconnected`
+    /// doc「The stream cannot be used after the device is disconnected. Applications
+    /// should stop and close the stream.」参照)は実機検証でしか確認できない。
+    #[test]
+    fn device_not_available_classifies_as_device_unavailable_the_aaudio_disconnect_path() {
+        let err = cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable);
+        assert_eq!(
+            classify_stream_error(&err),
+            StreamErrorReason::DeviceUnavailable
+        );
+    }
+
+    /// host 不在(PulseAudio/PipeWire/JACK 等が無い)も同じ `DeviceUnavailable` へ丸める
+    /// ——C# 側の分岐粒度は「デバイスに到達できない」でひとまとめにする設計(関数 doc参照)。
+    #[test]
+    fn host_unavailable_also_classifies_as_device_unavailable() {
+        let err = cpal::Error::new(cpal::ErrorKind::HostUnavailable);
+        assert_eq!(
+            classify_stream_error(&err),
+            StreamErrorReason::DeviceUnavailable
+        );
+    }
+
+    /// 一時的にデバイスが使用中(他アプリが握っている等)も同じグループ。
+    #[test]
+    fn device_busy_also_classifies_as_device_unavailable() {
+        let err = cpal::Error::new(cpal::ErrorKind::DeviceBusy);
+        assert_eq!(
+            classify_stream_error(&err),
+            StreamErrorReason::DeviceUnavailable
+        );
+    }
+
+    /// iOS のルート変化(`AVAudioSessionRouteChangeNotification`)がここへ来ることは
+    /// 実機で確認済み(`ios_interruption.rs` モジュール doc「追記: ルート変化」参照)。
+    /// `Reconfigured` は「再構築すれば直る」という意味なので、iOS はここには来ず
+    /// `ios_interruption::Watcher` が別経路で `pause()`→`play()` を試みる
+    /// ——`err_fn` 経由のこの分類はあくまでイベント通知用で、iOS の復帰処理自体は
+    /// `AVAudioSessionRouteChangeNotification` の直接監視によって行われる(cpal の
+    /// `err_fn` はルート変化時に `AudioUnit`/`playing` フラグへ一切触れないため、
+    /// 二重処理にはならない。`ios_interruption.rs` 参照)。
+    #[test]
+    fn stream_invalidated_and_device_changed_classify_as_reconfigured() {
+        for kind in [
+            cpal::ErrorKind::StreamInvalidated,
+            cpal::ErrorKind::DeviceChanged,
+        ] {
+            let err = cpal::Error::new(kind);
+            assert_eq!(classify_stream_error(&err), StreamErrorReason::Reconfigured);
+        }
+    }
+
+    #[test]
+    fn permission_denied_classifies_as_permission_denied() {
+        let err = cpal::Error::new(cpal::ErrorKind::PermissionDenied);
+        assert_eq!(
+            classify_stream_error(&err),
+            StreamErrorReason::PermissionDenied
+        );
+    }
+
+    /// 上記4分類のどれにも当てはまらない残り(`InvalidInput`/`RealtimeDenied`/
+    /// `ResourceExhausted`/`UnsupportedConfig` 等)は `Backend` へ丸める
+    /// (関数 doc「C# 側が実用的に分岐できる粒度」参照)。代表として1つだけ固定化する
+    /// ——将来 cpal が `ErrorKind` へバリアントを追加しても(`#[non_exhaustive]`)、
+    /// `_ =>` 分岐がある限りこのテストは影響を受けない。
+    #[test]
+    fn unmatched_kinds_fall_back_to_backend() {
+        let err = cpal::Error::new(cpal::ErrorKind::ResourceExhausted);
+        assert_eq!(classify_stream_error(&err), StreamErrorReason::Backend);
+    }
+}
