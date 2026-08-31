@@ -27,6 +27,9 @@ pub enum MwEventKind {
     AudioInterruptionBegan = 6,
     /// 割り込みが終わった/復帰を試みた(M3)。`payload` は
     /// `mw_core::Event::AudioInterruptionEnded::recovered`(0 or 1)をそのまま `u64` 化。
+    /// **iOS/tvOS 専用ではない**: Android(AAudio)切断からの内部再オープンの成否
+    /// (成功、またはバックオフを使い切って断念)もこの種別を再利用して通知する
+    /// (`mw_core::Event::AudioInterruptionEnded` のドキュメント参照)。
     AudioInterruptionEnded = 7,
 }
 

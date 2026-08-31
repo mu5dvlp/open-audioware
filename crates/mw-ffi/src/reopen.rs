@@ -38,10 +38,26 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-/// 再オープン試行の待機スケジュール(ミリ秒)。[`ReopenPolicy`] が
+/// 再オープン試行の待機スケジュール(ミリ秒)。**【仮】**——実機(Android/AAudio)の
+/// 「切断してから再接続可能になるまで」の実測分布を見ずに決めた値
+/// (`docs/history/04-2026-08-31.md`「判断に迷い、勝手に確定させなかった点」参照。
+/// 長すぎる/短すぎるかは実機でしか判断できない)。[`ReopenPolicy`] が
 /// [`ios_interruption::RECOVERY_WAIT_SCHEDULE_MS`](../../mw-backend/src/ios_interruption.rs)
 /// と同じ「定数1箇所に集約」方針で、これを使い切ったら [`ReopenPolicy::is_exhausted`] が
 /// `true` になる(無限リトライ禁止)。
+///
+/// 実機計測後に見直す場合は、この配列(1箇所)を書き換えるだけで済む。
+/// **意図的に `mw_core::config::Config` へは移していない**(判断): このプロジェクトの
+/// 流儀では `Config` は `Renderer::build` へ実際に注入される mw-core 内部の描画パス
+/// 寄りの値の置き場所であり(`config.rs` モジュール doc)、バックエンド固有の復旧
+/// タイミング定数は対象クレートにローカルな `pub const` として持たせる先例が既にある
+/// (`ios_interruption::RECOVERY_WAIT_SCHEDULE_MS` も同様に `mw_core::config::Config` の
+/// フィールドではない)。加えて `mw_init` は現時点で C# 側から設定値を注入する経路
+/// 自体を持たない(`Config` のドキュメント「M1 時点では FFI からの上書きは未実装。
+/// M8 相当」)ため、ここだけ設定構造体へ格上げしても実際には誰も上書きできず、
+/// 複雑さが増えるだけで得るものが無い。初期構築仕様の凡例【仮】が要求する
+/// 「1箇所を書き換えれば済む構造(設定構造体 / 定数)」は、この `pub const` 1個で
+/// 既に満たしている。
 pub const REOPEN_BACKOFF_SCHEDULE_MS: [u64; 5] = [250, 500, 1_000, 2_000, 4_000];
 
 /// 再オープンをバックオフ付きで試行するかどうかを判定する、副作用を持たない状態機械。

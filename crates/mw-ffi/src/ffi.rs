@@ -2155,6 +2155,13 @@ mod tests {
         // (`Instance::reopen_diagnostics`)。`mw_poll_events` を呼ぶたびに
         // `maybe_reopen` がバックオフ条件を満たせば試行するので、数回ポーリングする
         // 形でも「再オープンが起きること」の検証として十分。
+        //
+        // 同じループの中で、成功した瞬間に一度だけ積まれるはずの
+        // `Event::AudioInterruptionEnded { recovered: true }`(作業①: 再オープン成功の
+        // C# 側への通知。既存イベント種別の転用)も見逃さず捕捉する——`drain` は
+        // 読み出した分をキューから消費するため、`reopen_diagnostics` の確認とは別の
+        // タイミングで改めてポーリングすると、この1回きりのイベントを取りこぼす。
+        let mut observed_recovered_event = false;
         let reopened_successfully = wait_until(
             || {
                 let mut buf = [MwEvent {
@@ -2162,7 +2169,7 @@ mod tests {
                     payload: 0,
                 }; 8];
                 let mut dropped = 0u32;
-                let _ = unsafe {
+                let written = unsafe {
                     mw_poll_events(
                         handle,
                         buf.as_mut_ptr(),
@@ -2170,6 +2177,13 @@ mod tests {
                         &mut dropped as *mut u32,
                     )
                 };
+                if written > 0
+                    && buf[..written as usize]
+                        .iter()
+                        .any(|e| e.kind == MwEventKind::AudioInterruptionEnded && e.payload == 1)
+                {
+                    observed_recovered_event = true;
+                }
                 handle_registry::with_instance(handle, |instance| instance.reopen_diagnostics())
                     .map(|(pending, _attempts, exhausted)| !pending && !exhausted)
                     .unwrap_or(false)
@@ -2180,6 +2194,12 @@ mod tests {
             reopened_successfully,
             "attempt_reopen must succeed when a real output device is still available \
              (this environment cannot force backend.open() to fail — see module doc)"
+        );
+        assert!(
+            observed_recovered_event,
+            "a successful internal reopen must notify the client via \
+             Event::AudioInterruptionEnded {{ recovered: true }} (reused, not a new event kind \
+             — see mw_core::Event::AudioInterruptionEnded doc)"
         );
 
         // --- 復元の検証 ---
@@ -2298,12 +2318,21 @@ mod tests {
         assert_eq!(dropped, 0);
 
         // 依頼書のテスト要件3: ポーリングでキューが空になる/2回目は0件。
+        //
+        // `reason` にあえて `DeviceUnavailable` 以外(`Backend`)を選んでいる:
+        // `DeviceUnavailable` を注入すると `mw_poll_events` のドレイン中に
+        // `Instance::note_stream_error` が内部再オープン(M3、`crate::reopen` 参照)の
+        // 候補として記録してしまい、この関数の意図(FFI 境界の汎用ドレイン挙動の確認、
+        // 再オープン機能とは無関係)に対して無用な副作用(実デバイスがあれば
+        // `maybe_reopen` が実際に再オープンを試み、`Event::AudioInterruptionEnded` を
+        // 積んでしまい、下の「フルドレイン後は0件」の前提を壊す)が混ざる
+        // (再オープン自体の専用テストは `run_reopen_lifecycle`)。
         let injected = handle_registry::with_instance(handle, |instance| {
             instance.events.push_realtime(mw_core::Event::MusicEnded);
             instance
                 .events
                 .push_side_channel(mw_core::Event::StreamError {
-                    reason: mw_core::StreamErrorReason::DeviceUnavailable,
+                    reason: mw_core::StreamErrorReason::Backend,
                 });
         });
         assert!(injected.is_some(), "handle must still be valid");
@@ -2322,7 +2351,7 @@ mod tests {
             buf[1],
             MwEvent {
                 kind: MwEventKind::StreamError,
-                payload: mw_core::StreamErrorReason::DeviceUnavailable as u64
+                payload: mw_core::StreamErrorReason::Backend as u64
             }
         );
 

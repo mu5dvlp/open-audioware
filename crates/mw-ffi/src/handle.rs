@@ -453,6 +453,18 @@ impl Instance {
     /// 実機でしか確認できない)——失敗した場合も `Instance` は次の呼び出しでまた
     /// 試せる一貫した状態のままになる(`self.backend` は単に「開いていない」状態、
     /// 既存の `mw_get_output_latency_ns` 等は 0/既定値を返すだけでパニックしない)。
+    ///
+    /// ## 結果の C# への通知(`docs/history/04-2026-08-31.md`「再オープンを諦めたことを
+    /// C# 側へ通知できるようにする」)
+    ///
+    /// 成功時・「諦めた」時のどちらも [`Instance::notify_reopen_outcome`] が
+    /// `Event::AudioInterruptionEnded { recovered }`(既存のイベント種別を転用。
+    /// 新種別は追加していない——理由は `mw_core::Event::AudioInterruptionEnded` の
+    /// ドキュメント参照)を積む。**中間の失敗(まだバックオフの途中)では積まない**——
+    /// 通知するのは「これ以上自動では回復しない」ことが確定した瞬間(バックオフを
+    /// 使い切った瞬間)と、実際に音が戻った瞬間だけに絞ってある(そうしないと
+    /// バックオフ中の一時的な失敗のたびにイベントが積まれ、C# 側から見て
+    /// 「まだ試行中なのか、もう諦めたのか」が読み取りにくくなる)。
     fn attempt_reopen(&mut self, now_ns: u64) -> bool {
         // 1) セッションを壊す前に、復元に要る情報をすべて読み取っておく。
         let clock_before = self.music_clock.snapshot();
@@ -541,6 +553,9 @@ impl Instance {
 
                 mw_backend::mw_log!("[mw-ffi] internal stream reopen succeeded");
                 self.reopen.record_result(true, now_ns);
+                // 🔴 音が戻ったことを C# 側へ通知する(`Instance::notify_reopen_outcome`
+                // のドキュメント参照)。
+                self.notify_reopen_outcome(true);
                 true
             }
             Err(err) => {
@@ -556,10 +571,29 @@ impl Instance {
                          is observed",
                         self.reopen.attempts()
                     );
+                    // 🔴 諦めたことを C# 側へ通知する(作業①: 直前まで `mw_log!` にしか
+                    // 出ていなかったため、C# 側に「音が永久に死んだ」ことを知る手段が
+                    // 無かった。`Instance::notify_reopen_outcome` のドキュメント参照)。
+                    self.notify_reopen_outcome(false);
                 }
                 false
             }
         }
+    }
+
+    /// 内部再オープン(案A)の最終結果を C# 側へ通知する
+    /// ([`Instance::attempt_reopen`] のドキュメント「結果の C# への通知」参照)。
+    ///
+    /// **既存の `Event::AudioInterruptionEnded { recovered }` を転用する**(新しい
+    /// イベント種別は追加していない——`mw_core::Event::AudioInterruptionEnded` の
+    /// ドキュメント参照)。呼び出し元(`attempt_reopen`)は必ずゲームスレッドから
+    /// 呼ばれる(初期構築仕様『§5.3』の対象外)ので、`cpal` のエラーコールバックが
+    /// `StreamError` を積むのと同じ [`EventQueue::push_side_channel`] を使う
+    /// (`push_realtime` は音声スレッド専用の単一書き手前提のため、ここでは使えない/
+    /// 使う必要が無い)。
+    fn notify_reopen_outcome(&self, recovered: bool) {
+        self.events
+            .push_side_channel(mw_core::Event::AudioInterruptionEnded { recovered });
     }
 
     /// 4本のバスの音量を再送する([`Instance::attempt_reopen`] 手順6)。

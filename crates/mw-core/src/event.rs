@@ -130,6 +130,21 @@ pub enum Event {
     /// 再開不要(`AVAudioSessionInterruptionOptionShouldResume` 無し)と判断した場合は
     /// 復帰を試みず `recovered: false` で積む**(何もしていないので「成功していない」
     /// が正確)。
+    ///
+    /// **iOS/tvOS 専用ではない**: Android(AAudio)切断からのミドルウェア内部再オープン
+    /// (`crates/mw-ffi/src/handle.rs::Instance::attempt_reopen`、初期構築仕様『§6』案A、
+    /// M3 完了時点で追加)が、再オープンに**成功した**/バックオフを使い切って
+    /// **諦めた**、いずれの結果もこのバリアントを再利用して通知する
+    /// (`Instance::notify_reopen_outcome`)。新しいバリアントを追加しなかった理由:
+    /// 「ストリームレベルの復帰を試みた結果」という意味(`recovered: bool` で
+    /// 十分表現できる)が両者で完全に一致するため。iOS/tvOS では
+    /// `ios_interruption.rs` の経路のみ、それ以外では `mw-ffi::reopen` の経路のみが
+    /// コンパイルされる(`cfg` で排他)ので、C# 側が発生源(OS 割り込み復帰か
+    /// デバイス再オープンか)を区別する必要は無い——「音がまた鳴ったか/鳴らなく
+    /// なったままか」という受け手にとっての意味は共通のため。
+    /// [`Event::AudioInterruptionBegan`] に相当する「開始」通知は Android 側には
+    /// 積まない——切断そのものは既に `Event::StreamError { reason:
+    /// StreamErrorReason::DeviceUnavailable }` として通知済みで、その役目を兼ねている。
     AudioInterruptionEnded { recovered: bool },
 }
 

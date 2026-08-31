@@ -197,6 +197,28 @@ namespace Mw.Native.Tests
             Assert.AreEqual(4, Marshal.SizeOf(Enum.GetUnderlyingType(typeof(EventKind))), "MwEventKind is #[repr(i32)] on the native side");
         }
 
+        /// <summary>
+        /// <see cref="EventKind"/> の判別子はネイティブ側 <c>MwEventKind</c>
+        /// (<c>crates/mw-ffi/src/event.rs</c>)と1:1で同期させる契約になっている
+        /// (csbindgen が生成しない手書きの列挙のため、ズレを機械的には検出できない)。
+        /// <see cref="EventKind.AudioInterruptionEnded"/> は M3 で iOS/tvOS 用に
+        /// 追加された後、C# 側の列挙に反映されないまま残っていた欠落を埋めたもの
+        /// (Android 内部再オープンの結果通知〔このテストが書かれた作業〕で
+        /// 再利用するために必要になった)。
+        /// </summary>
+        [Test]
+        public void EventKind_ValuesMatchNativeDiscriminants()
+        {
+            Assert.AreEqual(0, (int)EventKind.RouteChanged);
+            Assert.AreEqual(1, (int)EventKind.Underrun);
+            Assert.AreEqual(2, (int)EventKind.MusicEnded);
+            Assert.AreEqual(3, (int)EventKind.MusicLooped);
+            Assert.AreEqual(4, (int)EventKind.StreamError);
+            Assert.AreEqual(5, (int)EventKind.ClipperEngaged);
+            Assert.AreEqual(6, (int)EventKind.AudioInterruptionBegan);
+            Assert.AreEqual(7, (int)EventKind.AudioInterruptionEnded);
+        }
+
         /// <summary>溜まっているイベントを空になるまで読み捨てる。</summary>
         private static void DrainEvents(ulong handle)
         {
