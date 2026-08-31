@@ -18,5 +18,6 @@ mod handle;
 // Android の JNI エントリポイント。**csbindgen の入力に含めない**
 // (理由はモジュール doc と build.rs のコメントを参照)。
 mod jni_entry;
+mod reopen;
 mod result;
 mod types;

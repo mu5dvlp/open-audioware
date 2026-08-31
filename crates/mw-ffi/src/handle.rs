@@ -19,17 +19,19 @@
 //!   理由は [`MUSIC_ID_FLAG`] のドキュメント参照。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 use mw_backend::{Backend, CpalBackend};
 use mw_core::{
-    BgmStatePublisher, CommandSender, Config, EventQueue, MusicClockPublisher, MusicClockSnapshot,
-    MusicDecoder, MusicState, ReclaimReceiver, Renderer, SoundStorage,
+    BUS_COUNT, BgmStatePublisher, BusId, Command, CommandSender, Config, EventQueue,
+    MusicClockPublisher, MusicClockSnapshot, MusicDecoder, MusicState, ReclaimReceiver, Renderer,
+    SoundStorage, StreamErrorReason, SymphoniaDecoder,
 };
 
 use crate::decode_thread::{self, DecoderSender};
+use crate::reopen::ReopenPolicy;
 
 /// 出力デバイスが実際にオープンされるまでの暫定サンプルレート(§4.7 推奨の 48kHz)。
 /// `CpalBackend::open` がデバイスとネゴシエートした実レートで上書きする
@@ -98,6 +100,33 @@ pub struct Instance {
     bgm_decode_thread_stop: Arc<AtomicBool>,
     /// BGM 用デコードスレッドの join ハンドル(`decode_thread` の BGM 版)。
     bgm_decode_thread: Option<JoinHandle<()>>,
+
+    // --- M3「Android(AAudio)切断復旧」案A(初期構築仕様『§6』確定) ------------------
+    //
+    // 内部再オープン(`Instance::attempt_reopen`)は `Renderer`/`Mixer` を丸ごと
+    // 作り直す(=上のハンドル一式をすべて差し替える)ため、復元に要る情報は
+    // `Renderer` の外側(=このキャッシュ)に持っておく必要がある。`sounds`/
+    // `music_bytes` は元々ここにあり再オープンでも触らないため、「ロード済みの
+    // SoundId が無効にならない」は追加のキャッシュ無しで自動的に満たされる
+    // (`Instance::attempt_reopen` のドキュメント参照)。
+    /// 直近の `mw_music_set` が指定した楽曲 ID(0 = 未設定)。再オープン後に同じ曲を
+    /// 読み直すために使う。
+    last_music_sound_id: AtomicU64,
+    /// 直近の `mw_music_set_loop` が設定したループ区間(`mw_music_set` のたびに
+    /// `None` へ仕切り直す——`MusicVoice::prepare` 自身がループ区間を無条件に
+    /// 初期化する挙動と揃えるため。`Instance::note_music_set` 参照)。
+    last_music_loop: Mutex<Option<(u64, u64)>>,
+    /// `last_music_sound_id` の BGM 版。
+    last_bgm_sound_id: AtomicU64,
+    /// `last_music_loop` の BGM 版。
+    last_bgm_loop: Mutex<Option<(u64, u64)>>,
+    /// 4バスの直近の音量(`mw_bus_set_volume`/`mw_bus_fade` の目標値。`f32::to_bits`/
+    /// `from_bits` で `AtomicU32` へ格納する——`f32` 自体は atomic 型が無いため)。
+    /// 既定値は `mw_core::bus::Bus::new()` と同じ 1.0。
+    bus_volumes: [AtomicU32; BUS_COUNT],
+    /// 切断からの内部再オープンを試みるかどうかの判定(`crate::reopen::ReopenPolicy`
+    /// のドキュメント参照)。
+    reopen: ReopenPolicy,
 }
 
 impl Instance {
@@ -263,6 +292,378 @@ impl Instance {
     pub fn log_new_output_underruns(&self) {
         self.backend.log_new_output_underruns();
     }
+
+    // --- M3「Android(AAudio)切断復旧」案A ---------------------------------------
+
+    /// `mw_music_set` が成功した後に呼ぶ復元キャッシュの更新
+    /// (`Instance::attempt_reopen` が使う)。`MusicVoice::prepare` 自身がループ区間を
+    /// 無条件に初期化する挙動(`music.rs::MusicVoice::prepare`)に揃え、ここでも
+    /// ループキャッシュを一緒に仕切り直す——そうしないと、曲を切り替えた後の
+    /// 再オープンで前の曲のループ区間を新しい曲へ誤って復元してしまう。
+    pub fn note_music_set(&self, sound_id: u64) {
+        self.last_music_sound_id.store(sound_id, Ordering::Relaxed);
+        *self
+            .last_music_loop
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    /// `mw_music_set_loop` が成功した後に呼ぶ復元キャッシュの更新。
+    pub fn note_music_loop(&self, region: Option<(u64, u64)>) {
+        *self
+            .last_music_loop
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = region;
+    }
+
+    /// [`Instance::note_music_set`] の BGM 版。
+    pub fn note_bgm_set(&self, sound_id: u64) {
+        self.last_bgm_sound_id.store(sound_id, Ordering::Relaxed);
+        *self
+            .last_bgm_loop
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    /// [`Instance::note_music_loop`] の BGM 版。
+    pub fn note_bgm_loop(&self, region: Option<(u64, u64)>) {
+        *self
+            .last_bgm_loop
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = region;
+    }
+
+    /// `mw_bus_set_volume`/`mw_bus_fade` が成功した後に呼ぶ復元キャッシュの更新
+    /// (フェードは最終的な目標値〔`target`〕をキャッシュする——再オープン後は
+    /// フェードの途中経過ではなく収束後の値へ即座に復元する設計、
+    /// `Instance::restore_bus_volumes` 参照)。
+    pub fn note_bus_volume(&self, bus: BusId, volume: f32) {
+        self.bus_volumes[bus.index()].store(volume.to_bits(), Ordering::Relaxed);
+    }
+
+    /// `mw_poll_events` の drain コールバックから、読み出した各イベントについて呼ぶ。
+    /// `reason == DeviceUnavailable` のときだけ内部再オープン(案A)の対象として記録する
+    /// (`crate::reopen::ReopenPolicy::mark_pending`)。**それ以外の reason
+    /// (`Reconfigured`/`PermissionDenied`/`Backend`)はここでは何もしない**——
+    /// `Reconfigured`(iOS のルート変化)は `mw-backend::ios_interruption` が既に
+    /// 独自の経路(`pause()`→`play()`)で扱っており、ここで反応すると二重処理になる
+    /// (依頼書「🔴 iOS を壊さないこと」)。
+    pub fn note_stream_error(&self, reason: StreamErrorReason) {
+        if reason == StreamErrorReason::DeviceUnavailable {
+            self.reopen.mark_pending(mw_backend::host_time_ns());
+        }
+    }
+
+    /// 診断用: 内部再オープンの判定状態を覗く(`(保留中か, 連続失敗回数, 諦めたか)`)。
+    /// テスト専用——FFI には公開しない([`crate::reopen::ReopenPolicy`] のフィールドは
+    /// すべて private なので、外から状態を確認するにはこの経路が要る)。
+    #[cfg(test)]
+    pub fn reopen_diagnostics(&self) -> (bool, u32, bool) {
+        (
+            self.reopen.is_pending(),
+            self.reopen.attempts(),
+            self.reopen.is_exhausted(),
+        )
+    }
+
+    /// 診断用: 再オープン復元キャッシュのバス音量を覗く。テスト専用
+    /// (`bus_volumes` フィールドは private なので、外から確認するにはこの経路が要る)。
+    #[cfg(test)]
+    pub fn bus_volume_for_test(&self, bus: BusId) -> f32 {
+        f32::from_bits(self.bus_volumes[bus.index()].load(Ordering::Relaxed))
+    }
+
+    /// 診断用: 再オープン復元キャッシュの楽曲ループ区間を覗く。テスト専用。
+    #[cfg(test)]
+    pub fn music_loop_for_test(&self) -> Option<(u64, u64)> {
+        *self
+            .last_music_loop
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// デコードスレッド(楽曲・BGM の両方)を停止・join する。`mw_shutdown` と
+    /// `attempt_reopen` の両方から呼ばれる共通処理(元は `shutdown` 内に直接
+    /// 書かれていたが、再オープンでも同じ手順が要るためここへ切り出した)。
+    fn stop_and_join_decode_threads(&mut self) {
+        self.decode_thread_stop.store(true, Ordering::Relaxed);
+        if let Some(join_handle) = self.decode_thread.take() {
+            // デコードスレッド内部は catch_unwind で panic を握りつぶす設計
+            // (`crate::decode_thread` 参照)なので、ここでの `Err`(パニック伝播)は
+            // 理論上起こらない。万一起きても続行する。
+            let _ = join_handle.join();
+        }
+        self.bgm_decode_thread_stop.store(true, Ordering::Relaxed);
+        if let Some(join_handle) = self.bgm_decode_thread.take() {
+            let _ = join_handle.join();
+        }
+    }
+
+    /// 案A(初期構築仕様『§6』確定): ミドルウェア内部でストリームを再オープンし、
+    /// できる限り状態を復元する。
+    ///
+    /// **必ずゲームスレッドから呼ぶこと**(`handle_registry::maybe_reopen` 経由)。
+    /// `Renderer::build_with_events`/デコードスレッドの `thread::spawn` はいずれも
+    /// ヒープアロケーションを伴うため、初期構築仕様『§5.3』のリアルタイム安全性規約の
+    /// 対象である音声コールバックから呼んではならない(依頼書「⚠️ 再オープンは
+    /// ゲームスレッド側でやること」)。
+    ///
+    /// ## 復元できる状態・できない状態
+    ///
+    /// - **楽曲の再生位置**(いちばん重要): `music_clock` のスナップショットが持つ
+    ///   `song_frames`/`state` を [`Instance::restore_music`] が
+    ///   `MusicPrepare`→`MusicSeek`→(再生中だったときのみ)`MusicPlayScheduled` として
+    ///   再送する。§4.3 で元から用意されているコマンド列(`mw_music_set` と同じ順序
+    ///   厳守)を再利用しているだけで、専用の復元経路を新設してはいない。
+    /// - **バス音量**: `bus_volumes` キャッシュから4本とも `SetBusVolume` を再送する
+    ///   ([`Instance::restore_bus_volumes`])。
+    /// - **ロード済みの `SoundId`**: `sounds`/`music_bytes` はこのメソッドが一切
+    ///   触れないストレージ(`Instance` 直下に元々ある。`Renderer`/`Mixer` の外側)
+    ///   なので、無条件に有効なまま残る——追加の復元処理は不要。
+    /// - **ループ設定**: `last_music_loop`/`last_bgm_loop` キャッシュから
+    ///   `MusicSetLoop`/`BgmSetLoop` を再送する。
+    /// - **効果音の発音**: 復元しない(依頼書「捨ててよい」)。`VoicePool` は
+    ///   `Renderer::build_with_events` によって丸ごと新規生成されるため、鳴っていた
+    ///   SE ボイスは失われる。理由: 発音は短命(初期構築仕様『§4.2』)で、かつ
+    ///   「何が鳴っていたか」を再現するには発音時刻・残り再生位置まで追跡する
+    ///   専用の状態が要り、投資に見合わないと判断した。
+    /// - **BGM の再生位置**: 復元しない(既知の制約)。`mw_core::BgmStatePublisher`
+    ///   は状態(`MusicState`)だけを公開する設計で、そもそもフレーム位置を読み出す
+    ///   経路が無い(M14「BGM はクロックを持たない」——位置を公開する仕組み自体が
+    ///   無い)。ロード済みトラック・ループ区間は復元するが、**再生中だった場合も
+    ///   自動では再生を再開しない**(Ready で止める)。理由: BGM の再生開始
+    ///   (`Command::BgmPlay`)は `MusicVoice::play()` が `Ready` 状態でのみ有効という
+    ///   即時 API で、楽曲側の `MusicPlayScheduled`(プリロール未完了なら自動的に
+    ///   繰り下げる仕組み、§4.3)に相当する「準備完了を待ってから発火する」経路が
+    ///   BGM には無い。ここでゲームスレッドをブロックして `Ready` になるまで
+    ///   スピン待機する実装も検討したが、再オープンという1回きりの処理のために
+    ///   新しい待ち合わせパターンを持ち込むほどの価値は無いと判断し、見送った——
+    ///   BGM はメタ画面のループ BGM 用途(初期構築仕様『§2』M14)であり、無音に
+    ///   戻ってもゲーム進行(判定)には影響しない。クライアント側が `mw_bgm_state`
+    ///   をポーリングして `Ready` を検知したら `mw_bgm_play` を呼び直せば復帰できる。
+    ///
+    /// ## 再オープンに失敗したとき
+    ///
+    /// このメソッドは1回試すだけで、結果を [`ReopenPolicy::record_result`] に記録して
+    /// 返す。**無限リトライはしない**——呼び出し元(`handle_registry::maybe_reopen`)は
+    /// `ReopenPolicy` のバックオフに従い間隔を空けて再試行し、既定
+    /// [`crate::reopen::REOPEN_BACKOFF_SCHEDULE_MS`] を使い切ったら自動での再試行を
+    /// 諦める(`crate::reopen` モジュール doc「無限リトライを禁止する」参照)。
+    /// 🔴 `default_output_device()` が切断直後に使える保証は無い(依頼書の指摘。
+    /// 実機でしか確認できない)——失敗した場合も `Instance` は次の呼び出しでまた
+    /// 試せる一貫した状態のままになる(`self.backend` は単に「開いていない」状態、
+    /// 既存の `mw_get_output_latency_ns` 等は 0/既定値を返すだけでパニックしない)。
+    fn attempt_reopen(&mut self, now_ns: u64) -> bool {
+        // 1) セッションを壊す前に、復元に要る情報をすべて読み取っておく。
+        let clock_before = self.music_clock.snapshot();
+        let bgm_state_before = self.bgm_state.read();
+        let saved_music_sound_id = {
+            let id = self.last_music_sound_id.load(Ordering::Relaxed);
+            (id != 0).then_some(id)
+        };
+        let saved_music_loop = *self
+            .last_music_loop
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved_bgm_sound_id = {
+            let id = self.last_bgm_sound_id.load(Ordering::Relaxed);
+            (id != 0).then_some(id)
+        };
+        let saved_bgm_loop = *self
+            .last_bgm_loop
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved_bus_volumes: [f32; BUS_COUNT] =
+            std::array::from_fn(|i| f32::from_bits(self.bus_volumes[i].load(Ordering::Relaxed)));
+
+        mw_backend::mw_log!(
+            "[mw-ffi] attempting internal stream reopen (attempt={}, music_state={:?}, \
+             music_frames={}, bgm_state={:?})",
+            self.reopen.attempts() + 1,
+            clock_before.state,
+            clock_before.song_frames,
+            bgm_state_before,
+        );
+
+        // 2) 現在のセッションを畳む。AAudio の切断は API 契約上すでに終端的
+        //    (`ndk::audio::AudioError::Disconnected` のドキュメント。
+        //    `docs/history/03-2026-08-31.md` 参照)なので、明示的に close しなくても
+        //    もう鳴っていない——ここでの close は状態を明示的に確定させる後始末に
+        //    過ぎない。失敗してもベストエフォートで続行する。
+        if let Err(err) = self.backend.close() {
+            mw_backend::mw_log!("[mw-ffi] attempt_reopen: backend close failed (ignored): {err}");
+        }
+        self.stop_and_join_decode_threads();
+
+        // 3) 新しい Renderer 一式を組み立てる。`events`(`Arc<EventQueue>`)の identity は
+        //    変えない——`mw_poll_events` が読み出す先を差し替える必要が無いようにする
+        //    (`mw_core::renderer::Renderer::build_with_events` のドキュメント参照)。
+        let (renderer, command_sender, reclaim_receiver, music_producer, music_clock, _events, bgm) =
+            Renderer::build_with_events(
+                Config::default(),
+                PROVISIONAL_SAMPLE_RATE,
+                Arc::clone(&self.events),
+            );
+
+        // 4) 🔴 generation を必ず bump する。新しいクロックは generation=0 から
+        //    始まるため、直前のクロックが最後に観測させた値と偶然一致しうる——
+        //    `wrapping_add(1)` した値でシードすることで「直前に観測されたどの値とも
+        //    異なる」ことを保証する
+        //    (`MusicClockPublisher::seed_generation_after_reopen` のドキュメント参照)。
+        music_clock.seed_generation_after_reopen(clock_before.generation.wrapping_add(1));
+
+        // 5) 実際にバックエンドを開き直す。
+        match self.backend.open(renderer, Arc::clone(&self.events)) {
+            Ok(()) => {
+                let (decoder_tx, decode_thread_stop, decode_thread_handle) =
+                    decode_thread::spawn(music_producer, Arc::clone(&self.events));
+                let (bgm_decoder_tx, bgm_decode_thread_stop, bgm_decode_thread_handle) =
+                    decode_thread::spawn(bgm.stream_producer, Arc::clone(&self.events));
+
+                self.command_sender = command_sender;
+                self.reclaim_receiver = Mutex::new(reclaim_receiver);
+                self.music_clock = music_clock;
+                self.bgm_state = bgm.state;
+                self.decoder_tx = decoder_tx;
+                self.decode_thread_stop = decode_thread_stop;
+                self.decode_thread = Some(decode_thread_handle);
+                self.bgm_decoder_tx = bgm_decoder_tx;
+                self.bgm_decode_thread_stop = bgm_decode_thread_stop;
+                self.bgm_decode_thread = Some(bgm_decode_thread_handle);
+                // 新しいセッション用に「1回だけ」ログのフラグも仕切り直す(そうしないと
+                // 新しいストリームの実測値〔I/O バッファ長〕が二度とログされない)。
+                self.logged_buffer_info.store(false, Ordering::Relaxed);
+
+                // 6) 状態を復元する(このメソッドのドキュメント「復元できる状態」参照)。
+                self.restore_bus_volumes(&saved_bus_volumes);
+                self.restore_music(saved_music_sound_id, &clock_before, saved_music_loop);
+                self.restore_bgm(saved_bgm_sound_id, saved_bgm_loop);
+
+                mw_backend::mw_log!("[mw-ffi] internal stream reopen succeeded");
+                self.reopen.record_result(true, now_ns);
+                true
+            }
+            Err(err) => {
+                mw_backend::mw_log!("[mw-ffi] internal stream reopen failed: {err}");
+                self.reopen.record_result(false, now_ns);
+                if self.reopen.is_exhausted() {
+                    // 依頼書「無限リトライは禁止」: バックオフを使い切ったので、
+                    // 新しい切断イベント(`note_stream_error`)が届くまで自動での
+                    // 再試行を止める(`crate::reopen` モジュール doc 参照)。
+                    mw_backend::mw_log!(
+                        "[mw-ffi] internal stream reopen: giving up after {} consecutive \
+                         failed attempts; will retry automatically only if a new disconnect \
+                         is observed",
+                        self.reopen.attempts()
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    /// 4本のバスの音量を再送する([`Instance::attempt_reopen`] 手順6)。
+    fn restore_bus_volumes(&self, volumes: &[f32; BUS_COUNT]) {
+        for bus in mw_core::ALL_BUSES {
+            let volume = volumes[bus.index()];
+            let _ = self
+                .command_sender
+                .send(Command::SetBusVolume { bus, volume });
+        }
+    }
+
+    /// 楽曲ボイスの状態を再送する([`Instance::attempt_reopen`] 手順6)。
+    fn restore_music(
+        &self,
+        sound_id: Option<u64>,
+        clock_before: &MusicClockSnapshot,
+        loop_region: Option<(u64, u64)>,
+    ) {
+        let Some(sound_id) = sound_id else {
+            return; // 一度も mw_music_set が呼ばれていない。復元するものが無い。
+        };
+        let Some(bytes) = self.get_music_bytes(sound_id) else {
+            // 再オープンの間に mw_sound_release されていた(呼び出し側が明示的に
+            // 手放した)。復元を諦める——存在しない音を捏造しない。
+            mw_backend::mw_log!(
+                "[mw-ffi] attempt_reopen: cannot restore music, sound_id {sound_id} is no \
+                 longer loaded"
+            );
+            return;
+        };
+        let output_sample_rate = self.backend_sample_rate();
+        let decoder = match SymphoniaDecoder::open((*bytes).clone(), output_sample_rate) {
+            Ok(decoder) => decoder,
+            Err(err) => {
+                mw_backend::mw_log!("[mw-ffi] attempt_reopen: re-decoding music failed: {err}");
+                return;
+            }
+        };
+        if !self.send_decoder(Box::new(decoder)) {
+            return;
+        }
+        // `mw_music_set` と同じ順序厳守(デコーダ差し替え→Prepare→Seek。
+        // `ffi.rs::mw_music_set` のドキュメント「曲の切り替えで前曲の PCM が漏れる
+        // 問題への対処」参照)。
+        let _ = self.command_sender.send(Command::MusicPrepare);
+        let _ = self.command_sender.send(Command::MusicSeek {
+            frames: clock_before.song_frames,
+        });
+        if let Some(region) = loop_region {
+            let _ = self.command_sender.send(Command::MusicSetLoop {
+                region: Some(region),
+            });
+        }
+        if clock_before.state == MusicState::Playing {
+            // 準備完了(Ready)を待たずに予約すれば、既存の「プリロール未完了時は
+            // 繰り下げる」仕組み(`mw_core::mixer::MusicSchedule`, 初期構築仕様
+            // 『§4.3』)が、Ready になった時点で自動的に発音してくれる——専用の
+            // 待ち合わせは不要。
+            let _ = self.command_sender.send(Command::MusicPlayScheduled {
+                host_time_ns: mw_backend::host_time_ns(),
+            });
+        }
+        // `Paused` だった場合は位置だけ復元し、明示的な再生は行わない(`Ready` の
+        // まま止まる)。ネイティブ側だけで `Paused` 状態そのものを再現する経路は
+        // 用意していない——`mw_music_resume_at`/`mw_music_pause` を呼べる状態
+        // (`Ready`)まで戻すところまでが復元の範囲、という割り切り。
+    }
+
+    /// BGM ボイスの状態を再送する([`Instance::attempt_reopen`] 手順6)。
+    ///
+    /// **BGM の再生位置・再生中だったかどうかは復元しない**(このメソッドの呼び出し元
+    /// `Instance::attempt_reopen` のドキュメント「復元できる状態・できない状態」参照)。
+    /// ロード済みトラックとループ区間だけを復元し、`Ready` で止める。
+    fn restore_bgm(&self, sound_id: Option<u64>, loop_region: Option<(u64, u64)>) {
+        let Some(sound_id) = sound_id else {
+            return;
+        };
+        let Some(bytes) = self.get_music_bytes(sound_id) else {
+            mw_backend::mw_log!(
+                "[mw-ffi] attempt_reopen: cannot restore bgm, sound_id {sound_id} is no longer \
+                 loaded"
+            );
+            return;
+        };
+        let output_sample_rate = self.backend_sample_rate();
+        let decoder = match SymphoniaDecoder::open((*bytes).clone(), output_sample_rate) {
+            Ok(decoder) => decoder,
+            Err(err) => {
+                mw_backend::mw_log!("[mw-ffi] attempt_reopen: re-decoding bgm failed: {err}");
+                return;
+            }
+        };
+        if !self.send_bgm_decoder(Box::new(decoder)) {
+            return;
+        }
+        let _ = self.command_sender.send(Command::BgmPrepare);
+        let _ = self.command_sender.send(Command::BgmSeek { frames: 0 });
+        if let Some(region) = loop_region {
+            let _ = self.command_sender.send(Command::BgmSetLoop {
+                region: Some(region),
+            });
+        }
+    }
 }
 
 /// ハンドルは 1 から始まる単調増加の不透明 ID。0 は「未割当」を意味する予約値として使わない
@@ -371,6 +772,13 @@ pub fn init() -> InitOutcome {
         bgm_decoder_tx,
         bgm_decode_thread_stop,
         bgm_decode_thread: Some(bgm_decode_thread_handle),
+        last_music_sound_id: AtomicU64::new(0),
+        last_music_loop: Mutex::new(None),
+        last_bgm_sound_id: AtomicU64::new(0),
+        last_bgm_loop: Mutex::new(None),
+        // `mw_core::bus::Bus::new()` の既定音量(1.0)と揃える。
+        bus_volumes: std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())),
+        reopen: ReopenPolicy::new(),
     });
     InitOutcome::Opened(handle)
 }
@@ -402,28 +810,16 @@ pub fn shutdown(handle: u64) -> ShutdownOutcome {
     match guard.take() {
         Some(mut instance) => {
             // M2-7: デコードスレッドを確実に停止・join する(`mw_init` で1本だけ
-            // 立てたぶん、`mw_shutdown` で確実に回収する。スレッドリーク防止)。
+            // 立てたぶん、`mw_shutdown` で確実に回収する。スレッドリーク防止。
+            // M4-3 で BGM 専用のもう1本も同じ手順で対称に扱うようになった)。
             // 最大で `decode_thread::POLL_INTERVAL` 分だけこの呼び出しがブロックし
             // うるが、`mw_shutdown` は毎フレーム呼ぶ関数ではない一度きりの終了処理
             // なので、初期構築仕様『§5.4』の「全関数非ブロッキング」が要求する
             // 粒度の対象外とみなす(既存の `backend.close()` も内部でストリームの
-            // 停止を同期的に待つ設計になっている)。
-            instance.decode_thread_stop.store(true, Ordering::Relaxed);
-            if let Some(join_handle) = instance.decode_thread.take() {
-                // デコードスレッド内部は catch_unwind で panic を握りつぶす設計
-                // (`crate::decode_thread` 参照)なので、ここでの `Err`(パニック伝播)
-                // は理論上起こらない。万一起きても shutdown 自体は続行する
-                // (join 失敗を理由にハンドルを不定状態のまま残さない)。
-                let _ = join_handle.join();
-            }
-            // M4-3: BGM 専用デコードスレッドも同様に停止・join する(楽曲用と
-            // 対称。どちらか一方だけ回収し忘れるとスレッドリークになる)。
-            instance
-                .bgm_decode_thread_stop
-                .store(true, Ordering::Relaxed);
-            if let Some(join_handle) = instance.bgm_decode_thread.take() {
-                let _ = join_handle.join();
-            }
+            // 停止を同期的に待つ設計になっている)。`Instance::attempt_reopen`
+            // (M3, 案A)も同じ手順を必要としたため、共通処理として切り出してある
+            // (`Instance::stop_and_join_decode_threads`)。
+            instance.stop_and_join_decode_threads();
             match instance.backend.close() {
                 Ok(()) => ShutdownOutcome::Closed,
                 Err(_) => ShutdownOutcome::CloseFailed,
@@ -432,6 +828,39 @@ pub fn shutdown(handle: u64) -> ShutdownOutcome {
         // 直前の `is_valid` チェックで Some を確認済みのため到達しない防御的分岐。
         None => ShutdownOutcome::InvalidHandle,
     }
+}
+
+/// 切断からの内部再オープン(初期構築仕様『§6』案A)を、必要であれば試みる。
+///
+/// **`mw_poll_events`(ゲームスレッド)のすべての呼び出しから呼ぶ想定。** 通常は
+/// `ReopenPolicy::is_due` が `false` を返す安価なチェックだけで即座に戻る
+/// (`registry()` のロック取得+数回の atomic load のみ)。`instance.handle != handle`
+/// (無効ハンドル)・インスタンス未初期化の場合も静かに何もしない
+/// (`with_instance`/`shutdown` と同じ「クラッシュしない」方針)。
+///
+/// 🔴 **iOS/tvOS ではこの関数への呼び出し自体が存在しない**——呼び出し元
+/// (`crate::ffi::mw_poll_events`)側が `#[cfg(not(any(target_os = "ios", target_os =
+/// "tvos")))]` で丸ごと除去している。iOS には実機で確認済みの既存の復帰経路
+/// (`mw-backend::ios_interruption`、割り込み・ルート変化からの `pause()`→`play()`)が
+/// 既にあり、両者が同じ `Event::StreamError { reason: DeviceUnavailable }` に対して
+/// 競合しないようにするため。「どちらの経路を通るか」はこの `cfg` 1箇所だけで
+/// コンパイル時に決まる(実行時のヒューリスティックには一切頼らない——依頼書
+/// 「⚠️『どちらの経路を通るか』の判定を曖昧にしないこと」への回答)。
+pub fn maybe_reopen(handle: u64) {
+    let mut guard = registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(instance) = guard.as_mut() else {
+        return;
+    };
+    if instance.handle != handle {
+        return;
+    }
+    let now_ns = mw_backend::host_time_ns();
+    if !instance.reopen.is_due(now_ns) {
+        return;
+    }
+    instance.attempt_reopen(now_ns);
 }
 
 #[cfg(test)]

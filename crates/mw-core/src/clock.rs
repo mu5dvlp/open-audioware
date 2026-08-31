@@ -265,6 +265,33 @@ mod tests {
     }
 
     #[test]
+    fn seed_generation_after_reopen_sets_generation_without_disturbing_other_fields() {
+        // 再オープン専用のシード API(M3「Android AAudio 切断復旧」案A)。他のフィールドは
+        // まだ何も publish されていない新しいクロックなので既定値のままのはず。
+        let publisher = MusicClockPublisher::new();
+        publisher.seed_generation_after_reopen(42);
+
+        let snapshot = publisher.snapshot();
+        assert_eq!(snapshot.generation, 42);
+        assert_eq!(snapshot.song_frames, 0);
+        assert_eq!(snapshot.host_time_ns, 0);
+        assert_eq!(snapshot.state, MusicState::Loading);
+
+        // その後の bump_generation は通常どおりシードした値から進む(特別扱いされる
+        // フィールドではないことの確認)。
+        publisher.bump_generation();
+        assert_eq!(publisher.snapshot().generation, 43);
+    }
+
+    #[test]
+    fn seed_generation_after_reopen_wraps_without_panicking() {
+        let publisher = MusicClockPublisher::new();
+        publisher.seed_generation_after_reopen(u32::MAX);
+        publisher.bump_generation();
+        assert_eq!(publisher.snapshot().generation, 0);
+    }
+
+    #[test]
     fn music_clock_publisher_concurrent_snapshots_stay_consistent_with_single_writer() {
         // seqlock が存在する理由そのものを検証するテスト。
         // song_frames と host_time_ns を個別の atomic のまま公開すると、「更新後の
@@ -538,6 +565,30 @@ impl MusicClockPublisher {
         self.write(|| {
             let next = self.generation.load(Ordering::Relaxed).wrapping_add(1);
             self.generation.store(next, Ordering::Relaxed);
+        });
+    }
+
+    /// 再オープン(ミドルウェア内部でストリームを閉じて開き直す。初期構築仕様『§6』
+    /// 【確定】)専用の世代シード。
+    ///
+    /// 新しい `MusicClockPublisher::new()` は常に `generation = 0` から始まる。
+    /// 再オープンで作り直したクロックをそのまま使うと、たまたま直前のクロックが
+    /// 最後に観測させた generation と同じ値になりうる(例: 一度もシークしていない曲は
+    /// generation=0 のまま)——その場合 C# 側が「generation が変わっていない」と
+    /// 誤認し、不連続を跨いで補間してしまう(『§4.4』の禁止事項)。
+    ///
+    /// **再オープン処理(ゲームスレッド)が、この新しいクロックをまだ誰にも
+    /// 公開していない段階で一度だけ呼ぶこと。** 呼び出し側は直前のクロックの
+    /// `snapshot().generation` に `wrapping_add(1)` した値を渡す想定
+    /// (`crates/mw-ffi/src/handle.rs::Instance::attempt_reopen` 参照)——これにより
+    /// 新しいクロックの最初の generation は「直前のクロックが観測させたどの値とも
+    /// 異なる」ことが保証される。
+    ///
+    /// 音声スレッドとは無関係(ゲームスレッド専用)だが、他の書き込みと同じ seqlock
+    /// プロトコルを通しておく([`Self::write`])。
+    pub fn seed_generation_after_reopen(&self, generation: u32) {
+        self.write(|| {
+            self.generation.store(generation, Ordering::Relaxed);
         });
     }
 

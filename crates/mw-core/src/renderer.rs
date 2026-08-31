@@ -76,6 +76,42 @@ impl Renderer {
         )
     }
 
+    /// [`Renderer::build`] と同じだが、新しい `EventQueue` を作らず呼び出し側が渡した
+    /// `Arc` を使う([`mixer::build_with_events`] のドキュメント参照)。
+    ///
+    /// **M3「Android(AAudio)切断復旧」案A専用の入口。** ミドルウェア内部でストリームを
+    /// 再オープンする際、`mw-ffi::handle::Instance` はこちらを使って `Renderer` を
+    /// 丸ごと作り直しつつ、`mw_poll_events` の読み出し先(`Arc<EventQueue>`)の identity
+    /// は変えない。
+    pub fn build_with_events(
+        config: Config,
+        sample_rate: u32,
+        events: Arc<EventQueue>,
+    ) -> (
+        Renderer,
+        CommandSender,
+        ReclaimReceiver,
+        MusicStreamProducer,
+        Arc<MusicClockPublisher>,
+        Arc<EventQueue>,
+        mixer::BgmHandles,
+    ) {
+        let (mixer, sender, reclaim, music_producer, music_clock, events, bgm) =
+            mixer::build_with_events(config, sample_rate, events);
+        (
+            Renderer {
+                mixer,
+                frame_counter: RenderedFrameCounter::new(),
+            },
+            sender,
+            reclaim,
+            music_producer,
+            music_clock,
+            events,
+            bgm,
+        )
+    }
+
     /// `output` はインターリーブされた f32 ステレオバッファ(`len` は `frames * CHANNELS`)。
     /// `buffer_start_host_time_ns` はこのバッファの先頭フレームが実際に DAC から
     /// 出力される(と予測される)ホスト単調時刻(初期構築仕様『§4.4』。

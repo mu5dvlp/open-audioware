@@ -557,6 +557,8 @@ pub extern "C" fn mw_bus_set_volume(handle: u64, bus: i32, volume: f32) -> MwRes
                     volume,
                 });
             if sent {
+                // M3(案A): 再オープン後の復元用キャッシュ(`Instance::attempt_reopen`)。
+                instance.note_bus_volume(bus.to_core(), volume);
                 MwResult::Ok
             } else {
                 MwResult::ErrCommandQueueFull
@@ -586,6 +588,9 @@ pub extern "C" fn mw_bus_fade(handle: u64, bus: i32, target: f32, ms: f32) -> Mw
                 ms,
             });
             if sent {
+                // M3(案A): フェードの収束後の値(`target`)をキャッシュする
+                // (`Instance::restore_bus_volumes` のドキュメント参照)。
+                instance.note_bus_volume(bus.to_core(), target);
                 MwResult::Ok
             } else {
                 MwResult::ErrCommandQueueFull
@@ -746,6 +751,9 @@ pub extern "C" fn mw_music_set(handle: u64, sound_id: u64) -> MwResult {
                     .command_sender
                     .send(mw_core::Command::MusicSeek { frames: 0 });
             if sent {
+                // M3(案A): 再オープン後に同じ曲を読み直すための復元キャッシュ
+                // (`Instance::attempt_reopen`/`Instance::restore_music`)。
+                instance.note_music_set(sound_id);
                 MwResult::Ok
             } else {
                 MwResult::ErrCommandQueueFull
@@ -931,6 +939,8 @@ pub extern "C" fn mw_music_set_loop(handle: u64, begin_frames: u64, end_frames: 
                 .command_sender
                 .send(mw_core::Command::MusicSetLoop { region });
             if sent {
+                // M3(案A): 再オープン後の復元用キャッシュ(`Instance::restore_music`)。
+                instance.note_music_loop(region);
                 MwResult::Ok
             } else {
                 MwResult::ErrCommandQueueFull
@@ -1072,6 +1082,8 @@ pub extern "C" fn mw_bgm_set(handle: u64, sound_id: u64) -> MwResult {
                     .command_sender
                     .send(mw_core::Command::BgmSeek { frames: 0 });
             if sent {
+                // M3(案A): 再オープン後の復元用キャッシュ(`Instance::restore_bgm`)。
+                instance.note_bgm_set(sound_id);
                 MwResult::Ok
             } else {
                 MwResult::ErrCommandQueueFull
@@ -1193,6 +1205,8 @@ pub extern "C" fn mw_bgm_set_loop(handle: u64, begin_frames: u64, end_frames: u6
                 .command_sender
                 .send(mw_core::Command::BgmSetLoop { region });
             if sent {
+                // M3(案A): 再オープン後の復元用キャッシュ(`Instance::restore_bgm`)。
+                instance.note_bgm_loop(region);
                 MwResult::Ok
             } else {
                 MwResult::ErrCommandQueueFull
@@ -1334,6 +1348,32 @@ pub unsafe extern "C" fn mw_get_output_underrun_stats(
 /// **今回のポーリングで新たに判明した**破棄イベント件数を書き込む(黙って捨てない。
 /// 『§4.6』)。前回までに報告済みの分は含まない——累積は呼び出し側の責務にしない。
 ///
+/// ## M3(案A): Android(AAudio)切断からの内部再オープン
+///
+/// 初期構築仕様『§6』(確定)「ストリーム自体の切断(AAudio の disconnect 等)は
+/// ミドルウェア内部で再オープンし、イベントで通知する」の入口はここ。ドレイン中に
+/// `MwEventKind::StreamError { reason: DeviceUnavailable }` を観測すると
+/// [`crate::handle::Instance::note_stream_error`] が内部再オープンの候補として記録し、
+/// この関数の最後で [`handle_registry::maybe_reopen`] を呼んで(バックオフの都合が
+/// 良ければ)実際に試みる——**この関数自体が「ゲームスレッドから毎フレーム呼ばれる」
+/// 関数であることを利用しており、専用のポンプ・監視スレッドは新設していない**
+/// (依頼書「⚠️ 再オープンはゲームスレッド側でやること」)。
+///
+/// 🔴 **iOS/tvOS では次の呼び出しが丸ごとコンパイルから除かれる**(`cfg`)。
+/// iOS には実機で確認済みの既存の復帰経路(`mw-backend::ios_interruption`)が別途
+/// あり、同じ `Event::StreamError { reason: DeviceUnavailable }` に対して二重に
+/// 反応させないため——「どちらの経路を通るか」を実行時の条件分岐ではなく
+/// コンパイル時の `cfg` 1箇所だけで確定させている
+/// (`handle_registry::maybe_reopen` のドキュメント参照)。
+///
+/// この関数は「アロケーションゼロで毎フレーム呼ぶ」という上の設計方針の対象では
+/// あるが、内部再オープンの試行自体は稀にしか起きず(切断イベントを観測した直後、
+/// かつバックオフの間隔条件を満たしたときだけ)、その1回に限っては
+/// `CpalBackend::open` 相当の重い処理(デバイス列挙・ストリーム構築)をこの呼び出しの
+/// 中で同期的に行う。通常フレーム(切断が起きていない大多数のフレーム)は
+/// `ReopenPolicy::is_due` の安価なチェックのみで即座に戻るため、定常状態の
+/// 非ブロッキング性は保たれる。
+///
 /// # Safety
 /// `cap > 0` の場合、`buf` は `cap` 個の [`MwEvent`] を書き込み可能な有効なポインタで
 /// なければならない。`cap <= 0` の場合は `buf` が null でもよい(書き込みを行わない。
@@ -1360,6 +1400,11 @@ pub unsafe extern "C" fn mw_poll_events(
         let result = handle_registry::with_instance(handle, |instance| {
             let mut written = 0usize;
             let (_, dropped) = instance.events.drain(cap, |event| {
+                // M3(案A): DeviceUnavailable を観測したら内部再オープンの候補として
+                // 記録する(`reason` 以外は素通り。詳細はメソッド doc 参照)。
+                if let mw_core::Event::StreamError { reason } = event {
+                    instance.note_stream_error(reason);
+                }
                 // SAFETY: `written < cap` は `drain` の `max` 引数(=`cap`)により
                 // 保証される。`buf` は上で null/cap の整合を確認済みで、`cap` 個
                 // 書き込み可能なポインタであることは呼び出し側の契約(Safety 節)。
@@ -1376,6 +1421,18 @@ pub unsafe extern "C" fn mw_poll_events(
         });
         result.ok_or(MwResult::ErrInvalidHandle)
     }));
+
+    // M3(案A): このスコープの外(=上の `with_instance` が既にレジストリロックを
+    // 解放した後)で呼ぶ——`with_instance` の中から呼ぶと同じ `Mutex` を二重に
+    // ロックしにいってデッドロックする(`handle_registry::maybe_reopen` は
+    // `init`/`shutdown` と同じレジストリロックを独立に取得する設計のため)。
+    // iOS/tvOS ではこの呼び出しが丸ごとコンパイルされない(関数doc参照)。
+    // パニックしても `mw_poll_events` 全体の結果(`outcome`)を巻き込まないよう、
+    // ここだけ独立して `catch_unwind` で保護する。
+    #[cfg(not(any(target_os = "ios", target_os = "tvos")))]
+    {
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| handle_registry::maybe_reopen(handle)));
+    }
 
     match outcome {
         Ok(Ok(written)) => written,
@@ -1566,6 +1623,7 @@ mod tests {
         run_music_lifecycle(handle);
         run_music_preview_style_rapid_switch(handle);
         run_bgm_lifecycle(handle);
+        run_reopen_lifecycle(handle);
     }
 
     /// M2-7: 楽曲再生の一連の流れ(実ハンドル越し)。`run_se_lifecycle` と同じ理由
@@ -1942,6 +2000,268 @@ mod tests {
             MwResult::ErrInvalidSoundId,
             "double release of a BGM id must be rejected, not crash"
         );
+    }
+
+    /// M3「Android(AAudio)切断復旧」案A の統合テスト(実ハンドル + 実デコードスレッド +
+    /// 実 `CpalBackend` 越し)。
+    ///
+    /// **実デバイスを本当に切断する手段がこの環境には無い**(`docs/history/
+    /// 03-2026-08-31.md`「実機でしか確認できない範囲」参照)。このテストが実行されて
+    /// いる時点で `mw_init` は既に成功している(呼び出し元
+    /// `init_se_lifecycle_then_shutdown_or_gracefully_reports_no_device` が
+    /// `MwResult::Ok` を確認済み)ので、実デバイスは存在する。ここでは
+    /// `Event::StreamError { reason: DeviceUnavailable }` をイベントキューへ直接注入して
+    /// 「切断が観測された」ことだけをシミュレートし、そこから先
+    /// (`CpalBackend::close()` → `Renderer::build_with_events()` →
+    /// `CpalBackend::open()` と、状態復元コマンドの再送)はすべて本物のコードパスを
+    /// 踏む。**再オープンに失敗したときに無限ループしないことの保証は、ここではなく
+    /// `crate::reopen::tests`(バックエンドを必要としない純粋な状態機械のテスト)が
+    /// 担っている**——この環境には `backend.open()` を確実に失敗させる手段
+    /// (モックバックエンド)が無いため。
+    fn run_reopen_lifecycle(handle: u64) {
+        // 0.1秒ぶん(48kHz)。シークの余地を持たせるため十分な長さにする。
+        let music_bytes = make_pcm16_wav(48_000, 2, &vec![7_777i16; 4_800]);
+        let mut music_id: u64 = 0;
+        assert_eq!(
+            unsafe {
+                mw_sound_load(
+                    handle,
+                    music_bytes.as_ptr(),
+                    music_bytes.len(),
+                    1, // MwSoundMode::Music
+                    &mut music_id as *mut u64,
+                )
+            },
+            MwResult::Ok
+        );
+
+        let se_bytes = make_pcm16_wav(48_000, 2, &[42, -42]);
+        let mut se_id: u64 = 0;
+        assert_eq!(
+            unsafe {
+                mw_sound_load(
+                    handle,
+                    se_bytes.as_ptr(),
+                    se_bytes.len(),
+                    0, // MwSoundMode::Se
+                    &mut se_id as *mut u64,
+                )
+            },
+            MwResult::Ok
+        );
+
+        // 楽曲を準備し、Ready を待ってからループ・バス音量を設定して再生する
+        // (依頼書「復元すべき状態」を一通り成立させてから切断をシミュレートする)。
+        assert_eq!(mw_music_set(handle, music_id), MwResult::Ok);
+        let mut state = -1i32;
+        assert!(
+            wait_until(
+                || {
+                    let r = unsafe { mw_music_state(handle, &mut state as *mut i32) };
+                    r == MwResult::Ok && state == MwMusicState::Ready as i32
+                },
+                std::time::Duration::from_secs(5),
+            ),
+            "music must become Ready before we can test reopen restoration"
+        );
+
+        assert_eq!(mw_music_set_loop(handle, 100, 4_000), MwResult::Ok);
+        assert_eq!(
+            mw_bus_set_volume(handle, 1 /* MwBus::Bgm */, 0.42),
+            MwResult::Ok
+        );
+        assert_eq!(
+            mw_music_play_scheduled(handle, mw_host_time_ns()),
+            MwResult::Ok
+        );
+
+        // 実際に再生位置が進み、`Playing` になるまで待つ(「復元された位置が0の
+        // ままではない」ことの検証に意味を持たせるため)。
+        let mut position_before = MwMusicPosition {
+            song_frames: 0,
+            host_time_ns: 0,
+            sample_rate: 0,
+            state: MwMusicState::Loading,
+            is_playing: 0,
+            generation: 0,
+        };
+        let advanced = wait_until(
+            || {
+                let r = unsafe {
+                    mw_music_get_position(handle, &mut position_before as *mut MwMusicPosition)
+                };
+                r == MwResult::Ok
+                    && position_before.is_playing == 1
+                    && position_before.song_frames > 0
+            },
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            advanced,
+            "music must actually start playing before reopen-restoration can be tested \
+             meaningfully; last observed position={position_before:?}"
+        );
+        let generation_before = position_before.generation;
+        let frames_before = position_before.song_frames;
+
+        // SoundId が(切断前は当然)有効であることの前提確認。
+        let mut se_voice = 0u64;
+        assert_eq!(
+            unsafe { mw_se_play(handle, se_id, 2, 1.0, &mut se_voice as *mut u64) },
+            MwResult::Ok
+        );
+
+        // --- 切断イベントを注入する(実機の AAudio disconnect の代わり) ---
+        let injected = handle_registry::with_instance(handle, |instance| {
+            instance
+                .events
+                .push_side_channel(mw_core::Event::StreamError {
+                    reason: mw_core::StreamErrorReason::DeviceUnavailable,
+                });
+        });
+        assert!(
+            injected.is_some(),
+            "handle must be valid before injecting the event"
+        );
+
+        // `mw_poll_events` がこのイベントをドレインし、同じ呼び出しの中で内部再オープン
+        // の候補として記録する(`mw_poll_events` のドキュメント「M3(案A)」参照)。
+        let mut event_buf = [MwEvent {
+            kind: MwEventKind::RouteChanged,
+            payload: 0,
+        }; 8];
+        let mut dropped = 0u32;
+        let written = unsafe {
+            mw_poll_events(
+                handle,
+                event_buf.as_mut_ptr(),
+                event_buf.len() as i32,
+                &mut dropped as *mut u32,
+            )
+        };
+        assert!(
+            written >= 1,
+            "the injected StreamError event must be observable via mw_poll_events"
+        );
+        assert!(
+            event_buf[..written as usize]
+                .iter()
+                .any(|e| e.kind == MwEventKind::StreamError),
+            "must contain the injected StreamError event, got {:?}",
+            &event_buf[..written as usize]
+        );
+
+        // 再オープンが試行され、成功したことを診断アクセサで確認する
+        // (`Instance::reopen_diagnostics`)。`mw_poll_events` を呼ぶたびに
+        // `maybe_reopen` がバックオフ条件を満たせば試行するので、数回ポーリングする
+        // 形でも「再オープンが起きること」の検証として十分。
+        let reopened_successfully = wait_until(
+            || {
+                let mut buf = [MwEvent {
+                    kind: MwEventKind::RouteChanged,
+                    payload: 0,
+                }; 8];
+                let mut dropped = 0u32;
+                let _ = unsafe {
+                    mw_poll_events(
+                        handle,
+                        buf.as_mut_ptr(),
+                        buf.len() as i32,
+                        &mut dropped as *mut u32,
+                    )
+                };
+                handle_registry::with_instance(handle, |instance| instance.reopen_diagnostics())
+                    .map(|(pending, _attempts, exhausted)| !pending && !exhausted)
+                    .unwrap_or(false)
+            },
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            reopened_successfully,
+            "attempt_reopen must succeed when a real output device is still available \
+             (this environment cannot force backend.open() to fail — see module doc)"
+        );
+
+        // --- 復元の検証 ---
+
+        let mut position_after = MwMusicPosition {
+            song_frames: 0,
+            host_time_ns: 0,
+            sample_rate: 0,
+            state: MwMusicState::Loading,
+            is_playing: 0,
+            generation: 0,
+        };
+
+        // 1) 楽曲の再生位置が復元されている(いちばん重要。ゼロから始め直す実装だと
+        //    ここで song_frames が伸びても 0 近辺からの再カウントになってしまう)。
+        //    `song_frames` は `MusicSeek` の時点で(まだ `Loading` のうちから)
+        //    直ちに反映されるため、`is_playing` も一緒に条件へ入れて
+        //    「デコードが追いつき実際に鳴り始めた」ところまで待つ
+        //    (`song_frames > 0` だけだと Seek 直後の一瞬で満たされてしまい、
+        //    その後 `state` が `Playing` に遷移するのを待たずに検証してしまう)。
+        let position_restored = wait_until(
+            || {
+                let r = unsafe {
+                    mw_music_get_position(handle, &mut position_after as *mut MwMusicPosition)
+                };
+                r == MwResult::Ok
+                    && position_after.song_frames > 0
+                    && position_after.is_playing == 1
+            },
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            position_restored,
+            "song position must be restored (not stuck at 0) after the internal reopen; \
+             last observed={position_after:?}"
+        );
+        assert!(
+            position_after.song_frames + 1_000 >= frames_before,
+            "restored position ({}) must not have reset back near zero relative to the \
+             pre-disconnect position ({frames_before}) — a small amount of slack is allowed \
+             for re-decode/seek overhead, but a reset to zero would indicate the restore \
+             command sequence did not actually run",
+            position_after.song_frames
+        );
+        assert_eq!(
+            position_after.state,
+            MwMusicState::Playing,
+            "must resume playing automatically since it was Playing before the disconnect"
+        );
+
+        // 2) generation が bump されている(不連続の通知。依頼書「🔴 generation を
+        //    必ず bump すること」)。
+        assert_ne!(
+            position_after.generation, generation_before,
+            "generation must change across an internal reopen so the client can detect \
+             the discontinuity and stop interpolating across it"
+        );
+
+        // 3) ロード済みの SoundId が引き続き有効(`Instance::sounds`/`music_bytes` は
+        //    再オープンが一切触れないストレージのため)。
+        let mut se_voice_after = 0u64;
+        assert_eq!(
+            unsafe { mw_se_play(handle, se_id, 2, 1.0, &mut se_voice_after as *mut u64) },
+            MwResult::Ok,
+            "a SoundId loaded before the reopen must remain valid afterwards"
+        );
+
+        // 4) バス音量・ループ設定の復元キャッシュ(`Instance::note_bus_volume`/
+        //    `note_music_loop`)がこの一連の流れを通じて正しく保持されている
+        //    ——`Instance::attempt_reopen` はここから読んでコマンドを再送する。
+        let cached_bus_volume = handle_registry::with_instance(handle, |instance| {
+            instance.bus_volume_for_test(mw_core::BusId::Bgm)
+        });
+        assert_eq!(cached_bus_volume, Some(0.42));
+        let cached_loop =
+            handle_registry::with_instance(handle, |instance| instance.music_loop_for_test());
+        assert_eq!(cached_loop, Some(Some((100, 4_000))));
+
+        // 後始末。
+        assert_eq!(mw_music_stop(handle), MwResult::Ok);
+        assert_eq!(mw_sound_release(handle, music_id), MwResult::Ok);
+        assert_eq!(mw_sound_release(handle, se_id), MwResult::Ok);
     }
 
     /// `f` が `true` を返すまで短い間隔でポーリングする(タイムアウト付き)。

@@ -261,6 +261,38 @@ pub fn build(
     Arc<EventQueue>,
     BgmHandles,
 ) {
+    build_with_events(
+        config,
+        sample_rate,
+        Arc::new(EventQueue::new(config.event_queue_capacity)),
+    )
+}
+
+/// [`build`] と同じだが、新しい `EventQueue` を作らず呼び出し側が渡した `Arc` を使う。
+///
+/// **M3「Android(AAudio)切断復旧」案A(初期構築仕様『§6』【確定】)専用の入口。**
+/// ミドルウェア内部でストリームを再オープンする際、`mw-ffi::handle::Instance` は
+/// `Mixer`/コマンドキュー・楽曲クロック・BGM 状態などを丸ごと作り直す必要があるが、
+/// `mw_poll_events` が読み出す `EventQueue` の**identity(`Arc` そのもの)は変えたくない**
+/// ——変えてしまうと、再オープンをまたいで `Instance` 側にも `Mutex`/`ArcSwap` 等の
+/// 追加の間接参照が必要になる(`Instance` は既に「ゲームスレッド専用の `&mut self`
+/// 経路〔`init`/`shutdown` と同じレジストリロック〕からのみ再オープンする」設計にして
+/// あり、フィールドの直接差し替えで足りる。詳細は `crates/mw-ffi/src/handle.rs::
+/// Instance::attempt_reopen` 参照)。`build` はこのまま新規 `EventQueue` を作る既存の
+/// 経路として残す(全既存呼び出し元・テストのシグネチャを変えないため)。
+pub fn build_with_events(
+    config: Config,
+    sample_rate: u32,
+    events: Arc<EventQueue>,
+) -> (
+    Mixer,
+    CommandSender,
+    ReclaimReceiver,
+    MusicStreamProducer,
+    Arc<MusicClockPublisher>,
+    Arc<EventQueue>,
+    BgmHandles,
+) {
     let (command_producer, command_consumer) =
         RingBuffer::<Command>::new(config.command_queue_capacity);
     let (reclaim_producer, reclaim_consumer) =
@@ -271,7 +303,6 @@ pub fn build(
     let (bgm_producer, bgm_source) = stream::channel(config, sample_rate);
     let music_clock = Arc::new(MusicClockPublisher::new());
     let bgm_state = Arc::new(BgmStatePublisher::new());
-    let events = Arc::new(EventQueue::new(config.event_queue_capacity));
 
     let mixer = Mixer {
         buses: BusSet::new(),
@@ -772,6 +803,21 @@ mod tests {
         let mut buf = vec![1.0; 32 * CHANNELS];
         mixer.render(&mut buf, 0);
         assert!(buf.iter().all(|&s| s == 0.0));
+    }
+
+    /// M3「Android(AAudio)切断復旧」案A: `build_with_events` は呼び出し側が渡した
+    /// `Arc<EventQueue>` の identity をそのまま返す(新しい `EventQueue` を作らない)。
+    /// `mw-ffi::handle::Instance::attempt_reopen` が `mw_poll_events` の読み出し先を
+    /// 変えずに再オープンできることの前提となる不変条件。
+    #[test]
+    fn build_with_events_reuses_the_given_event_queue_identity() {
+        let events_in = Arc::new(EventQueue::new(Config::default().event_queue_capacity));
+        let (_mixer, _sender, _reclaim, _music_producer, _music_clock, events_out, _bgm) =
+            build_with_events(Config::default(), 48_000, Arc::clone(&events_in));
+        assert!(
+            Arc::ptr_eq(&events_in, &events_out),
+            "build_with_events must not allocate a new EventQueue"
+        );
     }
 
     #[test]
