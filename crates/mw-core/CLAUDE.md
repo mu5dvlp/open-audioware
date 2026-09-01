@@ -117,6 +117,17 @@ OS 非依存・デバイス非依存のコア。ミキサ、ボイス管理、�
   現在の実装では省かれている(`command.rs::Command::MusicPrepare` のドキュメント、
   `mixer.rs` の
   `music_set_command_sequence_recovers_cleanly_from_a_song_still_playing` テスト参照)。
+  **`MusicPause`/`MusicStop` は `mixer.rs::MusicSchedule::cancel` も呼ぶ**
+  (2026-09-01 実機バグ修正)——リードイン中(`mw_music_play_scheduled` で予約済み・
+  未再生)の楽曲ボイスは `MusicState::Ready` のままで、`MusicVoice::pause`/`stop`
+  自体は `Playing` からしか効かない no-op(`music.rs` 参照)。予約
+  (`Mixer::music_schedule`)は `MusicVoice` の外にあるミキサ側の状態なので、
+  `MusicVoice` を無条件でポーズ可能にする設計ではなく、**ポーズ/停止コマンドの
+  処理側で予約を明示的に破棄する**設計を選んだ(巻き戻し付き再開の本来の入口は
+  `MusicResumeAt` であり、この予約に頼る必要が無いため、破棄してよいと判断)。
+  詳細・検討した他の設計・回帰テストは `MusicSchedule::cancel` のドキュメントと
+  `mixer.rs` の `music_pause_while_ready_with_pending_schedule_*`/
+  `music_stop_while_ready_with_pending_schedule_*` テスト参照。
 - `mixer`: `Mixer::render(output, buffer_start_host_time_ns)` — 「コマンド消化 →
   楽曲ボイスのレンダリング(予約発火があればサンプル精度で分割) → BGM ボイスの
   レンダリング(M4-3, 下記) → イベント通知 → アクティブ SE ボイス合算 + 楽曲・BGM の

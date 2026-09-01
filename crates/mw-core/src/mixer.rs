@@ -111,6 +111,33 @@ impl MusicSchedule {
         self.deferred = false;
     }
 
+    /// 保留中の予約を無条件に破棄する(`Command::MusicPause`/`Command::MusicStop` から
+    /// 呼ぶ)。
+    ///
+    /// **ユーザー実機報告(2026-09-01)「ポーズしてすぐホームに行って、アプリに戻ると
+    /// 音が鳴り出した」の直接の修正。** 真因: リードイン中(予約済み・未再生)の
+    /// 楽曲ボイスは `MusicState::Ready` のままであり、`MusicVoice::pause`/`stop` は
+    /// `Playing` からの呼び出ししか受け付けない(`music.rs` 参照)ため、`Ready` 中に
+    /// ポーズ/停止しても `MusicVoice` 側は無条件で no-op になる。予約(この構造体)は
+    /// `MusicVoice` の外にあるミキサ側の状態なので、`MusicVoice` の状態機械をいじる
+    /// だけではこの保留を消せない——ポーズ/停止コマンドの処理側から明示的に
+    /// 呼び出す必要がある。
+    ///
+    /// `Playing` 中に届いた「まだ未来の」予約(`take_due_offset` が
+    /// `target_ns >= buffer_end_ns` で早期リターンし続けている間)を停止した場合も
+    /// 同じ穴がある——フェード完了後に `Ready` へ戻った時点で、古い予約がその
+    /// `Ready` を「発火条件」として誤爆しうる。`voice_state` を見ずに常に破棄するのは
+    /// この経路も一緒に塞ぐため。
+    ///
+    /// 巻き戻し付き再開の入口は `MusicVoice::resume_at`(`Command::MusicResumeAt`)で
+    /// あり、この予約に頼る必要は無い(初期構築仕様『§4.3』「巻き戻し付き再開」・
+    /// テンプレート仕様「中断対応」)ため、`deferred` していた事実ごと単純に
+    /// 捨ててよい(「準備完了後に鳴らす」約束を再開時まで持ち越す理由が無い)。
+    fn cancel(&mut self) {
+        self.pending_host_time_ns = None;
+        self.deferred = false;
+    }
+
     /// このバッファで発火すべきか判定する。発火するならバッファ内オフセット
     /// (サンプル数)を返し、内部状態を「発火済み(予約なし)」に戻す。
     ///
@@ -122,6 +149,12 @@ impl MusicSchedule {
     /// - 到来していて `voice_state` が `Playing`/`Paused`(既に別経路で状態が変わった)
     ///   場合は、発火させても `MusicVoice::play` 自体が no-op になるだけなので、
     ///   静かに予約を破棄する(`deferred` は立てない——プリロール未完了が理由ではないため)。
+    ///
+    /// ここでの「到来していて `Ready` なら発火」は無条件——「ポーズ/停止したのに
+    /// 予約が生きていて `Ready` に戻った拍子に鳴り出す」事故を防ぐ責務はこの関数の
+    /// 外([`Self::cancel`]、`Mixer::apply_command` の `MusicPause`/`MusicStop`)に
+    /// ある。ここへ来る時点で予約が残っているのは「本当にまだ有効な予約」である
+    /// という前提を置いている。
     fn take_due_offset(
         &mut self,
         buffer_start_ns: u64,
@@ -438,12 +471,21 @@ impl Mixer {
                 self.music_voice.seek(frames, &mut self.music_source);
             }
             Command::MusicPause => {
+                // 生きたままの予約(`MusicSchedule`)を先に破棄してから `pause` する。
+                // `Ready`(予約済み・未再生)中の `pause` は `MusicVoice` 側では
+                // no-op になるため、予約を消さないと予約時刻到来時に無断で
+                // 鳴り出してしまう(`MusicSchedule::cancel` のドキュメント参照。
+                // ユーザー実機報告2026-09-01の直接の修正)。
+                self.music_schedule.cancel();
                 self.music_voice.pause();
             }
             Command::MusicResumeAt { frames } => {
                 self.music_voice.resume_at(frames, &mut self.music_source);
             }
             Command::MusicStop => {
+                // `MusicPause` と同じ穴が `stop` 側にもある(`MusicSchedule::cancel`
+                // のドキュメント参照)ため、同様に先に破棄する。
+                self.music_schedule.cancel();
                 self.music_voice.stop();
             }
             Command::MusicSetLoop { region } => {
@@ -1517,6 +1559,169 @@ mod tests {
             buf[0] > 0.0,
             "an overdue music schedule must start at the very first frame, not be dropped"
         );
+    }
+
+    /// ユーザー実機報告(2026-09-01)「ポーズしてすぐホームに行って、アプリに戻ると
+    /// 音が鳴り出しました」の回帰テスト。
+    ///
+    /// 実機ログでは `[MusicControl] Pause` が `songTime=-1.34`(リードイン中、曲は
+    /// まだ始まっていない)の時点で発行されており、その後 `[MusicControl] Resume` は
+    /// 一度も出ていないのに、バックグラウンドから復帰した瞬間に曲が鳴り出していた。
+    ///
+    /// 真因: `mw_music_play_scheduled` で「未来のホスト時刻に開始予約」しただけの
+    /// 楽曲ボイスは、その予約が発火するまで `MusicState::Ready`(=まだ `Playing`
+    /// になっていない)のまま。ところが `MusicVoice::pause` は `Playing` からの
+    /// 呼び出ししか受け付けない no-op(`music.rs` 参照)なので、`Ready` 中に届いた
+    /// ポーズは `MusicVoice` 側では何も起きず、予約(`Mixer::music_schedule`)だけが
+    /// 生きたまま残っていた。バックグラウンド中に予約時刻を過ぎ、復帰でストリームが
+    /// 再開した瞬間に `take_due_offset` が「到来済み・`Ready`」と判定して発火して
+    /// しまう——これが「ポーズしたのに勝手に鳴り出す」症状の直接の原因だった。
+    ///
+    /// この修正(`MusicSchedule::cancel`)後は、`Ready` 中のポーズがこの予約を
+    /// 即座に破棄するため、予約時刻をどれだけ過ぎても発火しないことを固定化する。
+    #[test]
+    fn music_pause_while_ready_with_pending_schedule_prevents_it_from_firing_later() {
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events, _bgm) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+        make_music_ready(&mut mixer, &mut producer, 1.0);
+
+        // リードイン中を模す: 予約時刻はこのバッファよりずっと先(まだ未発火)。
+        let offset = 100u64;
+        sender.send(Command::MusicPlayScheduled {
+            host_time_ns: offset * NS_PER_SAMPLE,
+        });
+        let mut before = vec![0.0; 10 * CHANNELS];
+        mixer.render(&mut before, 0);
+        assert_eq!(
+            mixer.music_state(),
+            MusicState::Ready,
+            "must still be waiting for the scheduled time (lead-in), not yet Playing"
+        );
+
+        // ゲーム側がリードイン中にポーズを発行する(実機ログの `songTime=-1.34` に相当)。
+        sender.send(Command::MusicPause);
+        let mut after_pause = vec![0.0; 5 * CHANNELS];
+        mixer.render(&mut after_pause, 0);
+        assert_eq!(
+            mixer.music_state(),
+            MusicState::Ready,
+            "MusicVoice::pause is itself a no-op from Ready; only the pending schedule is canceled"
+        );
+
+        // 予約時刻をはるかに過ぎたバッファ(ストリーム復帰後の render に相当)を
+        // 渡しても、発火してはならない。
+        let mut past_due = vec![-1.0; 50 * CHANNELS];
+        mixer.render(&mut past_due, 100_000 * NS_PER_SAMPLE);
+        assert_eq!(
+            mixer.music_state(),
+            MusicState::Ready,
+            "a canceled reservation must never fire, even long after its target time"
+        );
+        assert!(
+            past_due.iter().all(|&s| s == 0.0),
+            "must stay silent — this is exactly the bug: a stream/callback resume must not \
+             make a paused lead-in start playing on its own"
+        );
+    }
+
+    /// 上のテストの続き: 予約を破棄しても「二度と鳴らない」わけではないこと。
+    /// クライアントは `mw_music_resume_at`(`InGameEntryPoint.TickResumeCountdown` →
+    /// ネイティブ)で再開するのが本来の経路であり、その経路からは指定フレームから
+    /// 正しくフェードインして鳴ることを確認する。
+    #[test]
+    fn music_pause_while_ready_with_pending_schedule_then_resume_at_plays_audibly() {
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events, _bgm) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+        make_music_ready(&mut mixer, &mut producer, 1.0);
+
+        let offset = 100u64;
+        sender.send(Command::MusicPlayScheduled {
+            host_time_ns: offset * NS_PER_SAMPLE,
+        });
+        let mut before = vec![0.0; 10 * CHANNELS];
+        mixer.render(&mut before, 0);
+        assert_eq!(mixer.music_state(), MusicState::Ready);
+
+        sender.send(Command::MusicPause);
+        let mut after_pause = vec![0.0; 5 * CHANNELS];
+        mixer.render(&mut after_pause, 0);
+        assert_eq!(mixer.music_state(), MusicState::Ready);
+
+        sender.send(Command::MusicResumeAt { frames: 7 });
+        let mut just_resumed = vec![0.0; CHANNELS];
+        mixer.render(&mut just_resumed, 0);
+        assert_eq!(mixer.music_state(), MusicState::Playing);
+        assert_eq!(
+            mixer.music_voice.position_frames(),
+            7,
+            "resume_at must reposition immediately, not after the fade-in settles"
+        );
+
+        // `resume_at` はリングバッファへ「シーク要求」(エポック ack 方式、`stream.rs`
+        // モジュール doc「メモリオーダリング」参照)を出すだけ——実機ではデコード
+        // スレッドが back で `pump` を回し続けて ack・PCM 供給を行うが、このテストでは
+        // それを明示的に1回叩く必要がある(叩くまでは無音のまま。上の
+        // `position_frames() == 7` はシーク要求直後の即時反映であって、実際に鳴っている
+        // ことの証明ではない)。
+        let mut decoder = ConstantDecoder {
+            cursor: 0,
+            value: 1.0,
+        };
+        producer.pump(&mut decoder).expect("pump must succeed");
+
+        let ramp_len = ms_to_samples(Config::DEFAULT_RAMP_MS, TEST_SAMPLE_RATE) as usize;
+        let settle_frames = ramp_len + 10;
+        let mut resumed = vec![0.0; settle_frames * CHANNELS];
+        mixer.render(&mut resumed, 0);
+
+        assert_eq!(mixer.music_state(), MusicState::Playing);
+        assert_eq!(
+            mixer.music_voice.position_frames(),
+            7 + settle_frames as u64,
+            "must actually advance through the song once PCM is supplied after resuming"
+        );
+        let last = resumed[(settle_frames - 1) * CHANNELS];
+        assert!(
+            (last - 1.0).abs() < 1e-4,
+            "must fade in to full volume and actually produce sound after resume_at, got {last}"
+        );
+    }
+
+    /// `MusicPause` と同じ穴が `stop` 側にもないかの回帰テスト
+    /// (依頼書「stop() でも予約が残らないこと」)。`MusicVoice::stop` も `Ready`/
+    /// `Loading` からは no-op(`music.rs` 参照)なので、`MusicSchedule::cancel` を
+    /// 呼ばなければ `pause` と全く同じ経路で誤発火しうる。
+    #[test]
+    fn music_stop_while_ready_with_pending_schedule_prevents_it_from_firing_later() {
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events, _bgm) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+        make_music_ready(&mut mixer, &mut producer, 1.0);
+
+        let offset = 100u64;
+        sender.send(Command::MusicPlayScheduled {
+            host_time_ns: offset * NS_PER_SAMPLE,
+        });
+        let mut before = vec![0.0; 10 * CHANNELS];
+        mixer.render(&mut before, 0);
+        assert_eq!(mixer.music_state(), MusicState::Ready);
+
+        sender.send(Command::MusicStop);
+        let mut after_stop = vec![0.0; 5 * CHANNELS];
+        mixer.render(&mut after_stop, 0);
+        assert_eq!(
+            mixer.music_state(),
+            MusicState::Ready,
+            "MusicVoice::stop is itself a no-op from Ready; only the pending schedule is canceled"
+        );
+
+        let mut past_due = vec![-1.0; 50 * CHANNELS];
+        mixer.render(&mut past_due, 100_000 * NS_PER_SAMPLE);
+        assert_eq!(
+            mixer.music_state(),
+            MusicState::Ready,
+            "a canceled reservation must never fire, even long after its target time"
+        );
+        assert!(past_due.iter().all(|&s| s == 0.0));
     }
 
     // --- 音楽クロックの相関点(初期構築仕様『§4.4』) ---
