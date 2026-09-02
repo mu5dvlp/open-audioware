@@ -106,9 +106,23 @@ impl Voice {
         }
     }
 
+    /// 自然終了(最後まで鳴りきった)かどうか。
+    ///
+    /// 🔴 **ループ区間が設定されている間は決して自然終了しない。** [`Voice::next_frame`] の
+    /// 折り返しは「次に読むとき」に行う遅延方式なので、バッファ境界がちょうどループ終端に
+    /// 揃った回では、折り返す前に `position_frames == loop_end` の状態で回収判定
+    /// ([`Voice::ready_to_reap`])が走り、**ループ中のボイスが黙って回収されて無音になる**。
+    ///
+    /// これは机上の懸念ではなく、ホールド保持音(2秒 / 48kHz = 96000 フレーム)で
+    /// **必ず**起きる —— 96000 は DSP バッファ 256 の倍数なので、1周目の直後に境界が揃う
+    /// (2026-09-02、クライアント側の実装者が `begin=0,end=20` の20フレーム音源で
+    ///  20回 `mix_frame` → `reap` すると `reclaimed=1` になることを実測して発見した)。
+    ///
+    /// ループの停止は明示的な stop でのみ行う、が正しい意味論。
     fn finished_naturally(&self) -> bool {
         match self.sound.as_ref() {
-            Some(sound) => self.position_frames >= sound.frames,
+            Some(sound) => self.loop_region.is_none() && self.position_frames >= sound.frames,
+            // 音源が無いスロットはループ設定に関わらず回収してよい(取り違えると枠が枯れる)。
             None => true,
         }
     }
@@ -550,6 +564,51 @@ mod tests {
             "a looping voice must not be reaped just because it has cycled past its data length"
         );
         assert_eq!(pool.active_primary_count(), 1);
+    }
+
+    /// 🔴 ループ終端が**音源の長さちょうど**(= 音源全体をループ)で、かつ描画したフレーム数が
+    /// その境界にぴったり揃った回の回帰テスト。
+    ///
+    /// 上の `looping_voice_never_naturally_reaps_while_looping` はループ区間が音源の内側
+    /// (20フレーム中の 0..4)だったため `position_frames` が音源長へ到達せず、**この壊れ方を
+    /// 踏んでいなかった**(テストは緑のまま、実際には回収されていた)。
+    ///
+    /// 「音源全体をループ」は最も素直な指定で、ホールド保持音がまさにこれ
+    /// (2秒 / 48kHz = 96000 フレームは DSP バッファ 256 の倍数なので**必ず境界が揃う**)。
+    #[test]
+    fn looping_whole_sound_is_not_reaped_when_buffer_ends_exactly_on_the_loop_end() {
+        let mut pool = VoicePool::new(1, 1);
+        let frames = 20usize;
+        pool.play(1, 100, indexed_sound(frames), BusId::Se, 1.0, 4);
+        pool.set_loop(1, Some((0, frames as u64)));
+
+        // 音源長ちょうどぶんだけ描画する(= バッファ境界がループ終端に揃った状態)。
+        for _ in 0..frames {
+            let _ = pool.mix_frame(&unity_bus_volume());
+        }
+
+        let mut reclaimed = 0;
+        pool.reap(|_| reclaimed += 1);
+        assert_eq!(
+            reclaimed, 0,
+            "音源全体をループしているボイスが、折り返す前の回収判定で消えてはいけない\
+             (これが起きるとホールド保持音が1周目の直後に必ず無音になる)"
+        );
+        assert_eq!(pool.active_primary_count(), 1);
+
+        // 折り返して先頭から鳴り続けること(無音落ちしていないことの裏取り)。
+        // ⚠️ `indexed_sound` は**フレーム0 の値が 0.0** なので、折り返し直後の1フレーム目で
+        //    非ゼロを期待してはいけない(最初にそう書いて落ちた)。2フレーム目(値 1.0)を見る。
+        let (first_after_wrap, _) = pool.mix_frame(&unity_bus_volume());
+        let (second_after_wrap, _) = pool.mix_frame(&unity_bus_volume());
+        assert_eq!(
+            first_after_wrap, 0.0,
+            "折り返し後の1フレーム目は音源の先頭(indexed_sound のフレーム0 = 0.0)のはず"
+        );
+        assert!(
+            second_after_wrap.abs() > 0.0,
+            "折り返し後に無音のままになっている(ループが機能していない)"
+        );
     }
 
     #[test]
