@@ -114,6 +114,11 @@ mw_se_schedule(handle, id: u64, bus: i32, volume: f32, host_time_ns: u64, out_vo
     // 予約時刻が過去ならそのバッファの先頭で即座に発音する(取りこぼさない)
 mw_voice_stop(handle, voice: u64) -> MwResult                     // 既定ランプ経由
 mw_voice_set_volume(handle, voice: u64, volume: f32) -> MwResult  // 既定ランプ経由
+mw_voice_set_loop(handle, voice: u64, begin_frames: u64, end_frames: u64) -> MwResult
+    // SE ボイスのループ再生(2026-09-02、ホールド音〔継続音〕向け)。規約は
+    // mw_music_set_loop と同じ(begin==0 && end==0 はループ解除、begin>=end は
+    // ErrInvalidLoopRegion)。楽曲/BGM と異なり折り返しにクロスフェードは挟まない
+    // (素材のループ点が連続している前提。mw_core::voice.rs モジュール doc 参照)
 mw_bus_set_volume(handle, bus: i32, volume: f32) -> MwResult      // 既定ランプ経由
 mw_bus_fade(handle, bus: i32, target: f32, ms: f32) -> MwResult   // 呼び出し側指定の時間
 mw_bus_get_volume(handle, bus: i32, out_volume: *mut f32) -> MwResult

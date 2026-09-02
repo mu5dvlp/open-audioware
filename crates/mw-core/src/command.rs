@@ -46,6 +46,18 @@ pub enum Command {
     StopVoice { voice_serial: u64 },
     /// 指定ボイスの音量を変更する(既定ランプ経由。M13)。
     SetVoiceVolume { voice_serial: u64, volume: f32 },
+    /// 指定ボイスのループ区間を設定・解除する(`mw_voice_set_loop` に相当。
+    /// ホールド音〔継続音〕のような、押している間ずっと鳴り続ける SE 向け)。
+    ///
+    /// `None` はループ解除。`Some((start, end))` で `start >= end` の不正な区間は
+    /// `voice::VoicePool::set_loop` 側でループ無しとして扱われる(`MusicSetLoop`/
+    /// `MusicVoice::set_loop` と同じ意味論——リアルタイム安全性のためパニックしない)。
+    /// 楽曲/BGM のループと異なり、折り返しにクロスフェードは挟まない
+    /// (`voice.rs` モジュール doc「ループ再生」参照)。
+    SetVoiceLoop {
+        voice_serial: u64,
+        region: Option<(u64, u64)>,
+    },
     /// 指定サウンド ID を再生中の全ボイスを停止する(`mw_sound_release` から発行される。
     /// 既定ランプ経由。停止後、当該ボイスが保持していた `Arc` は回収キュー経由で
     /// ゲームスレッドへ返却される)。

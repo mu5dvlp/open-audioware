@@ -4,10 +4,29 @@
 //! - 枯渇時は最も古いボイスをスティールする。スティールされたボイスは即座に消音せず、
 //!   「尾」スロット([`VoicePool`] の `tails`)へ移し、既定ランプで滑らかにフェードアウト
 //!   させながら解放する(M13: 停止・スティールもランプを通す。不連続ゼロを作らない)。
-//! - ボイスは PCM データ参照(`Arc<SoundData>`)+ 再生位置 + 音量(ランプ)+ バスを持つ。
+//! - ボイスは PCM データ参照(`Arc<SoundData>`)+ 再生位置 + 音量(ランプ)+ バス +
+//!   ループ区間(オプション、下記)を持つ。
 //!
 //! `VoicePool` はコンストラクタで固定長のバッキング配列を確保した後は、
 //! 音声コールバック経路から一切のアロケーションを行わない(§5.3)。
+//!
+//! # ループ再生([`VoicePool::set_loop`])
+//!
+//! ホールド音(継続音)のような「押している間ずっと鳴り続ける SE」向けに、ボイス単位で
+//! ループ区間を設定できる(初期構築仕様『§4.2』を拡張)。意味論は
+//! [`crate::music::MusicVoice::set_loop`] と揃えてある(2つの流儀を生まないため):
+//!
+//! - 区間は `(開始フレーム, 終了フレーム)` の組(終了は排他的境界)。
+//! - `start >= end` の不正な区間は無視し、ループ無し(`None`)として扱う
+//!   (リアルタイム安全性のため、不正入力でもパニックしない)。
+//! - 解除は `None` を渡す。
+//!
+//! **`MusicVoice` と異なる点**: 楽曲側の選曲プレビュー用ループは折り返しの瞬間に
+//! フェードアウト→フェードインを挟む(任意の位置がループ点になりうるため、
+//! クリックノイズを消す目的)。SE のループは「素材自体がループ点で連続するように
+//! 作られている継続音」を想定しており、折り返しにクロスフェードを挟まない
+//! (単純に位置を巻き戻すだけ。既存の `volume`(`Ramp`)は明示的な `stop`/スティールの
+//! フェードアウト専用のまま——ループ折り返しはこれを一切使わない)。
 
 use std::sync::Arc;
 
@@ -32,6 +51,9 @@ struct Voice {
     position_frames: usize,
     bus: BusId,
     volume: Ramp,
+    /// ループ区間 `(開始フレーム, 終了フレーム)`。`None` ならループしない
+    /// (`MusicVoice::loop_region` と同じ意味論。モジュール doc「ループ再生」参照)。
+    loop_region: Option<(u64, u64)>,
     /// 明示的な停止 / スティールによるフェードアウト中か。
     /// 自然終了(PCM を最後まで再生し終えた)とは区別する — 自然終了はランプ不要
     /// (§4.2 の対象は「変化」と「停止」であり、単なるデータ末尾到達ではない)。
@@ -49,6 +71,7 @@ impl Voice {
             position_frames: 0,
             bus: BusId::Se,
             volume: Ramp::new(0.0),
+            loop_region: None,
             stopping: false,
             age: 0,
         }
@@ -60,10 +83,20 @@ impl Voice {
 
     /// 1フレーム分の (L, R) を返し、再生位置を進める。データ終端に達していれば
     /// 無音を返す(添字パニックを避けるため `SoundData::frame` の `get` 系経由)。
+    ///
+    /// ループ区間が設定されている場合、位置が終了フレームへ到達した時点(終了は
+    /// 排他的境界)で開始フレームへ折り返してから読む(モジュール doc「ループ再生」)。
     fn next_frame(&mut self) -> (f32, f32) {
         let Some(sound) = self.sound.as_ref() else {
             return (0.0, 0.0);
         };
+        if let Some((loop_start, loop_end)) = self.loop_region
+            && self.position_frames as u64 >= loop_end
+        {
+            // `usize::try_from` が失敗する(loop_start が usize に収まらない)ことは
+            // 実運用上まず起こらないが、パニックせず安全側(末尾扱い = 以後は無音)に倒す。
+            self.position_frames = usize::try_from(loop_start).unwrap_or(usize::MAX);
+        }
         match sound.frame(self.position_frames) {
             Some((l, r)) => {
                 self.position_frames += 1;
@@ -144,6 +177,7 @@ impl VoicePool {
                 position_frames: 0,
                 bus,
                 volume: Ramp::new(volume),
+                loop_region: None,
                 stopping: false,
                 age,
             };
@@ -178,6 +212,7 @@ impl VoicePool {
                 position_frames: 0,
                 bus,
                 volume: Ramp::new(volume),
+                loop_region: None,
                 stopping: false,
                 age,
             };
@@ -208,6 +243,38 @@ impl VoicePool {
         {
             v.volume.set_target(volume, ramp_samples);
         }
+    }
+
+    /// ボイスのループ区間を設定・解除する(モジュール doc「ループ再生」)。
+    ///
+    /// `start >= end` の不正な区間は無視し、ループ無し(`None`)として扱う
+    /// (`MusicVoice::set_loop` と同じ意味論。リアルタイム安全性のためパニックしない)。
+    /// `set_volume` と同じフィルタ(発音中かつ `stopping`〔明示停止/スティールの
+    /// フェードアウト中〕でないボイスのみが対象)——フェードアウトして消えていく
+    /// ボイスに新しいループ区間を設定しても意味を持たないため。
+    ///
+    /// 無効・既に終了したボイス ID は静かに無視される(`stop`/`set_volume` と同じ、
+    /// opaque serial 方式の制約。§5.2)。
+    pub fn set_loop(&mut self, voice_serial: u64, region: Option<(u64, u64)>) {
+        let region = match region {
+            Some((start, end)) if start < end => Some((start, end)),
+            _ => None,
+        };
+        if let Some(v) = self
+            .primary
+            .iter_mut()
+            .find(|v| v.is_active() && v.serial == voice_serial && !v.stopping)
+        {
+            v.loop_region = region;
+        }
+    }
+
+    /// 現在のループ区間(テスト・診断用)。ボイスが存在しない、または未設定の場合は `None`。
+    pub fn loop_region(&self, voice_serial: u64) -> Option<(u64, u64)> {
+        self.primary
+            .iter()
+            .find(|v| v.is_active() && v.serial == voice_serial)
+            .and_then(|v| v.loop_region)
     }
 
     /// `sound_id`(`SoundStorage` が払い出した不透明 ID)が一致する再生中の全ボイスを停止する
@@ -371,6 +438,118 @@ mod tests {
         let mut reclaimed = 0;
         pool.reap(|_| reclaimed += 1);
         assert_eq!(reclaimed, 1);
+    }
+
+    /// `sound()` と違い、フレーム `i` の (L, R) が `i` そのものになる一定でない PCM。
+    /// ループ折り返しがどの位置から再開したかをサンプル値そのものから検証できる。
+    fn indexed_sound(frames: usize) -> Arc<SoundData> {
+        let mut interleaved = vec![0.0; frames * CHANNELS];
+        for i in 0..frames {
+            interleaved[i * CHANNELS] = i as f32;
+            interleaved[i * CHANNELS + 1] = i as f32;
+        }
+        Arc::new(SoundData {
+            sample_rate: 48_000,
+            frames,
+            interleaved,
+        })
+    }
+
+    #[test]
+    fn set_loop_rejects_invalid_region() {
+        let mut pool = VoicePool::new(1, 1);
+        pool.play(1, 100, sound(1000), BusId::Se, 1.0, 4);
+
+        pool.set_loop(1, Some((10, 10)));
+        assert_eq!(pool.loop_region(1), None);
+
+        pool.set_loop(1, Some((10, 5)));
+        assert_eq!(pool.loop_region(1), None);
+
+        pool.set_loop(1, Some((5, 10)));
+        assert_eq!(pool.loop_region(1), Some((5, 10)));
+    }
+
+    #[test]
+    fn set_loop_clears_with_none() {
+        let mut pool = VoicePool::new(1, 1);
+        pool.play(1, 100, sound(1000), BusId::Se, 1.0, 4);
+        pool.set_loop(1, Some((5, 10)));
+        assert_eq!(pool.loop_region(1), Some((5, 10)));
+
+        pool.set_loop(1, None);
+        assert_eq!(pool.loop_region(1), None);
+    }
+
+    #[test]
+    fn set_loop_on_unknown_voice_is_silently_ignored() {
+        let mut pool = VoicePool::new(1, 1);
+        pool.play(1, 100, sound(1000), BusId::Se, 1.0, 4);
+        // 未知のシリアル: パニックせず、既存ボイスにも影響しない。
+        pool.set_loop(999, Some((5, 10)));
+        assert_eq!(pool.loop_region(999), None);
+        assert_eq!(pool.loop_region(1), None);
+    }
+
+    #[test]
+    fn set_loop_is_ignored_once_voice_is_stopping() {
+        // `set_volume` と同じフィルタ: フェードアウト中のボイスへ新しいループ区間を
+        // 設定しても無視される(消えていくボイスに意味を持たせないため)。
+        let mut pool = VoicePool::new(1, 1);
+        pool.play(1, 100, sound(1000), BusId::Se, 1.0, 4);
+        pool.stop(1, 4);
+        pool.set_loop(1, Some((5, 10)));
+        assert_eq!(pool.loop_region(1), None);
+    }
+
+    /// ループ境界をまたいで正しくサンプルが出ること(依頼書のテスト要件)。
+    /// 区間 `[5, 10)` でループさせ、位置の実際の遷移をサンプル値(L=フレーム番号)から
+    /// 直接検証する: 0,1,2,3,4 (助走) → 5,6,7,8,9 (ループ1周目) → 5,6,7,8,9 (2周目) → ...
+    #[test]
+    fn loop_region_wraps_and_produces_correct_samples_across_the_boundary() {
+        let mut pool = VoicePool::new(1, 1);
+        pool.play(1, 100, indexed_sound(20), BusId::Se, 1.0, 4);
+        pool.set_loop(1, Some((5, 10)));
+
+        let mut observed = Vec::new();
+        for _ in 0..17 {
+            let (l, r) = pool.mix_frame(&unity_bus_volume());
+            assert_eq!(l, r, "L/R must match for this fixture");
+            observed.push(l);
+        }
+
+        assert_eq!(
+            observed,
+            vec![
+                0.0, 1.0, 2.0, 3.0, 4.0, // 助走(ループ区間の外)
+                5.0, 6.0, 7.0, 8.0, 9.0, // 1周目
+                5.0, 6.0, 7.0, 8.0, 9.0, // 2周目
+                5.0, 6.0, // 3周目の途中
+            ],
+            "position must wrap to the loop start exactly at the exclusive end boundary"
+        );
+    }
+
+    /// ループ設定済みのボイスは、`sound.frames` を超えて延々ループし続けても
+    /// 自然終了(`ready_to_reap`)しない——ホールド保持音が明示的な `stop` まで
+    /// 鳴り続け続けるための前提。
+    #[test]
+    fn looping_voice_never_naturally_reaps_while_looping() {
+        let mut pool = VoicePool::new(1, 1);
+        pool.play(1, 100, indexed_sound(20), BusId::Se, 1.0, 4);
+        pool.set_loop(1, Some((0, 4)));
+
+        for _ in 0..100 {
+            let _ = pool.mix_frame(&unity_bus_volume());
+        }
+
+        let mut reclaimed = 0;
+        pool.reap(|_| reclaimed += 1);
+        assert_eq!(
+            reclaimed, 0,
+            "a looping voice must not be reaped just because it has cycled past its data length"
+        );
+        assert_eq!(pool.active_primary_count(), 1);
     }
 
     #[test]

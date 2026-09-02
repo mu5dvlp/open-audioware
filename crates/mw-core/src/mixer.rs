@@ -429,6 +429,12 @@ impl Mixer {
             } => {
                 self.voices.set_volume(voice_serial, volume, default_ramp);
             }
+            Command::SetVoiceLoop {
+                voice_serial,
+                region,
+            } => {
+                self.voices.set_loop(voice_serial, region);
+            }
             Command::StopVoicesUsingSound { sound_id } => {
                 self.voices.stop_all_using_sound(sound_id, default_ramp);
                 // `voices` 側だけでは不十分: `se_schedule` に残る同じ音源への未発火予約は
@@ -838,6 +844,25 @@ mod tests {
         })
     }
 
+    /// `constant_sound` と違い、フレーム `i` の (L, R) が `i * 0.01` になる PCM。
+    /// `Command::SetVoiceLoop` の折り返し位置をサンプル値から直接検証するために使う。
+    /// 振幅を Master 段の `SoftClipper` 閾値(既定 1.0)より十分小さく抑えてあるのは、
+    /// 素の値(0..frames)をそのまま振幅に使うと大きな値がクリッパで非線形圧縮され、
+    /// 「位置がどこへ折り返ったか」をサンプル値から線形に読み取れなくなるため。
+    fn indexed_sound(frames: usize) -> Arc<SoundData> {
+        let mut interleaved = vec![0.0; frames * CHANNELS];
+        for i in 0..frames {
+            let value = i as f32 * 0.01;
+            interleaved[i * CHANNELS] = value;
+            interleaved[i * CHANNELS + 1] = value;
+        }
+        Arc::new(SoundData {
+            sample_rate: 48_000,
+            frames,
+            interleaved,
+        })
+    }
+
     #[test]
     fn silence_by_default() {
         let (mut mixer, _sender, _reclaim, _music_producer, _music_clock, _events, _bgm) =
@@ -879,6 +904,45 @@ mod tests {
         // 初期構築仕様 §4.2: 「次のオーディオコールバックで必ず発音される」。
         assert_eq!(buf[0], 0.25);
         assert_eq!(buf[1], 0.25);
+    }
+
+    /// `Command::SetVoiceLoop` がコマンドキュー経由で `VoicePool::set_loop` まで正しく
+    /// 配線されており、ループ境界をまたいで正しくサンプルが出ることを end-to-end で確認する
+    /// (依頼書のテスト要件。ボイスプール単体の検証は `voice.rs` を参照)。
+    #[test]
+    fn set_voice_loop_command_wraps_playback_at_the_loop_boundary() {
+        let (mut mixer, sender, _reclaim, _music_producer, _music_clock, _events, _bgm) =
+            build(Config::default(), 48_000);
+        assert!(sender.send(Command::PlaySe {
+            voice_serial: 1,
+            sound_id: 1,
+            sound: indexed_sound(20),
+            bus: BusId::Se,
+            volume: 1.0,
+        }));
+        assert!(sender.send(Command::SetVoiceLoop {
+            voice_serial: 1,
+            region: Some((5, 10)),
+        }));
+
+        let mut buf = vec![0.0; 12 * CHANNELS];
+        mixer.render(&mut buf, 0);
+
+        let l_values: Vec<f32> = (0..12).map(|i| buf[i * CHANNELS]).collect();
+        let expected: Vec<f32> = [
+            0, 1, 2, 3, 4, // 助走
+            5, 6, 7, 8, 9, // 1周目
+            5, 6, // 2周目の途中
+        ]
+        .iter()
+        .map(|&i| i as f32 * 0.01)
+        .collect();
+        for (i, (&actual, &expected)) in l_values.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1e-6,
+                "frame {i}: expected {expected}, got {actual}"
+            );
+        }
     }
 
     #[test]

@@ -96,8 +96,16 @@ OS 非依存・デバイス非依存のコア。ミキサ、ボイス管理、�
   枯渇時は最古のボイスを「尾」スロットへ退避しつつ既定ランプでフェードアウトさせ、
   元のスロットへ新規ボイスを即座に割り当てる(スティール。§4.2)。停止・スティールは
   必ずランプを経由し、自然終了(PCM 終端到達)はランプ不要としてただちに回収する。
+  **2026-09-02: `VoicePool::set_loop`(SE ボイスのループ再生)を追加**——ホールド音
+  (継続音)向け。ボイス単位で `Option<(開始フレーム, 終了フレーム)>` を持たせ、
+  `MusicVoice::set_loop` と意味論を揃えた(区間の与え方・`start >= end` の不正入力を
+  ループ無しへ丸める・`None` で解除、の3点。2つの流儀を生まないため)。**異なる点**:
+  `MusicVoice` の折り返しはフェードアウト→フェードインを挟む(任意の位置がループ点に
+  なりうる選曲プレビュー用のため)が、SE のループは素材のループ点が連続する前提の
+  継続音向けなのでクロスフェードを挟まず単純に位置を巻き戻す(`Voice::next_frame`)。
+  対象は「発音中かつ `stopping` でない」ボイスのみ(`set_volume` と同じフィルタ)。
 - `command`: `Command` — ゲームスレッド→音声スレッドのコマンド列挙
-  (`PlaySe` / `StopVoice` / `SetVoiceVolume` / `StopVoicesUsingSound` /
+  (`PlaySe` / `StopVoice` / `SetVoiceVolume` / `SetVoiceLoop` / `StopVoicesUsingSound` /
   `SetBusVolume` / `BusFade` / `SeSchedule` / `MusicPlayScheduled` / `MusicPrepare` /
   `MusicSeek` / `MusicPause` / `MusicResumeAt` / `MusicStop` / `MusicSetLoop` /
   `BgmPrepare` / `BgmSeek` / `BgmPlay` / `BgmStop` / `BgmSetLoop`)。

@@ -460,7 +460,7 @@ namespace Mw.Native
         /// <param name="id"><see cref="LoadSound"/> が返したサウンド ID。</param>
         /// <param name="bus">再生先バス。</param>
         /// <param name="volume">再生音量(linear)。</param>
-        /// <param name="voice">成功時、以後 <see cref="VoiceStop"/> / <see cref="VoiceSetVolume"/> に渡す不透明 ID。</param>
+        /// <param name="voice">成功時、以後 <see cref="VoiceStop"/> / <see cref="VoiceSetVolume"/> / <see cref="SetVoiceLoop"/> に渡す不透明 ID。</param>
         public static unsafe MwResult PlaySe(ulong handle, ulong id, Bus bus, float volume, out ulong voice)
         {
             ulong outVoice = 0;
@@ -491,7 +491,7 @@ namespace Mw.Native
         /// <param name="bus">再生先バス。</param>
         /// <param name="volume">再生音量(linear)。</param>
         /// <param name="hostTimeNs">発音時刻(<see cref="HostTimeNs"/> と同じ時計)。</param>
-        /// <param name="voice">成功時、以後 <see cref="VoiceStop"/> / <see cref="VoiceSetVolume"/> に渡す不透明 ID。</param>
+        /// <param name="voice">成功時、以後 <see cref="VoiceStop"/> / <see cref="VoiceSetVolume"/> / <see cref="SetVoiceLoop"/> に渡す不透明 ID。</param>
         public static unsafe MwResult ScheduleSe(ulong handle, ulong id, Bus bus, float volume, ulong hostTimeNs, out ulong voice)
         {
             ulong outVoice = 0;
@@ -512,6 +512,35 @@ namespace Mw.Native
         {
             Generated.MwResult native = NativeMethods.mw_voice_set_volume(handle, voice, volume);
             return ToPublicResult(native);
+        }
+
+        /// <summary>
+        /// ボイスのループ区間を設定する(<see cref="SetMusicLoop"/> の SE ボイス版)。
+        /// ホールド音(継続音)のような、押している間ずっと鳴り続ける SE 向け。
+        /// <para>
+        /// 楽曲/BGM のループと異なりフェードイン/アウトは行わない——SE のループポイントは
+        /// 素材自体が連続するように作られている継続音を想定している。
+        /// </para>
+        /// <para>
+        /// 解除は <see cref="ClearVoiceLoop"/> を使うこと。
+        /// <paramref name="beginFrames"/> が <paramref name="endFrames"/> 以上の場合は
+        /// <see cref="MwResult.ErrInvalidLoopRegion"/>(解除を意味する 0/0 を除く)。
+        /// </para>
+        /// </summary>
+        public static MwResult SetVoiceLoop(ulong handle, ulong voice, ulong beginFrames, ulong endFrames)
+        {
+            Generated.MwResult native = NativeMethods.mw_voice_set_loop(handle, voice, beginFrames, endFrames);
+            return ToPublicResult(native);
+        }
+
+        /// <summary>
+        /// ボイスのループ区間を解除する。ネイティブ側は「区間 0/0」を解除の合図として
+        /// 解釈する【仮】ため、呼び出し側にその規約を意識させないよう専用のメソッドに
+        /// してある(<see cref="ClearMusicLoop"/> と同じ設計)。
+        /// </summary>
+        public static MwResult ClearVoiceLoop(ulong handle, ulong voice)
+        {
+            return SetVoiceLoop(handle, voice, 0, 0);
         }
 
         /// <summary>バス音量を変更する(既定ランプ経由。初期構築仕様 M13/§4.1)。</summary>

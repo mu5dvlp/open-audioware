@@ -222,6 +222,13 @@ fn render_path_never_allocates_or_deallocates() {
         voice_serial: 5,
         volume: 0.2,
     }));
+    // SE ボイスのループ再生(ホールド保持音向け)。折り返し(`voice::Voice::next_frame`
+    // の位置巻き戻し)がこの200コールバックぶんのレンダリング中に何度も発生する
+    // 短いループ区間にして、ゼロアロケーション経路の対象へ含める。
+    assert!(sender.send(Command::SetVoiceLoop {
+        voice_serial: 6,
+        region: Some((10, 50)),
+    }));
     assert!(sender.send(Command::SetBusVolume {
         bus: mw_core::BusId::Master,
         volume: 0.8,

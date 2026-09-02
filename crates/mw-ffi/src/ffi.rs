@@ -541,6 +541,58 @@ pub extern "C" fn mw_voice_set_volume(handle: u64, voice: u64, volume: f32) -> M
     }
 }
 
+/// ボイスのループ区間を設定・解除する(`mw_music_set_loop` の SE ボイス版。
+/// ホールド音〔継続音〕のような、押している間ずっと鳴り続ける SE 向け)。
+///
+/// 意味論は `mw_music_set_loop`/`mw_bgm_set_loop` と揃えてある:
+/// **`begin_frames == 0 && end_frames == 0` はループ解除**([`LOOP_CLEAR_SENTINEL`]
+/// と同じ規約)。それ以外で `begin_frames >= end_frames` は不正な区間として
+/// `MwResult::ErrInvalidLoopRegion` を返す(`mw_core::voice::VoicePool::set_loop`
+/// は同じ状況を音声スレッド側で黙ってループ無しに丸めるが——リアルタイム安全性の
+/// ためパニックできない設計——FFI 境界では黙って捨てず明示的に拒否する)。
+///
+/// 楽曲/BGM のループと異なり、折り返しにクロスフェードは挟まない(SE のループポイントは
+/// 素材自体が連続するように作られている前提。`voice.rs` モジュール doc「ループ再生」
+/// 参照)。無効・既に終了した `voice` は静かに無視される(`mw_voice_stop`/
+/// `mw_voice_set_volume` と同じ、opaque serial 方式の制約)。
+#[unsafe(no_mangle)]
+pub extern "C" fn mw_voice_set_loop(
+    handle: u64,
+    voice: u64,
+    begin_frames: u64,
+    end_frames: u64,
+) -> MwResult {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        let region = if (begin_frames, end_frames) == LOOP_CLEAR_SENTINEL {
+            None
+        } else if begin_frames >= end_frames {
+            return MwResult::ErrInvalidLoopRegion;
+        } else {
+            Some((begin_frames, end_frames))
+        };
+
+        let result = handle_registry::with_instance(handle, |instance| {
+            let sent = instance
+                .command_sender
+                .send(mw_core::Command::SetVoiceLoop {
+                    voice_serial: voice,
+                    region,
+                });
+            if sent {
+                MwResult::Ok
+            } else {
+                MwResult::ErrCommandQueueFull
+            }
+        });
+        result.unwrap_or(MwResult::ErrInvalidHandle)
+    }));
+
+    match outcome {
+        Ok(result) => result,
+        Err(_) => MwResult::ErrPanic,
+    }
+}
+
 /// バス音量を変更する(既定ランプ経由。初期構築仕様 M13/§4.1)。
 #[unsafe(no_mangle)]
 pub extern "C" fn mw_bus_set_volume(handle: u64, bus: i32, volume: f32) -> MwResult {
@@ -1622,6 +1674,15 @@ mod tests {
         );
 
         assert_eq!(mw_voice_set_volume(handle, voice_id, 0.5), MwResult::Ok);
+        // ホールド保持音向けのループ区間設定・解除(実ハンドル越しにコマンドが素通り
+        // することの確認。サンプル精度の折り返し検証は mw-core 側の
+        // `voice.rs`/`mixer.rs` のオフラインレンダリングテストで行う)。
+        assert_eq!(mw_voice_set_loop(handle, voice_id, 0, 2), MwResult::Ok);
+        assert_eq!(mw_voice_set_loop(handle, voice_id, 0, 0), MwResult::Ok);
+        assert_eq!(
+            mw_voice_set_loop(handle, voice_id, 5, 5),
+            MwResult::ErrInvalidLoopRegion
+        );
         assert_eq!(mw_voice_stop(handle, voice_id), MwResult::Ok);
         assert_eq!(mw_bus_set_volume(handle, 2, 0.9), MwResult::Ok);
         assert_eq!(mw_bus_fade(handle, 0, 1.0, 20.0), MwResult::Ok);
@@ -2816,6 +2877,38 @@ mod tests {
     fn music_set_loop_with_a_valid_region_and_invalid_handle_is_invalid_handle_not_a_crash() {
         assert_eq!(
             mw_music_set_loop(0xDEAD_BEEF_u64, 0, 100),
+            MwResult::ErrInvalidHandle
+        );
+    }
+
+    /// `mw_voice_set_loop`(SE ボイス版)は `mw_music_set_loop` と同じ区間検証の
+    /// 挙動を持つ(モジュール doc「意味論を揃える」)。
+    #[test]
+    fn voice_set_loop_rejects_invalid_region_before_touching_the_handle() {
+        assert_eq!(
+            mw_voice_set_loop(0xDEAD_BEEF_u64, 1, 10, 10),
+            MwResult::ErrInvalidLoopRegion
+        );
+        assert_eq!(
+            mw_voice_set_loop(0xDEAD_BEEF_u64, 1, 10, 5),
+            MwResult::ErrInvalidLoopRegion
+        );
+    }
+
+    #[test]
+    fn voice_set_loop_zero_zero_is_treated_as_clear_not_as_an_invalid_region() {
+        // (0, 0) はループ解除として扱われ、不正区間の検証には引っかからない
+        // (`mw_music_set_loop_zero_zero_is_treated_as_clear...` と同じ論法)。
+        assert_eq!(
+            mw_voice_set_loop(0xDEAD_BEEF_u64, 1, 0, 0),
+            MwResult::ErrInvalidHandle
+        );
+    }
+
+    #[test]
+    fn voice_set_loop_with_a_valid_region_and_invalid_handle_is_invalid_handle_not_a_crash() {
+        assert_eq!(
+            mw_voice_set_loop(0xDEAD_BEEF_u64, 1, 0, 100),
             MwResult::ErrInvalidHandle
         );
     }
