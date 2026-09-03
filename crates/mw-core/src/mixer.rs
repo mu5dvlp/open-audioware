@@ -1907,6 +1907,84 @@ mod tests {
         );
     }
 
+    /// P0-4 回帰テスト: 自然終了後に BGM/楽曲を鳴らし直すと無音になっていた不具合
+    /// (`music.rs::MusicVoice::render` の自然終了分岐が `position_frames` を末尾に
+    /// 残したままだったため、直後の `play()` が即座にまた自然終了と判定し、
+    /// 無音のまま `MusicEnded` を再送していた)。
+    ///
+    /// `MusicStreamProducer`/`StreamingMusicSource` を実際に介した経路(単体の
+    /// `MusicVoice` だけでなく、シーク調停のエポック ack もまたいで)で、
+    /// 「自然終了 → もう一度 `play` → 実際に曲頭から音が出る」ことと、
+    /// 「そのとき `MusicEnded` が再送されない」ことの両方を固定化する。
+    #[test]
+    fn music_replays_from_the_start_after_natural_end_without_resending_music_ended() {
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, events, _bgm) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+
+        let mut decoder = FiniteDecoder {
+            cursor: 0,
+            total: 5,
+        };
+        producer.pump(&mut decoder).expect("pump must succeed");
+        let mut warmup = vec![0.0; 4 * CHANNELS];
+        mixer.render(&mut warmup, 0);
+        assert_eq!(mixer.music_state(), MusicState::Ready);
+
+        sender.send(Command::MusicPlayScheduled { host_time_ns: 0 });
+        // 総フレーム数(5)より大きい要求 -> このコールバック内で自然終了するはず。
+        let mut buf = vec![0.0; 20 * CHANNELS];
+        mixer.render(&mut buf, 0);
+        assert_eq!(
+            mixer.music_state(),
+            MusicState::Ready,
+            "must have returned to Ready via natural end"
+        );
+        assert_eq!(
+            mixer.music_voice.position_frames(),
+            0,
+            "natural end must reset position back to the head, like stop()"
+        );
+
+        let (out, dropped) = drain_events(&events, 10);
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            out.iter().filter(|e| **e == Event::MusicEnded).count(),
+            1,
+            "natural end must push MusicEnded exactly once, got {out:?}"
+        );
+
+        // 自然終了時の `request_seek(0)` で `seek_epoch` が進んでいるはずなので、
+        // デコードスレッド役の `pump` がそれを検知してデコーダを曲頭へシークし直し、
+        // リングバッファへ再び詰める(`stream.rs::MusicStreamProducer::
+        // handle_seek_if_requested` 参照)。実運用でもデコードスレッドが
+        // 定期的に `pump` を回し続けているため、この呼び出しは実際の経路を模している。
+        producer
+            .pump(&mut decoder)
+            .expect("pump must succeed after rewinding to the head");
+
+        sender.send(Command::MusicPlayScheduled { host_time_ns: 0 });
+        let mut replay = vec![-1.0; 3 * CHANNELS];
+        mixer.render(&mut replay, 0);
+
+        assert_eq!(
+            mixer.music_state(),
+            MusicState::Playing,
+            "replaying after natural end must actually start playing again, not silently stay Ready"
+        );
+        assert!(
+            replay.iter().any(|&s| s != 0.0),
+            "replay after natural end must produce audible output, not silence, got {replay:?}"
+        );
+
+        let (out2, dropped2) = drain_events(&events, 10);
+        assert_eq!(dropped2, 0);
+        assert!(
+            !out2.contains(&Event::MusicEnded),
+            "MusicEnded must not be resent merely from replaying; only a fresh natural end \
+             should push it again, got {out2:?}"
+        );
+    }
+
     #[test]
     fn music_looped_event_is_pushed_with_the_restart_frame() {
         let (mut mixer, sender, _reclaim, mut producer, _music_clock, events, _bgm) =

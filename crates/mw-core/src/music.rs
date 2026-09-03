@@ -451,12 +451,31 @@ impl MusicVoice {
             // 自然終了(§4.3: ランプ不要、データ末尾到達は「変化」でも「停止」でもない)。
             // チャンクは総フレーム数を跨がないよう切ってあるため、ここに到達するのは
             // 常に「直前のチャンクでちょうど末尾まで読み切った」瞬間になる。
+            //
+            // 位置を末尾のまま残すと、この直後に `play()` された際に次の `render` が
+            // 即座にこの分岐へ再突入してしまい(`position_frames >= total` が
+            // 依然として成り立つため)、音が一切出ないまま `MusicEnded` だけを
+            // 再送してしまう(P0-4)。`stop()` の「フェード完了後に位置を 0 へ戻す」
+            // 後始末(`position_frames = 0` + `source` への位置決め要求)と同じだけ
+            // ここでも行い、曲頭から鳴らし直せる状態に戻す。`source` 側のカーソル
+            // (`StreamingMusicSource` のリングバッファ)は末尾まで消費し切っており、
+            // 明示的に `request_seek(0)` しない限り新しい PCM が積まれないため、
+            // `position_frames` を戻すだけでは不十分――両方が必須。
+            //
+            // ランプは経由しない自然終了だが、位置そのものが末尾→曲頭へ不連続に
+            // 付け替わる点は `seek`/`stop` と同じなので、`outcome.discontinuity` も
+            // 合わせて立てる(音楽クロックの世代カウンタを進めさせる。この render 呼び出しの
+            // 中で完結するため `pending_discontinuity` 経由ではなく直接立ててよい——
+            // `PendingTransition::Stop`/`LoopWrap` の扱いと同じ)。
             if let Some(total) = total_frames
                 && self.position_frames >= total
             {
                 self.state = MusicState::Ready;
                 self.gain.set_immediate(0.0);
                 self.pending_settle = PendingTransition::None;
+                self.position_frames = 0;
+                source.request_seek(0);
+                outcome.discontinuity = true;
                 outcome.ended = true;
                 break;
             }
@@ -805,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn natural_end_stops_exactly_at_total_frames_and_returns_to_ready() {
+    fn natural_end_stops_exactly_at_total_frames_and_resets_position_to_the_head() {
         let mut voice = MusicVoice::new(TEST_SAMPLE_RATE);
         let mut source = FakeSource::new(Some(10));
         let mut warmup = vec![0.0; CHANNELS];
@@ -817,14 +836,77 @@ mod tests {
 
         assert!(outcome.ended);
         assert_eq!(voice.state(), MusicState::Ready);
+        // 要求(20フレーム)は総フレーム数(10)より大きいが、自然終了で読み進めを
+        // 止めるため 10 フレーム目以降は一切書き込まれず、冒頭でゼロ初期化された
+        // ままのはず(=読み過ぎていないことの確認)。自然終了時に `position_frames`
+        // と `source` のカーソルをどちらも曲頭(0)へ戻してしまうため、`source` 側の
+        // カーソル値そのものではもう検証できない(下記の理由と同じ)。
+        for frame in 10..20 {
+            assert_eq!(
+                buf[frame * CHANNELS],
+                0.0,
+                "must not read past total_frames (frame {frame}, L)"
+            );
+            assert_eq!(
+                buf[frame * CHANNELS + 1],
+                0.0,
+                "must not read past total_frames (frame {frame}, R)"
+            );
+        }
+        // P0-4: 自然終了は `stop()` と同じ後始末(位置を曲頭へ戻す)を行うため、
+        // ここでの `position_frames()` は末尾(10)ではなく 0 になる——次の `play()` が
+        // 曲頭から鳴らし直せるようにするため(`render` の自然終了分岐のコメント参照)。
         assert_eq!(
             voice.position_frames(),
-            10,
-            "must stop exactly at total_frames"
+            0,
+            "natural end must reset position back to the head, like stop()"
+        );
+        assert_eq!(
+            source.seek_calls.last(),
+            Some(&0),
+            "natural end must request the source to seek back to frame 0"
         );
         assert!(
-            voice.position_frames() <= 10,
-            "position must never exceed total_frames"
+            outcome.discontinuity,
+            "the head <- end jump must be reported as a discontinuity, like seek/stop"
+        );
+    }
+
+    /// P0-4 回帰テスト: 自然終了直後、`position_frames` が末尾に残ったままだと
+    /// 次の `play()` の直後の `render` が即座にまた自然終了と判定してしまい、
+    /// 無音のまま `MusicEnded` を再送し続けていた。位置を曲頭へ戻す(かつ
+    /// `source` にも曲頭へのシークを要求する)ことで、実際に曲頭から鳴らし直せて
+    /// `MusicEnded` の再送も止まることを固定化する。
+    #[test]
+    fn natural_end_then_play_again_replays_from_the_start_without_resending_music_ended() {
+        let mut voice = MusicVoice::new(TEST_SAMPLE_RATE);
+        let mut source = FakeSource::new(Some(10));
+        let mut warmup = vec![0.0; CHANNELS];
+        voice.render(&mut warmup, &mut source);
+        voice.play();
+
+        let mut buf = vec![0.0; 20 * CHANNELS]; // 総フレーム数(10)より大きい要求で自然終了させる。
+        let outcome = voice.render(&mut buf, &mut source);
+        assert!(outcome.ended);
+        assert_eq!(voice.state(), MusicState::Ready);
+
+        source.constant_value = Some(1.0);
+        voice.play();
+        let mut replay = vec![0.0; 3 * CHANNELS];
+        let replay_outcome = voice.render(&mut replay, &mut source);
+
+        assert!(
+            !replay_outcome.ended,
+            "MusicEnded must not be resent immediately after replaying from the start"
+        );
+        assert_eq!(voice.state(), MusicState::Playing);
+        assert!(
+            voice.position_frames() > 0,
+            "replay must actually advance instead of staying stuck silent at the end"
+        );
+        assert!(
+            replay.iter().any(|&s| s != 0.0),
+            "replay after natural end must produce audible output, not silence, got {replay:?}"
         );
     }
 
