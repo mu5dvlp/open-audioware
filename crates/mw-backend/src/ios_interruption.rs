@@ -313,14 +313,36 @@
 //! macOS/Linux でも単体テストで固定化できる(本ファイル末尾の `tests` モジュール参照)。
 //!
 //! **待機は `std::thread::sleep` を使う(ブロッキング)。** この経路は音声スレッドでは
-//! なく、通知センターの observer ブロックを実行する非リアルタイムスレッドなので
-//! §5.3 の対象外(「パニック安全性」節・`ios_session::configure()` の呼び出しと同じ扱い)。
-//! ただし**全ステップ空振りした最悪ケースでは合計 370ms(= 20+50+100+200ms)このスレッド
-//! をブロックする**——復帰確認のためだけの待機で音声スレッド・UI スレッドを
-//! ブロックするわけではないため実害は無いと判断したが、observer ブロックを呼んだ
-//! OS 側のスレッドが最大370ms占有されること自体は事実として明記しておく。
-//! **復帰が1回目で確認できる通常ケースでは20msしか待たない**ため、頻繁に起きる
-//! ルート変化・割り込み終了のたびに370msのヒッチが出るわけではない。
+//! ないので §5.3 の対象外(「パニック安全性」節・`ios_session::configure()` の呼び出しと
+//! 同じ扱い)ではあるが、**「observer ブロックを実行する非リアルタイムスレッドをブロック
+//! するだけで実害は無い」という当初の判断は誤りだった(2026-09-03 是正、P0-6)**。
+//! `addObserverForName_object_queue_usingBlock` は `queue` に `None` を渡すと、ブロックを
+//! **通知を post したスレッド上で同期実行する**契約になっており
+//! (`NSNotificationCenter` のドキュメント上の挙動)、`UIApplicationDidBecomeActiveNotification`
+//! はじめ UIKit の通知は必ずメインスレッドから post される。つまり `queue: None` の
+//! observer 登録は**そのままメインスレッド(= UI スレッド)上で `attempt_recovery` を
+//! 同期実行する**ことを意味し、全ステップ空振りした最悪ケースの合計 370ms
+//! (= 20+50+100+200ms)は丸ごとメインスレッドのブロックになる——60fps 換算で約22フレーム
+//! ぶんのヒッチであり、「UI をブロックしない」という前提は成立していなかった。
+//!
+//! **対応: `confirm_recovery_progress` の呼び出し(=待機ループ本体)を専用のワーカー
+//! スレッドへ移した。** `attempt_recovery` は「1回目の `pause()`→`play()`(高速な
+//! CoreAudio 呼び出しのみ、ブロッキング待機を含まない)」までを通知ハンドラのスレッド
+//! (= メインスレッドでありうる)上で同期実行し、**そこで即座に返る**。実際に待機を
+//! 伴う確認・再試行(`confirm_recovery_progress` とその戻り値に基づく状態更新・イベント
+//! 発火)は `std::thread::spawn` した専用スレッドへ丸ごと委譲する(下記
+//! `attempt_recovery` 参照)。これにより observer ブロックそのものは即座に返るようになり、
+//! メインスレッドは一切ブロックされない。「NSOperationQueue を observer に渡す」という
+//! 代替案(cpal 自身の `session_event_manager.rs` と同じパターンで、監視対象4通知すべてを
+//! 丸ごと非メインスレッドへ渡す)も検討したが、(1) 4つの observer 全体の実行順序保証
+//! (`state: Mutex<InterruptionState>` が前提とする「割り込み Began → Ended」等の
+//! 順序)を `NSOperationQueue` の `maxConcurrentOperationCount` で明示的に直列化し直す
+//! 追加の考慮が要ること、(2) 問題の本質は「復帰確認の待機ループ」だけであり通知の
+//! 検知・状態遷移自体は軽量で移す必要が無いこと、の2点から見送った——影響範囲を
+//! 「実際にブロックしていた箇所」だけに絞れるワーカースレッド方式を採用した。
+//! **復帰が1回目で確認できる通常ケースでも、この待機(20ms)自体はメインスレッドから
+//! 完全に切り離されている**(以前のように「短ければ実害が無い」という程度問題ではなく、
+//! 構造的にメインスレッドを一切ブロックしなくなった)。
 //!
 //! ## パニック安全性
 //!
@@ -361,6 +383,21 @@
 //! かという実機の生の値そのものは自動テスト不可——`RECOVERY_WAIT_SCHEDULE_MS` の
 //! 妥当性(20msで足りるか、370ms待っても復帰しない実機ケースがあるか)は次の実機
 //! テストで確認する。
+//!
+//! **6つ目(P0-6, 2026-09-03): 復帰確認をワーカースレッドへ委譲したことでメインスレッドの
+//! ブロックが実際に解消したか。** `attempt_recovery` が `confirm_recovery_progress` の
+//! 呼び出しを `std::thread::spawn` した専用スレッドへ委譲するようになったこと自体は
+//! コードの構造として自動テストで確認できない(`imp` モジュールは iOS/tvOS 専用の
+//! `#[cfg]` 配下にあり、CoreAudio/UIKit 実体が無いホスト環境ではそもそもコンパイル
+//! 対象に入らない——本ファイル冒頭 doc 参照。`cargo check --target aarch64-apple-ios`
+//! でのコンパイル可否は確認済みだが、それは「型が合う」ことの確認であって「実機で
+//! メインスレッドが本当にブロックされなくなったか」の確認ではない)。**次の実機テストで
+//! 確認すべきこと**: (a) 割り込み終了・ルート変化・前面復帰それぞれで音が正しく復帰する
+//! こと(既存の確認事項と同じ)に加え、(b) 前面復帰の瞬間に UI が実際にヒッチしなくなった
+//! ことを Instruments 等の Main Thread 計測、または単純に手触りで確認すること
+//! (是正前は Xcode の Time Profiler で `UIApplicationDidBecomeActiveNotification` の
+//! ハンドラ内に370ms級のブロックが見えていたはず——是正後はそれが消えていることを
+//! 確認する)。
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -643,6 +680,7 @@ mod imp {
     use std::ptr::NonNull;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::thread;
     use std::time::Duration;
 
     use block2::RcBlock;
@@ -849,10 +887,10 @@ mod imp {
 
     fn handle_interruption_notification(
         notif: &NSNotification,
-        state: &Mutex<InterruptionState>,
-        stream: &cpal::Stream,
-        events: &EventQueue,
-        callback_ticks: &AtomicU64,
+        state: &Arc<Mutex<InterruptionState>>,
+        stream: &Arc<cpal::Stream>,
+        events: &Arc<EventQueue>,
+        callback_ticks: &Arc<AtomicU64>,
     ) {
         let Some(kind) = interruption_type(notif) else {
             return;
@@ -916,10 +954,10 @@ mod imp {
     /// (Began は届いていた)だったと実機ログから判別できる(モジュール doc「追記:
     /// `DidBecomeActive` 安全網の前提が崩れていたケース」の観測性節参照)。
     fn handle_became_active(
-        state: &Mutex<InterruptionState>,
-        stream: &cpal::Stream,
-        events: &EventQueue,
-        callback_ticks: &AtomicU64,
+        state: &Arc<Mutex<InterruptionState>>,
+        stream: &Arc<cpal::Stream>,
+        events: &Arc<EventQueue>,
+        callback_ticks: &Arc<AtomicU64>,
     ) {
         let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
         let previous_state = *guard;
@@ -943,10 +981,10 @@ mod imp {
 
     fn handle_route_change_notification(
         notif: &NSNotification,
-        state: &Mutex<InterruptionState>,
-        stream: &cpal::Stream,
-        events: &EventQueue,
-        callback_ticks: &AtomicU64,
+        state: &Arc<Mutex<InterruptionState>>,
+        stream: &Arc<cpal::Stream>,
+        events: &Arc<EventQueue>,
+        callback_ticks: &Arc<AtomicU64>,
     ) {
         // 通知を受け取った事実そのものを reason の解釈より前にログする。以前は
         // `route_change_reason` が `None` を返すとログより先に `return` していたため、
@@ -1052,25 +1090,35 @@ mod imp {
     /// `pause()`→`play()` を呼び直しながら段階的に(`RECOVERY_WAIT_SCHEDULE_MS`)
     /// 再確認する。
     ///
-    /// **待機は `std::thread::sleep`(ブロッキング)。** この経路は音声スレッドではなく
-    /// 通知センターの observer ブロックを実行する非リアルタイムスレッドなので §5.3 の
-    /// 対象外(`ios_session::configure()` の呼び出しと同じ扱い。モジュール doc「パニック
-    /// 安全性」節参照)。ただし**全ステップ空振りした最悪ケースでは、このスレッドを
-    /// 合計 370ms(= `RECOVERY_WAIT_SCHEDULE_MS` の総和)ブロックする**——音声スレッドや
-    /// UI スレッドをブロックするわけではないため実害は無いと判断したが、観測用の
-    /// ヒッチが出うることは明記しておく。**復帰が1回目で確認できる通常ケースでは
-    /// 20ms しか待たない**ため、頻繁に起きるルート変化・割り込み終了のたびに
-    /// 370msのヒッチが出るわけではない。
+    /// **待機は `std::thread::sleep`(ブロッキング)。** ただし P0-6(2026-09-03 是正)の
+    /// 対応として、待機を伴う確認・再試行(`confirm_recovery_progress` とその結果に基づく
+    /// 状態更新・イベント発火)は**この関数自身のスレッドでは実行せず、専用のワーカー
+    /// スレッドへ丸ごと委譲する**(下記実装参照)。この関数(＝通知ハンドラから同期的に
+    /// 呼ばれる部分)が実際に行うのは「1回目の `pause()`→`play()`」までであり、これは
+    /// ブロッキング待機を含まない高速な CoreAudio 呼び出しのみなので、呼び出し元の
+    /// スレッド(`UIApplicationDidBecomeActiveNotification` の場合は**メインスレッド**
+    /// ——`queue: None` で登録した observer は通知を post したスレッド上で同期実行される
+    /// 契約であり、UIKit の通知は必ずメインスレッドから post されるため)を実質的に
+    /// ブロックしない。
+    ///
+    /// 🔴 **是正前はここに `confirm_recovery_progress` の呼び出し(=最大370msの
+    /// `std::thread::sleep`)が同期的に含まれており、`UIApplicationDidBecomeActiveNotification`
+    /// 経由(=メインスレッド)で呼ばれた場合に限り、メインスレッドを最大370ms
+    /// ブロックしていた**(モジュール doc「実装方針」節の「待機は `std::thread::sleep` を
+    /// 使う」パラグラフ参照。P0-6, 2026-09-03 是正)。ワーカースレッドへの委譲により
+    /// この問題は解消した——ただし実機での体感(ヒッチが本当に消えたか)は自動テストでは
+    /// 確認できない(本ファイル末尾「自動テストで守れる範囲・守れない範囲」参照)。
     ///
     /// `trigger`・`stream.play()` の成否・実測による最終判定は必ずログへ出す——
     /// 「`play()` は成功したが実測では確認できなかった」ケースをログだけで判別できる
     /// ようにする(モジュール doc「追記: `DidBecomeActive` 安全網の前提が崩れていた
-    /// ケース」の観測性節、および今回の追記の両方を踏襲)。
+    /// ケース」の観測性節、および今回の追記の両方を踏襲)。ワーカースレッドへ移した後も
+    /// この観測性は変わらない(ログを出す場所が別スレッドになるだけ)。
     fn attempt_recovery(
-        state: &Mutex<InterruptionState>,
-        stream: &cpal::Stream,
-        events: &EventQueue,
-        callback_ticks: &AtomicU64,
+        state: &Arc<Mutex<InterruptionState>>,
+        stream: &Arc<cpal::Stream>,
+        events: &Arc<EventQueue>,
+        callback_ticks: &Arc<AtomicU64>,
         trigger: RecoveryTrigger,
     ) {
         crate::mw_log!("[mw-backend] ios_interruption: attempting recovery (trigger={trigger:?})");
@@ -1096,45 +1144,81 @@ mod imp {
             ),
         }
 
-        let outcome = confirm_recovery_progress(
-            ticks_before,
-            || callback_ticks.load(Ordering::Relaxed),
-            || {
-                // 空振り: pause()→play() を呼び直す。既に停止/再生中のユニットへ
-                // 呼んでも安全というのが CoreAudio の一般的な契約(モジュール doc
-                // 「実機バグの原因」参照)なので、戻り値は無視してよい——最終的な
-                // 成否は `confirm_recovery_progress` の実測で決まる。
-                let _ = stream.pause();
-                let _ = stream.play();
-            },
-            |wait_ms| std::thread::sleep(Duration::from_millis(wait_ms)),
-        );
-
-        let success = match outcome {
-            Some((attempt, waited_ms)) => {
-                crate::mw_log!(
-                    "[mw-backend] ios_interruption: stream restart confirmed by callback \
-                     progress (attempt={attempt}, waited={waited_ms}ms, trigger={trigger:?})"
+        // ここから先(待機を伴う確認・再試行・最終的な状態更新とイベント発火)は
+        // 専用のワーカースレッドへ委譲する(P0-6)。呼び出し元(通知ハンドラ)のスレッドは
+        // ここで即座に返る——`UIApplicationDidBecomeActiveNotification` 経由の場合、
+        // それはメインスレッドを指す。
+        //
+        // `state`/`stream`/`events`/`callback_ticks` はいずれも `Arc` なので `clone` は
+        // 参照カウント操作のみ(このスレッド生成自体は §5.3 の対象外の非リアルタイム
+        // スレッドから行っているため、ここでのアロケーションは問題にならない)。
+        // 元の `state`/`events`(引数の `&Arc<...>`)は spawn 失敗時のフォールバックで
+        // 使うため、ワーカースレッドへ渡す分は別名で clone する(シャドーイングして
+        // move してしまうとフォールバック側で参照できなくなるため)。
+        let worker_state = Arc::clone(state);
+        let worker_stream = Arc::clone(stream);
+        let worker_events = Arc::clone(events);
+        let worker_callback_ticks = Arc::clone(callback_ticks);
+        let spawned = thread::Builder::new()
+            .name("mw-ios-interruption-recovery".to_owned())
+            .spawn(move || {
+                let outcome = confirm_recovery_progress(
+                    ticks_before,
+                    || worker_callback_ticks.load(Ordering::Relaxed),
+                    || {
+                        // 空振り: pause()→play() を呼び直す。既に停止/再生中のユニットへ
+                        // 呼んでも安全というのが CoreAudio の一般的な契約(モジュール doc
+                        // 「実機バグの原因」参照)なので、戻り値は無視してよい——最終的な
+                        // 成否は `confirm_recovery_progress` の実測で決まる。
+                        let _ = worker_stream.pause();
+                        let _ = worker_stream.play();
+                    },
+                    |wait_ms| std::thread::sleep(Duration::from_millis(wait_ms)),
                 );
-                true
-            }
-            None => {
-                let total_ms: u64 = RECOVERY_WAIT_SCHEDULE_MS.iter().sum();
-                crate::mw_log!(
-                    "[mw-backend] ios_interruption: 🔴 stream restart NOT confirmed — callback \
-                     did not advance after {total_ms}ms across {attempts} attempts \
-                     (trigger={trigger:?}); the cpal stream likely needs to be rebuilt (M3 \
-                     design proper)",
-                    attempts = RECOVERY_WAIT_SCHEDULE_MS.len(),
-                );
-                false
-            }
-        };
 
-        let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
-        *guard = guard.on_recovery_attempted(success);
-        drop(guard);
-        events.push_side_channel(Event::AudioInterruptionEnded { recovered: success });
+                let success = match outcome {
+                    Some((attempt, waited_ms)) => {
+                        crate::mw_log!(
+                            "[mw-backend] ios_interruption: stream restart confirmed by callback \
+                             progress (attempt={attempt}, waited={waited_ms}ms, \
+                             trigger={trigger:?})"
+                        );
+                        true
+                    }
+                    None => {
+                        let total_ms: u64 = RECOVERY_WAIT_SCHEDULE_MS.iter().sum();
+                        crate::mw_log!(
+                            "[mw-backend] ios_interruption: 🔴 stream restart NOT confirmed — \
+                             callback did not advance after {total_ms}ms across {attempts} \
+                             attempts (trigger={trigger:?}); the cpal stream likely needs to be \
+                             rebuilt (M3 design proper)",
+                            attempts = RECOVERY_WAIT_SCHEDULE_MS.len(),
+                        );
+                        false
+                    }
+                };
+
+                let mut guard = worker_state.lock().unwrap_or_else(|p| p.into_inner());
+                *guard = guard.on_recovery_attempted(success);
+                drop(guard);
+                worker_events
+                    .push_side_channel(Event::AudioInterruptionEnded { recovered: success });
+            });
+        if let Err(err) = spawned {
+            // スレッド生成自体が失敗した(OS リソース枯渇等、極めて稀)。復帰確認を
+            // 諦めるしかないが、パニックはしない——次の `DidBecomeActive`/ルート変化・
+            // 割り込みが来れば `needs_recovery_attempt()` 経由で再試行されるため
+            // (`InterruptionState::RecoveryFailed` と同じ扱いにする)。
+            crate::mw_log!(
+                "[mw-backend] ios_interruption: failed to spawn recovery worker thread: {err} \
+                 (trigger={trigger:?}); giving up on this attempt, a later notification will \
+                 retry"
+            );
+            let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+            *guard = guard.on_recovery_attempted(false);
+            drop(guard);
+            events.push_side_channel(Event::AudioInterruptionEnded { recovered: false });
+        }
     }
 
     fn interruption_type(notif: &NSNotification) -> Option<AVAudioSessionInterruptionType> {
