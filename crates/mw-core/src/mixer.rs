@@ -492,7 +492,7 @@ impl Mixer {
                 // `MusicPause` と同じ穴が `stop` 側にもある(`MusicSchedule::cancel`
                 // のドキュメント参照)ため、同様に先に破棄する。
                 self.music_schedule.cancel();
-                self.music_voice.stop();
+                self.music_voice.stop(&mut self.music_source);
             }
             Command::MusicSetLoop { region } => {
                 self.music_voice.set_loop(region);
@@ -507,7 +507,7 @@ impl Mixer {
                 self.bgm_voice.play();
             }
             Command::BgmStop => {
-                self.bgm_voice.stop();
+                self.bgm_voice.stop(&mut self.bgm_source);
             }
             Command::BgmSetLoop { region } => {
                 self.bgm_voice.set_loop(region);
@@ -1128,6 +1128,39 @@ mod tests {
 
         fn total_frames(&self) -> Option<u64> {
             Some(self.total)
+        }
+    }
+
+    /// P0-4b 用のフェイクデコーダ: 読み出しカーソルの値をそのまま PCM として返す
+    /// (`music.rs::tests::FakeSource` の既定動作と同じ考え方)。`ConstantDecoder`/
+    /// `FiniteDecoder` はどちらも値が位置に依存しないため「今どこを読んでいるか」を
+    /// PCM 自体から判定できない——`stop()` が `source.request_seek(0)` を呼び忘れても
+    /// (音は途切れず)ただ位置がずれるだけの回帰は検出できない。このデコーダなら
+    /// 実際にリングバッファへ積まれている PCM の値から「曲頭から読み直しているか」を
+    /// ゲイン/ランプを介さず直接確認できる。
+    struct PositionEchoDecoder {
+        cursor: u64,
+    }
+
+    impl MusicDecoder for PositionEchoDecoder {
+        fn read(&mut self, out: &mut [f32]) -> Result<usize, DecodeError> {
+            let n = out.len() / CHANNELS;
+            for i in 0..n {
+                let value = self.cursor as f32;
+                out[i * CHANNELS] = value;
+                out[i * CHANNELS + 1] = value;
+                self.cursor += 1;
+            }
+            Ok(n)
+        }
+
+        fn seek(&mut self, frame: u64) -> Result<(), DecodeError> {
+            self.cursor = frame;
+            Ok(())
+        }
+
+        fn total_frames(&self) -> Option<u64> {
+            None
         }
     }
 
@@ -2163,6 +2196,132 @@ mod tests {
 
         assert_eq!(mixer.music_state(), MusicState::Ready);
         assert_eq!(mixer.music_voice.position_frames(), 0);
+    }
+
+    /// P0-4b 回帰テスト(「stop → play で最初から鳴る」、`Playing` からのフェードアウト
+    /// 経由の停止 = `render` 内の `PendingTransition::Stop` 分岐): `MusicVoice::stop` の
+    /// `position_frames = 0` だけでは、`StreamingMusicSource` の実体(リングバッファ +
+    /// エポック ack で調停するシーク)側は停止直前の位置に取り残されたままで、
+    /// `source.request_seek(0)` を呼んでいなければ次の再生はそこから続きが鳴ってしまう
+    /// (P0-4 と同じクラスの欠陥)。`music.rs` のユニットテストは `FakeSource`
+    /// (シークが同期・即時)で確かめているのに対し、ここでは実際の
+    /// `StreamingMusicSource`/`MusicStreamProducer`(デコードスレッド役の `pump` も含む、
+    /// エポック ack を実際にまたぐ)を介した経路で確かめる。
+    ///
+    /// `PositionEchoDecoder` で PCM 自体に読み出し位置を刻み、`MusicVoice`/ゲインを
+    /// 経由せず `mixer.music_source.read()` を直接呼ぶことで、「実際にリングバッファへ
+    /// 積まれている PCM が曲頭のものか」をランプの影響を受けずに判定する。
+    #[test]
+    fn music_stop_while_playing_then_play_again_replays_from_the_start() {
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events, _bgm) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+
+        let mut decoder = PositionEchoDecoder { cursor: 0 };
+        producer.pump(&mut decoder).expect("pump must succeed");
+        let mut warmup = vec![0.0; 4 * CHANNELS];
+        mixer.render(&mut warmup, 0);
+        assert_eq!(mixer.music_state(), MusicState::Ready);
+
+        sender.send(Command::MusicPlayScheduled { host_time_ns: 0 });
+        let mut buf = vec![0.0; 30 * CHANNELS];
+        mixer.render(&mut buf, 0);
+        assert_eq!(mixer.music_state(), MusicState::Playing);
+        assert!(mixer.music_voice.position_frames() > 0);
+
+        sender.send(Command::MusicStop);
+        // `Playing` からの stop はフェードアウト経由なので、既定ランプが尽きるだけの
+        // 余裕を与える(`music_stop_command_returns_to_ready_and_resets_position_to_zero`
+        // と同じ形)。
+        let ramp_len = ms_to_samples(Config::DEFAULT_RAMP_MS, TEST_SAMPLE_RATE) as usize;
+        let mut settle = vec![0.0; (ramp_len + 10) * CHANNELS];
+        mixer.render(&mut settle, 0);
+        assert_eq!(mixer.music_state(), MusicState::Ready);
+        assert_eq!(mixer.music_voice.position_frames(), 0);
+
+        // デコードスレッド役: `stop` が発行したシーク要求(epoch bump)を検知し、
+        // デコーダを曲頭へシークし直してリングバッファへ再び詰める
+        // (`stream.rs::MusicStreamProducer::handle_seek_if_requested` 参照)。
+        producer
+            .pump(&mut decoder)
+            .expect("pump must succeed after stop's rewind request");
+
+        // `MusicVoice`/ゲインを経由せず、リングバッファに実際に積まれている PCM を
+        // 直接読む。`peek` を負値で初期化し、「実際に書き込まれた 0.0」と
+        // 「そもそも書き込まれていない」を区別できるようにしてある。
+        let mut peek = vec![-1.0; 4 * CHANNELS];
+        let n = mixer.music_source.read(&mut peek);
+        assert!(n > 0, "must have refilled PCM after the seek settles");
+        assert_eq!(
+            peek[0], 0.0,
+            "stop() while Playing must rewind the underlying source to the head (frame 0), \
+             not leave it wherever the fade-out stopped reading; got {peek:?}"
+        );
+
+        // 実際に鳴らし直しても無音(アンダーラン)にならないことも確認する。
+        sender.send(Command::MusicPlayScheduled { host_time_ns: 0 });
+        let mut replay = vec![0.0; 3 * CHANNELS];
+        mixer.render(&mut replay, 0);
+        assert_eq!(mixer.music_state(), MusicState::Playing);
+        assert!(
+            replay.iter().any(|&s| s != 0.0),
+            "replay after stop must produce audible output, not silence, got {replay:?}"
+        );
+    }
+
+    /// P0-4b 回帰テスト(「stop → play で最初から鳴る」、`Paused` からの即時停止 =
+    /// `render` を経由しない `MusicVoice::stop` 自身の分岐): 上のテストの
+    /// `Playing` 版と対になる、`Paused` 経由の外部 API 呼び出し側。
+    #[test]
+    fn music_stop_while_paused_then_play_again_replays_from_the_start() {
+        let (mut mixer, sender, _reclaim, mut producer, _music_clock, _events, _bgm) =
+            build(Config::default(), TEST_SAMPLE_RATE);
+
+        let mut decoder = PositionEchoDecoder { cursor: 0 };
+        producer.pump(&mut decoder).expect("pump must succeed");
+        let mut warmup = vec![0.0; 4 * CHANNELS];
+        mixer.render(&mut warmup, 0);
+        assert_eq!(mixer.music_state(), MusicState::Ready);
+
+        sender.send(Command::MusicPlayScheduled { host_time_ns: 0 });
+        let mut buf = vec![0.0; 30 * CHANNELS];
+        mixer.render(&mut buf, 0);
+        assert_eq!(mixer.music_state(), MusicState::Playing);
+
+        sender.send(Command::MusicPause);
+        let ramp_len = ms_to_samples(Config::DEFAULT_RAMP_MS, TEST_SAMPLE_RATE) as usize;
+        let mut settle = vec![0.0; (ramp_len + 10) * CHANNELS];
+        mixer.render(&mut settle, 0);
+        assert_eq!(mixer.music_state(), MusicState::Paused);
+        assert!(mixer.music_voice.position_frames() > 0);
+
+        // `Paused` からの stop はランプ無しでその場で確定する(`MusicVoice::stop` 参照)。
+        sender.send(Command::MusicStop);
+        let mut immediate = vec![0.0; CHANNELS];
+        mixer.render(&mut immediate, 0);
+        assert_eq!(mixer.music_state(), MusicState::Ready);
+        assert_eq!(mixer.music_voice.position_frames(), 0);
+
+        producer
+            .pump(&mut decoder)
+            .expect("pump must succeed after stop's rewind request");
+
+        let mut peek = vec![-1.0; 4 * CHANNELS];
+        let n = mixer.music_source.read(&mut peek);
+        assert!(n > 0, "must have refilled PCM after the seek settles");
+        assert_eq!(
+            peek[0], 0.0,
+            "stop() while Paused must rewind the underlying source to the head (frame 0), \
+             not leave it wherever the pause froze reading; got {peek:?}"
+        );
+
+        sender.send(Command::MusicPlayScheduled { host_time_ns: 0 });
+        let mut replay = vec![0.0; 3 * CHANNELS];
+        mixer.render(&mut replay, 0);
+        assert_eq!(mixer.music_state(), MusicState::Playing);
+        assert!(
+            replay.iter().any(|&s| s != 0.0),
+            "replay after stop must produce audible output, not silence, got {replay:?}"
+        );
     }
 
     #[test]

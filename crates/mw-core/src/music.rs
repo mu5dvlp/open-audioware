@@ -308,11 +308,31 @@ impl MusicVoice {
     /// 停止する。
     ///
     /// - `Playing` 中: 既定ランプでフェードアウトしてから位置を 0 に戻し `Ready` へ
-    ///   (`pause` と同じ「ランプ収束待ち」の形)。
+    ///   (`pause` と同じ「ランプ収束待ち」の形)。実際の後始末(`position_frames`
+    ///   を戻す・`source.request_seek(0)`・`discontinuity`)はランプ収束を待った先の
+    ///   `render` 内(`PendingTransition::Stop` 分岐)で行う——このメソッド自身は
+    ///   `pending_settle` を積むだけで `source` に触れない。
     /// - `Paused` 中: 既にゲインは 0(ポーズ完了時点の不変条件)なので、
     ///   ランプを待たずその場で位置を 0 に戻し `Ready` へ。
     /// - `Ready`/`Loading` 中: 既に停止相当なので何もしない。
-    pub fn stop(&mut self) {
+    ///
+    /// P0-4b: `source` を受け取る(`seek`/`resume_at` と同様)。`Paused` からの
+    /// 即時停止は `render` を経由しない(次に `render` が呼ばれるのを待たず、
+    /// この呼び出しの中で `Ready` へ確定させる)ため、`position_frames = 0` と
+    /// 対にして `source.request_seek(0)` もここで直接呼ばないと、
+    /// `StreamingMusicSource` のリングバッファ/デコーダのカーソルだけが
+    /// ポーズした位置に取り残される(P0-4 と同じクラスの欠陥。自然終了時の
+    /// 3点セット——`position_frames = 0` / `source.request_seek(0)` /
+    /// `discontinuity = true`——を参照)。
+    ///
+    /// 呼び出し側(`mixer.rs::Mixer::apply_command` の `Command::MusicStop`/
+    /// `Command::BgmStop`)は既に `music_source`/`bgm_source` を `self` のフィールドと
+    /// して持っているため、このシグネチャ変更で新たに何かを保持し直す必要は無い。
+    /// **FFI 境界には影響しない**——`mw-ffi` は `Command::MusicStop`(引数無しの
+    /// unit variant)をコマンドキューへ積むだけで、`MusicVoice::stop` を直接
+    /// 呼び出すことは無い(`mw_music_stop`/`mw_bgm_stop` のシグネチャ・
+    /// `Command` の判別子・ペイロードのいずれも変わらない)。
+    pub fn stop(&mut self, source: &mut dyn MusicFrameSource) {
         match self.state {
             MusicState::Playing => {
                 self.pending_settle = PendingTransition::Stop;
@@ -321,6 +341,7 @@ impl MusicVoice {
             }
             MusicState::Paused => {
                 self.position_frames = 0;
+                source.request_seek(0);
                 self.state = MusicState::Ready;
                 self.gain.set_immediate(0.0);
                 self.pending_discontinuity = true;
@@ -557,8 +578,17 @@ impl MusicVoice {
                             self.pending_settle = PendingTransition::None;
                         }
                         PendingTransition::Stop => {
+                            // P0-4b: フェードアウト収束後の後始末は自然終了(P0-4)と
+                            // 同じ3点セット——`position_frames = 0` だけでは
+                            // `StreamingMusicSource` 側のリングバッファ/デコーダの
+                            // カーソルが停止直前の位置に取り残されたままになり、
+                            // 直後の `play()` が曲頭ではなく無音(または末尾近くの
+                            // 残骸)から再開してしまう。`source` はこの `render`
+                            // 呼び出しの引数として既に手元にあるので、ここで
+                            // 直接 `request_seek(0)` する。
                             self.state = MusicState::Ready;
                             self.position_frames = 0;
+                            source.request_seek(0);
                             outcome.discontinuity = true;
                             self.pending_settle = PendingTransition::None;
                         }
@@ -751,6 +781,136 @@ mod tests {
             "paused voice must not advance"
         );
         assert!(after.iter().all(|&s| s == 0.0));
+    }
+
+    /// P0-4b 回帰テスト: `Playing` 中の `stop()` は既定ランプでフェードアウトしてから
+    /// `render` 内の `PendingTransition::Stop` 分岐で確定する。P0-4(自然終了)と
+    /// 同じ3点セット——`position_frames = 0` / `source.request_seek(0)` /
+    /// `discontinuity = true`——がここでも行われることを固定化する
+    /// (`natural_end_stops_exactly_at_total_frames_and_resets_position_to_the_head`
+    /// と対になるテスト)。
+    #[test]
+    fn stop_while_playing_fades_out_then_resets_position_and_rewinds_the_source() {
+        let (mut voice, mut source) = playing_voice();
+        let mut buf = vec![0.0; 50 * CHANNELS];
+        voice.render(&mut buf, &mut source);
+        assert_eq!(voice.state(), MusicState::Playing);
+        assert!(voice.position_frames() > 0);
+
+        voice.stop(&mut source);
+
+        // ランプ長より短い間はまだ Playing のまま(フェード中)。
+        let mut mid_fade = vec![0.0; (ramp_len() - 1) * CHANNELS];
+        voice.render(&mut mid_fade, &mut source);
+        assert_eq!(voice.state(), MusicState::Playing);
+
+        // ランプが尽きるだけの余裕を与えれば Ready に収束する。
+        let mut settle = vec![0.0; 10 * CHANNELS];
+        let outcome = voice.render(&mut settle, &mut source);
+        assert_eq!(voice.state(), MusicState::Ready);
+        assert_eq!(
+            voice.position_frames(),
+            0,
+            "stop must reset position back to the head, like the natural-end case (P0-4)"
+        );
+        assert_eq!(
+            source.seek_calls.last(),
+            Some(&0),
+            "P0-4b: stop must request the source to seek back to frame 0, exactly like the \
+             natural-end branch already does (P0-4) — otherwise the ring buffer/decoder stays \
+             wherever the fade-out stopped reading"
+        );
+        assert!(
+            outcome.discontinuity,
+            "the fade-out -> head jump must be reported as a discontinuity, like seek/natural end"
+        );
+    }
+
+    /// P0-4b 回帰テスト: `Paused` 中の `stop()` はランプを経由せずその場で確定する
+    /// (`render` を経由しない)。この呼び出し自体が `source` を受け取るように
+    /// なった(シグネチャ変更)ため、`position_frames = 0` と対にして
+    /// `source.request_seek(0)` もこのメソッド自身の中で直接呼べていることを固定化する。
+    #[test]
+    fn stop_while_paused_immediately_resets_position_and_rewinds_the_source() {
+        let (mut voice, mut source) = playing_voice();
+        let mut buf = vec![0.0; 50 * CHANNELS];
+        voice.render(&mut buf, &mut source);
+
+        voice.pause();
+        let mut settle = vec![0.0; 20 * CHANNELS];
+        voice.render(&mut settle, &mut source);
+        assert_eq!(voice.state(), MusicState::Paused);
+        assert!(voice.position_frames() > 0);
+
+        voice.stop(&mut source);
+        assert_eq!(voice.state(), MusicState::Ready);
+        assert_eq!(voice.position_frames(), 0);
+        assert_eq!(
+            source.seek_calls.last(),
+            Some(&0),
+            "P0-4b: stop from Paused must request the source to seek back to frame 0 \
+             immediately — this call never goes through `render`, so `MusicVoice::stop` \
+             itself must issue it (this is exactly why its signature now takes `source`)"
+        );
+
+        // ポーズ中からの停止はランプを経由しないので discontinuity は次の render で
+        // まとめて報告される(`pending_discontinuity` 経由。`seek`/`resume_at` と同じ形)。
+        let mut after = vec![0.0; CHANNELS];
+        let outcome = voice.render(&mut after, &mut source);
+        assert!(
+            outcome.discontinuity,
+            "the paused-position -> head jump must be reported as a discontinuity"
+        );
+    }
+
+    /// P0-4b 回帰テスト(「stop → play で最初から鳴る」): `stop()` が
+    /// `source.request_seek(0)` を呼び忘れていると、`position_frames` こそ 0 に
+    /// 戻るものの `source` 側のカーソルはフェードアウトで進んだ位置に取り残されたまま
+    /// になる。`FakeSource` の既定動作(カーソル値をそのまま PCM として返す)を使うと、
+    /// これを `MusicVoice`/ゲインを経由せず `source.read()` で直接確かめられる——
+    /// カーソルが本当に 0 まで巻き戻っていれば最初に返る値も 0 のはず。そのうえで
+    /// 実際に `play()` し直し、無音(アンダーラン)にならず再生が続くことも確認する
+    /// (`natural_end_then_play_again_replays_from_the_start_without_resending_music_ended`
+    /// と対になるテスト)。
+    #[test]
+    fn stop_then_play_again_starts_reading_from_the_rewound_source_position() {
+        let (mut voice, mut source) = playing_voice();
+        let mut buf = vec![0.0; 50 * CHANNELS];
+        voice.render(&mut buf, &mut source);
+        assert!(voice.position_frames() > 0);
+
+        voice.stop(&mut source);
+        let mut settle = vec![0.0; (ramp_len() + 10) * CHANNELS];
+        voice.render(&mut settle, &mut source);
+        assert_eq!(voice.state(), MusicState::Ready);
+
+        // `MusicVoice`/ゲインを経由しない直接確認: `source` のカーソルそのものが
+        // 曲頭(0)まで巻き戻っているか。`peek` を負値で初期化しておくことで、
+        // 「実際に書き込まれた 0.0」と「そもそも書き込まれていない」を区別する。
+        let mut peek = vec![-1.0; 4 * CHANNELS];
+        let n = source.read(&mut peek);
+        assert!(
+            n > 0,
+            "source must have PCM available right after the rewind"
+        );
+        assert_eq!(
+            peek[0], 0.0,
+            "the very next sample read from the source must be frame 0's value, proving the \
+             source itself (not just position_frames) was rewound to the head; got {peek:?}"
+        );
+
+        voice.play();
+        let mut replay = vec![-1.0; 4 * CHANNELS];
+        let outcome = voice.render(&mut replay, &mut source);
+        assert_eq!(voice.state(), MusicState::Playing);
+        assert_eq!(
+            outcome.underrun_frames, 0,
+            "replay must actually read fresh PCM, not silently underrun"
+        );
+        assert!(
+            voice.position_frames() > 0,
+            "replay must actually advance instead of staying stuck at the head forever"
+        );
     }
 
     #[test]
