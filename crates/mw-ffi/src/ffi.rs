@@ -15,7 +15,7 @@ use std::sync::Once;
 
 use crate::event::MwEvent;
 use crate::handle as handle_registry;
-use crate::handle::{InitOutcome, ShutdownOutcome};
+use crate::handle::{InitOutcome, MusicTarget, ShutdownOutcome};
 use crate::result::MwResult;
 use crate::types::{MwBus, MwMusicPosition, MwMusicState, MwOutputUnderrunStats, MwSoundMode};
 
@@ -57,26 +57,22 @@ pub extern "C" fn mw_host_time_ns() -> u64 {
 pub unsafe extern "C" fn mw_init(out_handle: *mut u64) -> MwResult {
     install_panic_hook();
 
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+    guarded(MwResult::ErrPanic, || {
         if out_handle.is_null() {
-            return None;
+            return MwResult::ErrNullPointer;
         }
-        Some(handle_registry::init())
-    }));
-
-    match outcome {
-        Ok(None) => MwResult::ErrNullPointer,
-        Ok(Some(InitOutcome::Opened(h))) | Ok(Some(InitOutcome::AlreadyOpen(h))) => {
-            // SAFETY: 上の分岐で null チェック済み。呼び出し規約上、書き込み可能な
-            // `u64` を指すポインタであることは呼び出し側の責務(FFI 境界の契約)。
-            unsafe {
-                *out_handle = h;
+        match handle_registry::init() {
+            InitOutcome::Opened(h) | InitOutcome::AlreadyOpen(h) => {
+                // SAFETY: 上の分岐で null チェック済み。呼び出し規約上、書き込み可能な
+                // `u64` を指すポインタであることは呼び出し側の責務(FFI 境界の契約)。
+                unsafe {
+                    *out_handle = h;
+                }
+                MwResult::Ok
             }
-            MwResult::Ok
+            InitOutcome::Failed => MwResult::ErrBackendOpenFailed,
         }
-        Ok(Some(InitOutcome::Failed)) => MwResult::ErrBackendOpenFailed,
-        Err(_) => MwResult::ErrPanic,
-    }
+    })
 }
 
 /// panic の内容をログへ出すフックを1度だけ入れる。
@@ -100,20 +96,86 @@ fn install_panic_hook() {
     });
 }
 
+// --- P1-6: 共通ヘルパ --------------------------------------------------------------
+//
+// 29関数中19が「`catch_unwind` で包む → `with_instance` でハンドルを引く →
+// コマンドを1つ送る → 送信可否を `MwResult` へ変換する」という同型の15〜20行を
+// 繰り返していた(`REFACTOR-PLAN.md` P1-6)。この2つへ集約する。
+
+/// FFI 関数の本体を `catch_unwind` で包み、Rust panic を FFI 境界の外(C#/IL2CPP)へ
+/// 絶対に漏らさない(不変条件、`crates/mw-ffi/CLAUDE.md`)。捕捉した場合は
+/// `on_panic` を返す——`MwResult` を返す関数がほとんどだが、`mw_init`(`None` vs
+/// panic を区別する必要がある)や `mw_poll_events`(戻り値が `i32`)のように
+/// `on_panic` の値自体が関数ごとに違うため、固定値にせず引数として受け取る。
+/// `AssertUnwindSafe` をここ1箇所へ集約する(各関数が個別に書く必要がなくなる)。
+fn guarded<T>(on_panic: T, f: impl FnOnce() -> T) -> T {
+    match panic::catch_unwind(AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(_) => on_panic,
+    }
+}
+
+/// もっとも典型的な形——「ハンドルを検証し、`build` が返す1つの `mw_core::Command`
+/// をキューへ送るだけ」の FFI 関数本体をまとめる(`guarded` の上に乗る)。
+///
+/// - ハンドルが無効 → `MwResult::ErrInvalidHandle`
+/// - 送信成功 → `on_sent(instance)` を呼んだうえで `MwResult::Ok`
+/// - コマンドキュー満杯 → `MwResult::ErrCommandQueueFull`(`on_sent` は呼ばない——
+///   `note_bus_volume`/`note_track_loop` 等のキャッシュ更新は「実際に送信できた」
+///   ときだけ行う。ここを崩すと、キューが満杯で実際には適用されなかった変更を
+///   キャッシュへ反映してしまい、M3 再オープン復元キャッシュの正しさが壊れる)
+/// - panic → `MwResult::ErrPanic`
+///
+/// `build`/`on_sent` に事前処理(`instance.drain_reclaimed()` 等)や事後処理
+/// (`instance.note_*`)が要る関数はそれぞれのクロージャの中で行う——関数ごとに
+/// 有無が異なる(例: `mw_music_pause` は `drain_reclaimed` を呼ばないが
+/// `mw_voice_stop` は呼ぶ)ため、`send_command` 自身では固定しない。
+fn send_command(
+    handle: u64,
+    build: impl FnOnce(&handle_registry::Instance) -> mw_core::Command,
+    on_sent: impl FnOnce(&handle_registry::Instance),
+) -> MwResult {
+    guarded(MwResult::ErrPanic, || {
+        let result = handle_registry::with_instance(handle, |instance| {
+            let command = build(instance);
+            if instance.command_sender.send(command) {
+                on_sent(instance);
+                MwResult::Ok
+            } else {
+                MwResult::ErrCommandQueueFull
+            }
+        });
+        result.unwrap_or(MwResult::ErrInvalidHandle)
+    })
+}
+
+/// [`LOOP_CLEAR_SENTINEL`] 規約に沿ってループ区間を検証する(`mw_voice_set_loop`/
+/// `mw_music_set_loop`/`mw_bgm_set_loop` の3箇所で重複していたバリデーションを共有する)。
+/// ハンドルの有効性より前に呼ぶこと(既存のテスト
+/// `*_rejects_invalid_region_before_touching_the_handle` が固定化している契約)。
+fn parse_loop_region(begin_frames: u64, end_frames: u64) -> Result<Option<(u64, u64)>, MwResult> {
+    if (begin_frames, end_frames) == LOOP_CLEAR_SENTINEL {
+        Ok(None)
+    } else if begin_frames >= end_frames {
+        Err(MwResult::ErrInvalidLoopRegion)
+    } else {
+        Ok(Some((begin_frames, end_frames)))
+    }
+}
+
 /// ミドルウェアを終了し、出力ストリームを停止する。
 ///
 /// 無効なハンドル(未初期化・二重 shutdown・他インスタンスのハンドル)は
 /// `MwResult::ErrInvalidHandle` を返す。クラッシュはしない(§4.8)。
 #[unsafe(no_mangle)]
 pub extern "C" fn mw_shutdown(handle: u64) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| handle_registry::shutdown(handle)));
-
-    match outcome {
-        Ok(ShutdownOutcome::Closed) => MwResult::Ok,
-        Ok(ShutdownOutcome::CloseFailed) => MwResult::ErrBackendCloseFailed,
-        Ok(ShutdownOutcome::InvalidHandle) => MwResult::ErrInvalidHandle,
-        Err(_) => MwResult::ErrPanic,
-    }
+    guarded(MwResult::ErrPanic, || {
+        match handle_registry::shutdown(handle) {
+            ShutdownOutcome::Closed => MwResult::Ok,
+            ShutdownOutcome::CloseFailed => MwResult::ErrBackendCloseFailed,
+            ShutdownOutcome::InvalidHandle => MwResult::ErrInvalidHandle,
+        }
+    })
 }
 
 // --- M1: SE 再生 ------------------------------------------------------------
@@ -157,7 +219,7 @@ pub unsafe extern "C" fn mw_sound_load(
     mode: i32,
     out_id: *mut u64,
 ) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+    guarded(MwResult::ErrPanic, || {
         if out_id.is_null() {
             return MwResult::ErrNullPointer;
         }
@@ -181,12 +243,7 @@ pub unsafe extern "C" fn mw_sound_load(
             MwSoundMode::Se => unsafe { load_se(handle, slice, out_id) },
             MwSoundMode::Music => unsafe { load_music(handle, slice, out_id) },
         }
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+    })
 }
 
 /// `mw_sound_load` の SE(`mode = 0`)経路。全デコードしてメモリ常駐させる(M1)。
@@ -208,18 +265,9 @@ unsafe fn load_se(handle: u64, slice: &[u8], out_id: *mut u64) -> MwResult {
         Ok(data) => data,
         Err(err) => {
             mw_backend::mw_log!("[mw-ffi] mw_sound_load: decode failed: {err}");
-            return match err {
-                mw_core::WavError::InvalidSampleRate(_) => MwResult::ErrUnsupportedSampleRate,
-                mw_core::WavError::Resample(_) => MwResult::ErrDecodeFailed,
-                mw_core::WavError::UnsupportedFormatTag(_)
-                | mw_core::WavError::UnsupportedBitsPerSample(_)
-                | mw_core::WavError::UnsupportedChannelCount(_) => MwResult::ErrUnsupportedFormat,
-                mw_core::WavError::Truncated
-                | mw_core::WavError::NotRiff
-                | mw_core::WavError::NotWave
-                | mw_core::WavError::MissingFmtChunk
-                | mw_core::WavError::MissingDataChunk => MwResult::ErrDecodeFailed,
-            };
+            // P1-6: エラーコードへの変換は `impl From<WavError> for MwResult`
+            // (`result.rs`)へ集約した。ログ文言だけ呼び出し元固有のまま残す。
+            return err.into();
         }
     };
 
@@ -287,18 +335,13 @@ unsafe fn load_music(handle: u64, slice: &[u8], out_id: *mut u64) -> MwResult {
 /// 未知の `id`(未ロード・二重解放)は `MwResult::ErrInvalidSoundId` を返す(クラッシュしない)。
 #[unsafe(no_mangle)]
 pub extern "C" fn mw_sound_release(handle: u64, id: u64) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+    guarded(MwResult::ErrPanic, || {
         if handle_registry::is_music_id(id) {
             release_music(handle, id)
         } else {
             release_se(handle, id)
         }
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+    })
 }
 
 fn release_se(handle: u64, id: u64) -> MwResult {
@@ -356,7 +399,7 @@ pub unsafe extern "C" fn mw_se_play(
     volume: f32,
     out_voice: *mut u64,
 ) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+    guarded(MwResult::ErrPanic, || {
         if out_voice.is_null() {
             return MwResult::ErrNullPointer;
         }
@@ -399,12 +442,7 @@ pub unsafe extern "C" fn mw_se_play(
             }
         });
         result.unwrap_or(MwResult::ErrInvalidHandle)
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+    })
 }
 
 /// SE をサンプル精度で予約発音する(初期構築仕様『§4.5 スケジュール発音』, M2-5)。
@@ -434,7 +472,7 @@ pub unsafe extern "C" fn mw_se_schedule(
     host_time_ns: u64,
     out_voice: *mut u64,
 ) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+    guarded(MwResult::ErrPanic, || {
         if out_voice.is_null() {
             return MwResult::ErrNullPointer;
         }
@@ -477,12 +515,7 @@ pub unsafe extern "C" fn mw_se_schedule(
             }
         });
         result.unwrap_or(MwResult::ErrInvalidHandle)
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+    })
 }
 
 /// ボイスを停止する(既定ランプ経由。初期構築仕様 M13/§4.2)。
@@ -493,52 +526,32 @@ pub unsafe extern "C" fn mw_se_schedule(
 /// クラッシュや誤動作にはつながらない)。
 #[unsafe(no_mangle)]
 pub extern "C" fn mw_voice_stop(handle: u64, voice: u64) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-        let result = handle_registry::with_instance(handle, |instance| {
+    send_command(
+        handle,
+        |instance| {
             instance.drain_reclaimed();
-            let sent = instance.command_sender.send(mw_core::Command::StopVoice {
+            mw_core::Command::StopVoice {
                 voice_serial: voice,
-            });
-            if sent {
-                MwResult::Ok
-            } else {
-                MwResult::ErrCommandQueueFull
             }
-        });
-        result.unwrap_or(MwResult::ErrInvalidHandle)
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+        },
+        |_instance| {},
+    )
 }
 
 /// ボイスの音量を変更する(既定ランプ経由。初期構築仕様 M13/§4.2)。
 #[unsafe(no_mangle)]
 pub extern "C" fn mw_voice_set_volume(handle: u64, voice: u64, volume: f32) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-        let result = handle_registry::with_instance(handle, |instance| {
+    send_command(
+        handle,
+        |instance| {
             instance.drain_reclaimed();
-            let sent = instance
-                .command_sender
-                .send(mw_core::Command::SetVoiceVolume {
-                    voice_serial: voice,
-                    volume,
-                });
-            if sent {
-                MwResult::Ok
-            } else {
-                MwResult::ErrCommandQueueFull
+            mw_core::Command::SetVoiceVolume {
+                voice_serial: voice,
+                volume,
             }
-        });
-        result.unwrap_or(MwResult::ErrInvalidHandle)
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+        },
+        |_instance| {},
+    )
 }
 
 /// ボイスのループ区間を設定・解除する(`mw_music_set_loop` の SE ボイス版。
@@ -562,99 +575,60 @@ pub extern "C" fn mw_voice_set_loop(
     begin_frames: u64,
     end_frames: u64,
 ) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-        let region = if (begin_frames, end_frames) == LOOP_CLEAR_SENTINEL {
-            None
-        } else if begin_frames >= end_frames {
-            return MwResult::ErrInvalidLoopRegion;
-        } else {
-            Some((begin_frames, end_frames))
-        };
-
-        let result = handle_registry::with_instance(handle, |instance| {
-            let sent = instance
-                .command_sender
-                .send(mw_core::Command::SetVoiceLoop {
-                    voice_serial: voice,
-                    region,
-                });
-            if sent {
-                MwResult::Ok
-            } else {
-                MwResult::ErrCommandQueueFull
-            }
-        });
-        result.unwrap_or(MwResult::ErrInvalidHandle)
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+    let region = match parse_loop_region(begin_frames, end_frames) {
+        Ok(region) => region,
+        Err(err) => return err,
+    };
+    send_command(
+        handle,
+        |_instance| mw_core::Command::SetVoiceLoop {
+            voice_serial: voice,
+            region,
+        },
+        |_instance| {},
+    )
 }
 
 /// バス音量を変更する(既定ランプ経由。初期構築仕様 M13/§4.1)。
 #[unsafe(no_mangle)]
 pub extern "C" fn mw_bus_set_volume(handle: u64, bus: i32, volume: f32) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-        let Some(bus) = MwBus::from_raw(bus) else {
-            return MwResult::ErrInvalidBus;
-        };
-        let result = handle_registry::with_instance(handle, |instance| {
+    let Some(bus) = MwBus::from_raw(bus) else {
+        return MwResult::ErrInvalidBus;
+    };
+    send_command(
+        handle,
+        |instance| {
             instance.drain_reclaimed();
-            let sent = instance
-                .command_sender
-                .send(mw_core::Command::SetBusVolume {
-                    bus: bus.to_core(),
-                    volume,
-                });
-            if sent {
-                // M3(案A): 再オープン後の復元用キャッシュ(`Instance::attempt_reopen`)。
-                instance.note_bus_volume(bus.to_core(), volume);
-                MwResult::Ok
-            } else {
-                MwResult::ErrCommandQueueFull
+            mw_core::Command::SetBusVolume {
+                bus: bus.to_core(),
+                volume,
             }
-        });
-        result.unwrap_or(MwResult::ErrInvalidHandle)
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+        },
+        // M3(案A): 再オープン後の復元用キャッシュ(`Instance::attempt_reopen`)。
+        |instance| instance.note_bus_volume(bus.to_core(), volume),
+    )
 }
 
 /// バスをフェードする(呼び出し側指定の時間、ms。初期構築仕様 §4.1/§5.5)。
 #[unsafe(no_mangle)]
 pub extern "C" fn mw_bus_fade(handle: u64, bus: i32, target: f32, ms: f32) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-        let Some(bus) = MwBus::from_raw(bus) else {
-            return MwResult::ErrInvalidBus;
-        };
-        let result = handle_registry::with_instance(handle, |instance| {
+    let Some(bus) = MwBus::from_raw(bus) else {
+        return MwResult::ErrInvalidBus;
+    };
+    send_command(
+        handle,
+        |instance| {
             instance.drain_reclaimed();
-            let sent = instance.command_sender.send(mw_core::Command::BusFade {
+            mw_core::Command::BusFade {
                 bus: bus.to_core(),
                 target,
                 ms,
-            });
-            if sent {
-                // M3(案A): フェードの収束後の値(`target`)をキャッシュする
-                // (`Instance::restore_bus_volumes` のドキュメント参照)。
-                instance.note_bus_volume(bus.to_core(), target);
-                MwResult::Ok
-            } else {
-                MwResult::ErrCommandQueueFull
             }
-        });
-        result.unwrap_or(MwResult::ErrInvalidHandle)
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+        },
+        // M3(案A): フェードの収束後の値(`target`)をキャッシュする
+        // (`Instance::restore_bus_volumes` のドキュメント参照)。
+        |instance| instance.note_bus_volume(bus.to_core(), target),
+    )
 }
 
 /// バスの直近設定音量を取得する(R38「ツールバー連打で無音化」調査用に追加、
@@ -677,7 +651,7 @@ pub unsafe extern "C" fn mw_bus_get_volume(
     bus: i32,
     out_volume: *mut f32,
 ) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+    guarded(MwResult::ErrPanic, || {
         if out_volume.is_null() {
             return MwResult::ErrNullPointer;
         }
@@ -696,12 +670,7 @@ pub unsafe extern "C" fn mw_bus_get_volume(
             }
             None => MwResult::ErrInvalidHandle,
         }
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+    })
 }
 
 /// 楽曲を予約再生する(初期構築仕様『§4.3 楽曲再生』, M2-5)。
@@ -718,25 +687,14 @@ pub unsafe extern "C" fn mw_bus_get_volume(
 /// テストで検証済み。
 #[unsafe(no_mangle)]
 pub extern "C" fn mw_music_play_scheduled(handle: u64, host_time_ns: u64) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-        let result = handle_registry::with_instance(handle, |instance| {
+    send_command(
+        handle,
+        |instance| {
             instance.drain_reclaimed();
-            let sent = instance
-                .command_sender
-                .send(mw_core::Command::MusicPlayScheduled { host_time_ns });
-            if sent {
-                MwResult::Ok
-            } else {
-                MwResult::ErrCommandQueueFull
-            }
-        });
-        result.unwrap_or(MwResult::ErrInvalidHandle)
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+            mw_core::Command::MusicPlayScheduled { host_time_ns }
+        },
+        |_instance| {},
+    )
 }
 
 // --- M2-7: 楽曲再生 -----------------------------------------------------------
@@ -788,7 +746,15 @@ pub extern "C" fn mw_music_play_scheduled(handle: u64, host_time_ns: u64) -> MwR
 /// この関数はポインタを取らない(引数はすべて値渡し)。
 #[unsafe(no_mangle)]
 pub extern "C" fn mw_music_set(handle: u64, sound_id: u64) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+    set_music_track(handle, sound_id, MusicTarget::Music)
+}
+
+/// [`mw_music_set`]/[`mw_bgm_set`] の共有実体(P1-7)。実体はほぼ完全重複していた——
+/// 差分は [`MusicTarget`] 一つ(ログ文言・デコードスレッドの送り先・送出する
+/// `mw_core::Command`・復元キャッシュの書き込み先)に集約されている
+/// (`MusicTarget` のドキュメント「実体を共有する」参照)。
+fn set_music_track(handle: u64, sound_id: u64, target: MusicTarget) -> MwResult {
+    guarded(MwResult::ErrPanic, || {
         if !handle_registry::is_music_id(sound_id) {
             return MwResult::ErrInvalidSoundId;
         }
@@ -806,65 +772,52 @@ pub extern "C" fn mw_music_set(handle: u64, sound_id: u64) -> MwResult {
                 match mw_core::SymphoniaDecoder::open((*bytes).clone(), output_sample_rate) {
                     Ok(decoder) => decoder,
                     Err(err) => {
-                        mw_backend::mw_log!("[mw-ffi] mw_music_set: decode open failed: {err}");
-                        return match err {
-                            mw_core::DecodeError::InvalidSampleRate(_) => {
-                                MwResult::ErrUnsupportedSampleRate
-                            }
-                            mw_core::DecodeError::UnsupportedChannelCount(_) => {
-                                MwResult::ErrUnsupportedFormat
-                            }
-                            mw_core::DecodeError::Symphonia(_)
-                            | mw_core::DecodeError::NoAudioTrack
-                            | mw_core::DecodeError::Resample(_)
-                            | mw_core::DecodeError::ResetRequired => MwResult::ErrDecodeFailed,
-                        };
+                        mw_backend::mw_log!(
+                            "[mw-ffi] {}: decode open failed: {err}",
+                            target.set_fn_name()
+                        );
+                        // P1-6: エラーコードへの変換は `impl From<DecodeError> for MwResult`
+                        // (`result.rs`)へ集約した。
+                        return err.into();
                     }
                 };
 
             // 1) 先にデコーダを差し替える(このドキュメントの「曲の切り替えで
             //    前曲の PCM が漏れる問題への対処」参照。順序は変えないこと)。
-            if !instance.send_decoder(Box::new(decoder)) {
-                // 実運用では起こらない(`Instance::send_decoder` のドキュメント
-                // 参照)防御的分岐。
+            if !instance.send_decoder_for(target, Box::new(decoder)) {
+                // 実運用では起こらない(`Instance::send_decoder`/`send_bgm_decoder`
+                // のドキュメント参照)防御的分岐。
                 return MwResult::ErrCommandQueueFull;
             }
 
             // 2) そのあとでコマンドを送る。2通で足りる:
-            //    - `MusicPrepare`: 新しい曲として状態機械を仕切り直す(`MusicVoice::prepare`
-            //      が状態・位置・ループ区間・ゲイン・保留中の遷移を無条件に初期化する)。
-            //      **`MusicStop` ではこれの代わりにならない** —— `stop` は再生中だと
-            //      フェードアウトを予約するだけで状態は `Playing` のまま残り、続く
-            //      `MusicSeek` がその予約(`pending_settle`)を破棄してしまうため、
-            //      ゲイン 0 のまま `Playing` に居座って新しい曲が永久に無音になる
-            //      (`mixer.rs` の再現テスト参照)。
-            //    - `MusicSeek { frames: 0 }`: リングバッファの掃除と位置 0 への巻き戻しを
-            //      駆動する(消費側の `request_seek` を通す唯一の経路)。
+            //    - `MusicPrepare`/`BgmPrepare`: 新しい曲として状態機械を仕切り直す
+            //      (`MusicVoice::prepare` が状態・位置・ループ区間・ゲイン・保留中の
+            //      遷移を無条件に初期化する)。**`MusicStop`/`BgmStop` ではこれの
+            //      代わりにならない** —— `stop` は再生中だとフェードアウトを予約する
+            //      だけで状態は `Playing` のまま残り、続く `Seek` がその予約
+            //      (`pending_settle`)を破棄してしまうため、ゲイン 0 のまま `Playing`
+            //      に居座って新しい曲が永久に無音になる(`mixer.rs` の再現テスト参照)。
+            //    - `MusicSeek`/`BgmSeek { frames: 0 }`: リングバッファの掃除と位置 0
+            //      への巻き戻しを駆動する(消費側の `request_seek` を通す唯一の経路)。
             //
-            //    `MusicPrepare` の後に `MusicStop` を挟む必要は無い。コマンドは同一
-            //    コールバックの先頭で発行順に処理されるため、その時点の状態は必ず
-            //    `Loading` であり `stop` は定義上の no-op になる(送っても何も起きない
-            //    ぶん、コマンドキューの枠を1つ無駄に使うだけ)。
-            let sent = instance.command_sender.send(mw_core::Command::MusicPrepare)
-                && instance
-                    .command_sender
-                    .send(mw_core::Command::MusicSeek { frames: 0 });
+            //    `Prepare` の後に `Stop` を挟む必要は無い。コマンドは同一コールバックの
+            //    先頭で発行順に処理されるため、その時点の状態は必ず `Loading` であり
+            //    `stop` は定義上の no-op になる(送っても何も起きないぶん、コマンド
+            //    キューの枠を1つ無駄に使うだけ)。
+            let sent = instance.command_sender.send(target.prepare_command())
+                && instance.command_sender.send(target.seek_command(0));
             if sent {
                 // M3(案A): 再オープン後に同じ曲を読み直すための復元キャッシュ
-                // (`Instance::attempt_reopen`/`Instance::restore_music`)。
-                instance.note_music_set(sound_id);
+                // (`Instance::attempt_reopen`/`Instance::restore_music`/`restore_bgm`)。
+                instance.note_track_set(target, sound_id);
                 MwResult::Ok
             } else {
                 MwResult::ErrCommandQueueFull
             }
         });
         result.unwrap_or(MwResult::ErrInvalidHandle)
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+    })
 }
 
 /// 楽曲ボイスの再生状態を取得する(初期構築仕様『§4.3』『§5.5』)。
@@ -883,13 +836,18 @@ pub extern "C" fn mw_music_set(handle: u64, sound_id: u64) -> MwResult {
 /// なければならない(null は書き込みを行わず `MwResult::ErrNullPointer`)。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mw_music_state(handle: u64, out_state: *mut i32) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+    music_target_state(handle, MusicTarget::Music, out_state)
+}
+
+/// [`mw_music_state`]/[`mw_bgm_state`] の共有実体(P1-7)。差分は [`MusicTarget`] 越しの
+/// [`handle_registry::Instance::track_state`] 呼び分け1箇所のみ。
+fn music_target_state(handle: u64, target: MusicTarget, out_state: *mut i32) -> MwResult {
+    guarded(MwResult::ErrPanic, || {
         if out_state.is_null() {
             return MwResult::ErrNullPointer;
         }
         let result = handle_registry::with_instance(handle, |instance| {
-            let state = instance.music_clock_snapshot().state;
-            MwMusicState::from_core(state) as i32
+            MwMusicState::from_core(instance.track_state(target)) as i32
         });
         match result {
             Some(value) => {
@@ -901,12 +859,7 @@ pub unsafe extern "C" fn mw_music_state(handle: u64, out_state: *mut i32) -> MwR
             }
             None => MwResult::ErrInvalidHandle,
         }
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+    })
 }
 
 /// 楽曲を一時停止する(初期構築仕様『§4.3』の `mw_music_pause` に相当)。
@@ -916,22 +869,11 @@ pub unsafe extern "C" fn mw_music_state(handle: u64, out_state: *mut i32) -> MwR
 /// (クラッシュしない)。
 #[unsafe(no_mangle)]
 pub extern "C" fn mw_music_pause(handle: u64) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-        let result = handle_registry::with_instance(handle, |instance| {
-            let sent = instance.command_sender.send(mw_core::Command::MusicPause);
-            if sent {
-                MwResult::Ok
-            } else {
-                MwResult::ErrCommandQueueFull
-            }
-        });
-        result.unwrap_or(MwResult::ErrInvalidHandle)
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+    send_command(
+        handle,
+        |_instance| mw_core::Command::MusicPause,
+        |_instance| {},
+    )
 }
 
 /// 巻き戻し付きで再開する(初期構築仕様『§4.3』の `mw_music_resume_at` に相当。
@@ -941,24 +883,11 @@ pub extern "C" fn mw_music_pause(handle: u64) -> MwResult {
 /// 音声スレッド側で無視される(クラッシュしない)。
 #[unsafe(no_mangle)]
 pub extern "C" fn mw_music_resume_at(handle: u64, frames: u64) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-        let result = handle_registry::with_instance(handle, |instance| {
-            let sent = instance
-                .command_sender
-                .send(mw_core::Command::MusicResumeAt { frames });
-            if sent {
-                MwResult::Ok
-            } else {
-                MwResult::ErrCommandQueueFull
-            }
-        });
-        result.unwrap_or(MwResult::ErrInvalidHandle)
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+    send_command(
+        handle,
+        |_instance| mw_core::Command::MusicResumeAt { frames },
+        |_instance| {},
+    )
 }
 
 /// 楽曲ボイスをシークする(初期構築仕様『§4.3』の `mw_music_seek` に相当)。
@@ -967,24 +896,11 @@ pub extern "C" fn mw_music_resume_at(handle: u64, frames: u64) -> MwResult {
 /// 参照)。音楽クロックの世代カウンタ(§4.4)が進む。
 #[unsafe(no_mangle)]
 pub extern "C" fn mw_music_seek(handle: u64, frames: u64) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-        let result = handle_registry::with_instance(handle, |instance| {
-            let sent = instance
-                .command_sender
-                .send(mw_core::Command::MusicSeek { frames });
-            if sent {
-                MwResult::Ok
-            } else {
-                MwResult::ErrCommandQueueFull
-            }
-        });
-        result.unwrap_or(MwResult::ErrInvalidHandle)
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+    send_command(
+        handle,
+        |_instance| mw_core::Command::MusicSeek { frames },
+        |_instance| {},
+    )
 }
 
 /// 楽曲を停止する(初期構築仕様『§4.3』の `mw_music_stop` に相当)。
@@ -994,22 +910,12 @@ pub extern "C" fn mw_music_seek(handle: u64, frames: u64) -> MwResult {
 /// 参照)。
 #[unsafe(no_mangle)]
 pub extern "C" fn mw_music_stop(handle: u64) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-        let result = handle_registry::with_instance(handle, |instance| {
-            let sent = instance.command_sender.send(mw_core::Command::MusicStop);
-            if sent {
-                MwResult::Ok
-            } else {
-                MwResult::ErrCommandQueueFull
-            }
-        });
-        result.unwrap_or(MwResult::ErrInvalidHandle)
-    }));
+    stop_music_track(handle, MusicTarget::Music)
+}
 
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+/// [`mw_music_stop`]/[`mw_bgm_stop`] の共有実体(P1-7)。
+fn stop_music_track(handle: u64, target: MusicTarget) -> MwResult {
+    send_command(handle, |_instance| target.stop_command(), |_instance| {})
 }
 
 /// 楽曲のループ区間を設定・解除する(初期構築仕様『§4.3』の `mw_music_set_loop` に
@@ -1024,34 +930,26 @@ pub extern "C" fn mw_music_stop(handle: u64) -> MwResult {
 /// 黙って捨てず明示的に拒否する)。
 #[unsafe(no_mangle)]
 pub extern "C" fn mw_music_set_loop(handle: u64, begin_frames: u64, end_frames: u64) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-        let region = if (begin_frames, end_frames) == LOOP_CLEAR_SENTINEL {
-            None
-        } else if begin_frames >= end_frames {
-            return MwResult::ErrInvalidLoopRegion;
-        } else {
-            Some((begin_frames, end_frames))
-        };
+    set_music_track_loop(handle, MusicTarget::Music, begin_frames, end_frames)
+}
 
-        let result = handle_registry::with_instance(handle, |instance| {
-            let sent = instance
-                .command_sender
-                .send(mw_core::Command::MusicSetLoop { region });
-            if sent {
-                // M3(案A): 再オープン後の復元用キャッシュ(`Instance::restore_music`)。
-                instance.note_music_loop(region);
-                MwResult::Ok
-            } else {
-                MwResult::ErrCommandQueueFull
-            }
-        });
-        result.unwrap_or(MwResult::ErrInvalidHandle)
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+/// [`mw_music_set_loop`]/[`mw_bgm_set_loop`] の共有実体(P1-7)。
+fn set_music_track_loop(
+    handle: u64,
+    target: MusicTarget,
+    begin_frames: u64,
+    end_frames: u64,
+) -> MwResult {
+    let region = match parse_loop_region(begin_frames, end_frames) {
+        Ok(region) => region,
+        Err(err) => return err,
+    };
+    send_command(
+        handle,
+        |_instance| target.set_loop_command(region),
+        // M3(案A): 再オープン後の復元用キャッシュ(`Instance::restore_music`/`restore_bgm`)。
+        |instance| instance.note_track_loop(target, region),
+    )
 }
 
 /// [`mw_music_set_loop`] のループ解除を表す `(begin_frames, end_frames)` の組
@@ -1073,7 +971,7 @@ const LOOP_CLEAR_SENTINEL: (u64, u64) = (0, 0);
 /// null でなければならない(null は書き込みを行わず `MwResult::ErrNullPointer`)。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mw_music_get_position(handle: u64, out: *mut MwMusicPosition) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+    guarded(MwResult::ErrPanic, || {
         if out.is_null() {
             return MwResult::ErrNullPointer;
         }
@@ -1098,12 +996,7 @@ pub unsafe extern "C" fn mw_music_get_position(handle: u64, out: *mut MwMusicPos
             }
             None => MwResult::ErrInvalidHandle,
         }
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+    })
 }
 
 // --- M4-3: BGM のネイティブ化 --------------------------------------------------
@@ -1139,62 +1032,10 @@ pub unsafe extern "C" fn mw_music_get_position(handle: u64, out: *mut MwMusicPos
 /// `Ready` を返すまでポーリングすること。
 #[unsafe(no_mangle)]
 pub extern "C" fn mw_bgm_set(handle: u64, sound_id: u64) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-        if !handle_registry::is_music_id(sound_id) {
-            return MwResult::ErrInvalidSoundId;
-        }
-
-        let result = handle_registry::with_instance(handle, |instance| {
-            let Some(bytes) = instance.get_music_bytes(sound_id) else {
-                return MwResult::ErrInvalidSoundId;
-            };
-            let output_sample_rate = instance.backend_sample_rate();
-
-            let decoder =
-                match mw_core::SymphoniaDecoder::open((*bytes).clone(), output_sample_rate) {
-                    Ok(decoder) => decoder,
-                    Err(err) => {
-                        mw_backend::mw_log!("[mw-ffi] mw_bgm_set: decode open failed: {err}");
-                        return match err {
-                            mw_core::DecodeError::InvalidSampleRate(_) => {
-                                MwResult::ErrUnsupportedSampleRate
-                            }
-                            mw_core::DecodeError::UnsupportedChannelCount(_) => {
-                                MwResult::ErrUnsupportedFormat
-                            }
-                            mw_core::DecodeError::Symphonia(_)
-                            | mw_core::DecodeError::NoAudioTrack
-                            | mw_core::DecodeError::Resample(_)
-                            | mw_core::DecodeError::ResetRequired => MwResult::ErrDecodeFailed,
-                        };
-                    }
-                };
-
-            // `mw_music_set` と同じ順序厳守(デコーダ差し替え → Prepare → Seek{0})。
-            // 理由はこの関数のドキュメント、および `mw_music_set` 実装内コメント参照。
-            if !instance.send_bgm_decoder(Box::new(decoder)) {
-                return MwResult::ErrCommandQueueFull;
-            }
-
-            let sent = instance.command_sender.send(mw_core::Command::BgmPrepare)
-                && instance
-                    .command_sender
-                    .send(mw_core::Command::BgmSeek { frames: 0 });
-            if sent {
-                // M3(案A): 再オープン後の復元用キャッシュ(`Instance::restore_bgm`)。
-                instance.note_bgm_set(sound_id);
-                MwResult::Ok
-            } else {
-                MwResult::ErrCommandQueueFull
-            }
-        });
-        result.unwrap_or(MwResult::ErrInvalidHandle)
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+    // 実体は `mw_music_set` と共有する(P1-7、`set_music_track`/`MusicTarget` 参照)。
+    // 手順・非ブロッキング契約は完全に同一で、差分は `MusicTarget::Bgm` の1点のみ
+    // (デコーダの送り先・送出するコマンド・復元キャッシュの書き込み先・ログ文言)。
+    set_music_track(handle, sound_id, MusicTarget::Bgm)
 }
 
 /// BGM ボイスの再生状態を取得する(`mw_music_state` の BGM 版)。
@@ -1209,29 +1050,7 @@ pub extern "C" fn mw_bgm_set(handle: u64, sound_id: u64) -> MwResult {
 /// なければならない(null は書き込みを行わず `MwResult::ErrNullPointer`)。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mw_bgm_state(handle: u64, out_state: *mut i32) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-        if out_state.is_null() {
-            return MwResult::ErrNullPointer;
-        }
-        let result = handle_registry::with_instance(handle, |instance| {
-            MwMusicState::from_core(instance.bgm_state()) as i32
-        });
-        match result {
-            Some(value) => {
-                // SAFETY: 上で null チェック済み。
-                unsafe {
-                    *out_state = value;
-                }
-                MwResult::Ok
-            }
-            None => MwResult::ErrInvalidHandle,
-        }
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+    music_target_state(handle, MusicTarget::Bgm, out_state)
 }
 
 /// BGM を再生する(`Ready` からのみ有効、既定ランプでフェードインする。初期構築仕様
@@ -1239,22 +1058,11 @@ pub unsafe extern "C" fn mw_bgm_state(handle: u64, out_state: *mut i32) -> MwRes
 /// (クラッシュしない。`mw_core::MusicVoice::play` 参照)。
 #[unsafe(no_mangle)]
 pub extern "C" fn mw_bgm_play(handle: u64) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-        let result = handle_registry::with_instance(handle, |instance| {
-            let sent = instance.command_sender.send(mw_core::Command::BgmPlay);
-            if sent {
-                MwResult::Ok
-            } else {
-                MwResult::ErrCommandQueueFull
-            }
-        });
-        result.unwrap_or(MwResult::ErrInvalidHandle)
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+    send_command(
+        handle,
+        |_instance| mw_core::Command::BgmPlay,
+        |_instance| {},
+    )
 }
 
 /// BGM を停止する(`mw_music_stop` の BGM 版)。`Playing` 中は既定ランプでフェード
@@ -1262,22 +1070,7 @@ pub extern "C" fn mw_bgm_play(handle: u64) -> MwResult {
 /// (`mw_core::MusicVoice::stop` 参照)。
 #[unsafe(no_mangle)]
 pub extern "C" fn mw_bgm_stop(handle: u64) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-        let result = handle_registry::with_instance(handle, |instance| {
-            let sent = instance.command_sender.send(mw_core::Command::BgmStop);
-            if sent {
-                MwResult::Ok
-            } else {
-                MwResult::ErrCommandQueueFull
-            }
-        });
-        result.unwrap_or(MwResult::ErrInvalidHandle)
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+    stop_music_track(handle, MusicTarget::Bgm)
 }
 
 /// BGM のループ区間を設定・解除する(`mw_music_set_loop` の BGM 版。初期構築仕様
@@ -1290,34 +1083,7 @@ pub extern "C" fn mw_bgm_stop(handle: u64) -> MwResult {
 /// 同じ規約)。それ以外で `begin_frames >= end_frames` は `MwResult::ErrInvalidLoopRegion`。
 #[unsafe(no_mangle)]
 pub extern "C" fn mw_bgm_set_loop(handle: u64, begin_frames: u64, end_frames: u64) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-        let region = if (begin_frames, end_frames) == LOOP_CLEAR_SENTINEL {
-            None
-        } else if begin_frames >= end_frames {
-            return MwResult::ErrInvalidLoopRegion;
-        } else {
-            Some((begin_frames, end_frames))
-        };
-
-        let result = handle_registry::with_instance(handle, |instance| {
-            let sent = instance
-                .command_sender
-                .send(mw_core::Command::BgmSetLoop { region });
-            if sent {
-                // M3(案A): 再オープン後の復元用キャッシュ(`Instance::restore_bgm`)。
-                instance.note_bgm_loop(region);
-                MwResult::Ok
-            } else {
-                MwResult::ErrCommandQueueFull
-            }
-        });
-        result.unwrap_or(MwResult::ErrInvalidHandle)
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+    set_music_track_loop(handle, MusicTarget::Bgm, begin_frames, end_frames)
 }
 
 /// 出力レイテンシ(ns)を取得する(初期構築仕様『§5.5』`mw_get_output_latency_ns`)。
@@ -1338,7 +1104,7 @@ pub extern "C" fn mw_bgm_set_loop(handle: u64, begin_frames: u64, end_frames: u6
 /// なければならない(null は書き込みを行わず `MwResult::ErrNullPointer`)。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mw_get_output_latency_ns(handle: u64, out_ns: *mut u64) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+    guarded(MwResult::ErrPanic, || {
         if out_ns.is_null() {
             return MwResult::ErrNullPointer;
         }
@@ -1356,12 +1122,7 @@ pub unsafe extern "C" fn mw_get_output_latency_ns(handle: u64, out_ns: *mut u64)
             }
             None => MwResult::ErrInvalidHandle,
         }
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+    })
 }
 
 /// 出力コールバックのアンダーラン(の疑い)統計を取得する(初期構築仕様『§2』M3
@@ -1393,7 +1154,7 @@ pub unsafe extern "C" fn mw_get_output_underrun_stats(
     handle: u64,
     out: *mut MwOutputUnderrunStats,
 ) -> MwResult {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+    guarded(MwResult::ErrPanic, || {
         if out.is_null() {
             return MwResult::ErrNullPointer;
         }
@@ -1415,12 +1176,7 @@ pub unsafe extern "C" fn mw_get_output_underrun_stats(
             }
             None => MwResult::ErrInvalidHandle,
         }
-    }));
-
-    match outcome {
-        Ok(result) => result,
-        Err(_) => MwResult::ErrPanic,
-    }
+    })
 }
 
 // --- M2-6: イベント通知 -----------------------------------------------------
@@ -1486,7 +1242,7 @@ pub unsafe extern "C" fn mw_poll_events(
     cap: i32,
     out_dropped: *mut u32,
 ) -> i32 {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+    let outcome = guarded(Err(MwResult::ErrPanic), || {
         if out_dropped.is_null() {
             return Err(MwResult::ErrNullPointer);
         }
@@ -1519,7 +1275,7 @@ pub unsafe extern "C" fn mw_poll_events(
             written as i32
         });
         result.ok_or(MwResult::ErrInvalidHandle)
-    }));
+    });
 
     // M3(案A): このスコープの外(=上の `with_instance` が既にレジストリロックを
     // 解放した後)で呼ぶ——`with_instance` の中から呼ぶと同じ `Mutex` を二重に
@@ -1527,16 +1283,15 @@ pub unsafe extern "C" fn mw_poll_events(
     // `init`/`shutdown` と同じレジストリロックを独立に取得する設計のため)。
     // iOS/tvOS ではこの呼び出しが丸ごとコンパイルされない(関数doc参照)。
     // パニックしても `mw_poll_events` 全体の結果(`outcome`)を巻き込まないよう、
-    // ここだけ独立して `catch_unwind` で保護する。
+    // ここだけ独立して `guarded` で保護する。
     #[cfg(not(any(target_os = "ios", target_os = "tvos")))]
     {
-        let _ = panic::catch_unwind(AssertUnwindSafe(|| handle_registry::maybe_reopen(handle)));
+        guarded((), || handle_registry::maybe_reopen(handle));
     }
 
     match outcome {
-        Ok(Ok(written)) => written,
-        Ok(Err(err)) => err as i32,
-        Err(_) => MwResult::ErrPanic as i32,
+        Ok(written) => written,
+        Err(err) => err as i32,
     }
 }
 

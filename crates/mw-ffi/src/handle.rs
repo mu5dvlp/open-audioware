@@ -54,6 +54,69 @@ pub fn is_music_id(id: u64) -> bool {
     id & MUSIC_ID_FLAG != 0
 }
 
+/// 楽曲ボイス(`mw_music_*`)か BGM ボイス(`mw_bgm_*`)かを表す選択子(P1-7)。
+///
+/// `mw_music_set`/`mw_bgm_set`・`mw_music_state`/`mw_bgm_state`・`mw_music_stop`/
+/// `mw_bgm_stop`・`mw_music_set_loop`/`mw_bgm_set_loop` の4組は実体がほぼ完全重複
+/// していたため、この enum 1つで実装を共有する(`crate::ffi` 側の
+/// `set_music_track`/`music_target_state`/`stop_music_track`/`set_music_track_loop`
+/// が使う)。
+///
+/// **この4組以外は意図的に対象外**——`mw_music_pause`/`mw_music_resume_at`/
+/// `mw_music_seek`/`mw_music_play_scheduled`/`mw_music_get_position`/`mw_bgm_play`
+/// は BGM 側(または楽曲側)に対応する API 自体が無い(`mw_core::Command` に
+/// `BgmPause`/`BgmResumeAt`/公開版の `BgmSeek`/`BgmPlayScheduled` が無い。理由は
+/// `crates/mw-ffi/CLAUDE.md`「BGM との分担 —— 共有するもの・分けるもの」参照)ため、
+/// 共有化すると存在しない対称性を捏造することになる。個別のまま残す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MusicTarget {
+    Music,
+    Bgm,
+}
+
+impl MusicTarget {
+    /// ログ・エラーメッセージに使う FFI 関数名(`set_music_track` が使う。元の
+    /// `mw_music_set`/`mw_bgm_set` それぞれのログ文言をそのまま保つため)。
+    pub(crate) fn set_fn_name(self) -> &'static str {
+        match self {
+            MusicTarget::Music => "mw_music_set",
+            MusicTarget::Bgm => "mw_bgm_set",
+        }
+    }
+
+    /// `MusicPrepare`/`BgmPrepare` のうち対応する方。
+    pub(crate) fn prepare_command(self) -> Command {
+        match self {
+            MusicTarget::Music => Command::MusicPrepare,
+            MusicTarget::Bgm => Command::BgmPrepare,
+        }
+    }
+
+    /// `MusicSeek`/`BgmSeek` のうち対応する方。
+    pub(crate) fn seek_command(self, frames: u64) -> Command {
+        match self {
+            MusicTarget::Music => Command::MusicSeek { frames },
+            MusicTarget::Bgm => Command::BgmSeek { frames },
+        }
+    }
+
+    /// `MusicStop`/`BgmStop` のうち対応する方。
+    pub(crate) fn stop_command(self) -> Command {
+        match self {
+            MusicTarget::Music => Command::MusicStop,
+            MusicTarget::Bgm => Command::BgmStop,
+        }
+    }
+
+    /// `MusicSetLoop`/`BgmSetLoop` のうち対応する方。
+    pub(crate) fn set_loop_command(self, region: Option<(u64, u64)>) -> Command {
+        match self {
+            MusicTarget::Music => Command::MusicSetLoop { region },
+            MusicTarget::Bgm => Command::BgmSetLoop { region },
+        }
+    }
+}
+
 pub struct Instance {
     handle: u64,
     backend: CpalBackend,
@@ -255,6 +318,64 @@ impl Instance {
     /// [`Instance::send_decoder`] の BGM 版)。
     pub fn send_bgm_decoder(&self, decoder: Box<dyn MusicDecoder + Send>) -> bool {
         self.bgm_decoder_tx.send(decoder).is_ok()
+    }
+
+    // --- P1-7: `MusicTarget` によるディスパッチ(`crate::ffi::set_music_track` 等が使う) ---
+    //
+    // 既存の個別メソッド([`Instance::send_decoder`]/[`Instance::send_bgm_decoder`]/
+    // [`Instance::note_music_set`]/[`Instance::note_bgm_set`]/
+    // [`Instance::note_music_loop`]/[`Instance::note_bgm_loop`]/[`Instance::bgm_state`]/
+    // [`Instance::music_clock_snapshot`])は削除せず残してある——`attempt_reopen` /
+    // `restore_music` / `restore_bgm`(意図的に楽曲と BGM で挙動が異なる箇所。
+    // `Instance::attempt_reopen` のドキュメント「復元できる状態・できない状態」参照)は
+    // 引き続きそれぞれを個別に呼ぶ。ここへ統合すると、その意図的な非対称性まで
+    // 巻き込んで畳んでしまう事故になる。
+
+    /// [`MusicTarget`] に応じたデコードスレッドへデコーダを渡す
+    /// ([`Instance::send_decoder`]/[`Instance::send_bgm_decoder`] のディスパッチ版)。
+    pub(crate) fn send_decoder_for(
+        &self,
+        target: MusicTarget,
+        decoder: Box<dyn MusicDecoder + Send>,
+    ) -> bool {
+        match target {
+            MusicTarget::Music => self.send_decoder(decoder),
+            MusicTarget::Bgm => self.send_bgm_decoder(decoder),
+        }
+    }
+
+    /// [`MusicTarget`] に応じた `mw_music_set`/`mw_bgm_set` 成功後の復元キャッシュ更新
+    /// ([`Instance::note_music_set`]/[`Instance::note_bgm_set`] のディスパッチ版)。
+    pub(crate) fn note_track_set(&self, target: MusicTarget, sound_id: u64) {
+        match target {
+            MusicTarget::Music => self.note_music_set(sound_id),
+            MusicTarget::Bgm => self.note_bgm_set(sound_id),
+        }
+    }
+
+    /// [`MusicTarget`] に応じた `mw_music_set_loop`/`mw_bgm_set_loop` 成功後の
+    /// 復元キャッシュ更新([`Instance::note_music_loop`]/[`Instance::note_bgm_loop`]
+    /// のディスパッチ版)。
+    pub(crate) fn note_track_loop(&self, target: MusicTarget, region: Option<(u64, u64)>) {
+        match target {
+            MusicTarget::Music => self.note_music_loop(region),
+            MusicTarget::Bgm => self.note_bgm_loop(region),
+        }
+    }
+
+    /// [`MusicTarget`] に応じた再生状態(`mw_music_state`/`mw_bgm_state` のディスパッチ版)。
+    ///
+    /// **格納場所の非対称性は温存する**: 楽曲は音楽クロック
+    /// (`music_clock_snapshot().state`、seqlock)、BGM は専用の
+    /// `BgmStatePublisher::read`——BGM はクロック(位置・世代)を持たない
+    /// (`crates/mw-ffi/CLAUDE.md`「共有するもの・分けるもの」参照)ため、ここを
+    /// `bgm_state()` 相当の一本化されたストレージに統合することはできない
+    /// (統合すると BGM が誤って音楽クロックの世代・位置を持つかのようになってしまう)。
+    pub(crate) fn track_state(&self, target: MusicTarget) -> MusicState {
+        match target {
+            MusicTarget::Music => self.music_clock_snapshot().state,
+            MusicTarget::Bgm => self.bgm_state(),
+        }
     }
 
     /// 出力レイテンシの実測値([`Backend::output_latency_ns`])を取得する

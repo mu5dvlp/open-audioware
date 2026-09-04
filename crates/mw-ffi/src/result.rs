@@ -47,6 +47,45 @@ pub enum MwResult {
     ErrInvalidLoopRegion = -13,
 }
 
+// --- P1-6: `mw_core` のデコードエラー型からの変換 ----------------------------------
+//
+// `mw_core::wav::decode`(SE ロード, `load_se`)と `mw_core::SymphoniaDecoder::open`
+// (楽曲/BGM ロード, `mw_music_set`/`mw_bgm_set` の共有実体 `set_music_track`)は
+// エラーの種類こそ違う型(`WavError`/`DecodeError`)だが、どちらも「同じ理由付けで
+// 数個の `MwResult` エラーコードへ落とし込むだけ」の match だった(呼び出し側3箇所で
+// 実質同一の match 式が重複していた)。ここへ集約する——ログ出力(呼び出し元ごとに
+// 文言が違う)は呼び出し側に残したまま、コード変換だけをここへ寄せる設計
+// (`err.into()` の形で使う)。
+impl From<mw_core::WavError> for MwResult {
+    fn from(err: mw_core::WavError) -> Self {
+        match err {
+            mw_core::WavError::InvalidSampleRate(_) => MwResult::ErrUnsupportedSampleRate,
+            mw_core::WavError::Resample(_) => MwResult::ErrDecodeFailed,
+            mw_core::WavError::UnsupportedFormatTag(_)
+            | mw_core::WavError::UnsupportedBitsPerSample(_)
+            | mw_core::WavError::UnsupportedChannelCount(_) => MwResult::ErrUnsupportedFormat,
+            mw_core::WavError::Truncated
+            | mw_core::WavError::NotRiff
+            | mw_core::WavError::NotWave
+            | mw_core::WavError::MissingFmtChunk
+            | mw_core::WavError::MissingDataChunk => MwResult::ErrDecodeFailed,
+        }
+    }
+}
+
+impl From<mw_core::DecodeError> for MwResult {
+    fn from(err: mw_core::DecodeError) -> Self {
+        match err {
+            mw_core::DecodeError::InvalidSampleRate(_) => MwResult::ErrUnsupportedSampleRate,
+            mw_core::DecodeError::UnsupportedChannelCount(_) => MwResult::ErrUnsupportedFormat,
+            mw_core::DecodeError::Symphonia(_)
+            | mw_core::DecodeError::NoAudioTrack
+            | mw_core::DecodeError::Resample(_)
+            | mw_core::DecodeError::ResetRequired => MwResult::ErrDecodeFailed,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
