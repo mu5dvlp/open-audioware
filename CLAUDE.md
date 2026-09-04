@@ -2,6 +2,11 @@
 
 このファイルは短く保つ。詳細は索引先のドキュメントを参照すること。
 
+📌 **このリポジトリはワークスペース(1つ上の階層)の一部**で、client / server と合わせて
+開発している。**セッションを再開するときは、まずワークスペースの `docs/HANDOFF.md` を
+読むこと**(現在の状態・次にやること・未解決の問題がそこにある)。文書全体の地図は
+ワークスペースの `CLAUDE.md`。
+
 ## 唯一の正
 
 リポジトリ直下の**初期構築仕様**が、実装方針・決定事項・フェーズ計画の唯一の正。
@@ -23,6 +28,9 @@
 - [`crates/mw-backend/CLAUDE.md`](./crates/mw-backend/CLAUDE.md) — 出力デバイス抽象と cpal 実装
 - [`crates/mw-ffi/CLAUDE.md`](./crates/mw-ffi/CLAUDE.md) — C ABI 境界・エラーモデル・ハンドル管理
 - `docs/` — 肥大化する内容の切り出し先(統合手順・API リファレンス・ADR。M5 以降で拡充)
+- [`docs/history.md`](./docs/history.md) — 作業の経緯(索引。本体は `docs/history/`)
+- **ワークスペース全体の状態・次にやること** → 1つ上の階層の `docs/HANDOFF.md`
+- **踏んだ罠と教訓** → 1つ上の階層の `docs/LESSONS.md`
 
 ## Git 運用
 
@@ -31,6 +39,14 @@
 - フェーズ完了時にタグを打つ(例: `phase-m0`)
 - Git LFS は使わない。ビルド成果物(dylib / xcframework / so / 生成 C# バインディング /
   ゴールデン波形)はコミットしない(`.gitignore` を参照)
+
+🔴 **ネイティブバイナリは gitignore されている(追跡は `.meta` だけ)。**
+Rust を直しても、client 側で `make build-macos` / `build-ios` / `build-android` を回さないと
+**利用側に一切届かない**。回したあとは `strings` / `nm` でバイナリに入ったかまで確認する。
+⚠️ ただし**エクスポートシンボルが増減しない内部修正は `nm` / `strings` で新旧を見分けられない**
+——その場合の確認手段は実機での聴感だけになる(検証が弱いことを承知で受け入れる)。
+📌 **挙動を変えないリファクタ(例: P1-6 / P1-7)は焼き直し不要。** 判断の根拠は
+csbindgen が生成する `NativeMethods.g.cs` を前後で diff して同一かどうか。
 
 ## リアルタイム安全性
 
