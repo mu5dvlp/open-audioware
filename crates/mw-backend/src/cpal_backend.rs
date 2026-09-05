@@ -40,7 +40,7 @@ pub struct CpalBackend {
     ///
     /// `ios_interruption::Watcher` が「`pause()`→`play()` の戻り値」ではなく
     /// 「コールバックが実際に前進したか」を実測するために使う
-    /// (`ios_interruption.rs` モジュール doc「追記: `pause()`→`play()` が Ok を返しても
+    /// (`ios_interruption.rs` 調査記録「`pause()`→`play()` が Ok を返しても
     /// 無音のままだったケース」参照)。`callback_frames` と役割が近いが、こちらは
     /// 「呼ばれた回数そのもの」を見る専用のカウンタにしてある——`callback_frames`
     /// (直近のフレーム数)の値を比較する方式だと、同じバッファ長のコールバックが
@@ -466,7 +466,7 @@ fn build_output_stream(
                 callback_frames.store(frames_this_callback, Ordering::Relaxed);
 
                 // 復帰確認用のカウンタ(`CpalBackend::callback_ticks` のdoc、
-                // `ios_interruption.rs` モジュール doc「追記: `pause()`→`play()` が Ok を
+                // `ios_interruption.rs` 調査記録「`pause()`→`play()` が Ok を
                 // 返しても無音のままだったケース」参照)。relaxed な加算1回のみ——
                 // アロケーション・ロック・IO を伴わないためリアルタイム安全性規約
                 // (§5.3)に抵触しない。
@@ -594,7 +594,7 @@ mod tests {
     }
 
     /// iOS のルート変化(`AVAudioSessionRouteChangeNotification`)がここへ来ることは
-    /// 実機で確認済み(`ios_interruption.rs` モジュール doc「追記: ルート変化」参照)。
+    /// 実機で確認済み(`ios_interruption.rs` 調査記録「ルート変化」参照)。
     /// `Reconfigured` は「再構築すれば直る」という意味なので、iOS はここには来ず
     /// `ios_interruption::Watcher` が別経路で `pause()`→`play()` を試みる
     /// ——`err_fn` 経由のこの分類はあくまでイベント通知用で、iOS の復帰処理自体は

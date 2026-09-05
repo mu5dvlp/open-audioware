@@ -69,280 +69,34 @@
 //!   実際には音声セッションを中断しないため、無条件に `pause()`→`play()` すると
 //!   通常プレイ中に不要な音切れを生む(このガードが必要な理由)。
 //!
-//! ## 追記: ルート変化(Bluetooth 切断で SE が無音になる、2026-08-28)
+//! ## 実機で判明したこと(調査記録は `docs/history/09-2026-09-05.md`)
 //!
-//! ユーザー実機報告その2:「Bluetooth で繋いで、Bluetooth を解除したら SE が鳴らなくなる」。
-//! 根は同じ(cpal 0.18.1 の `Stream::play()` の内部 `playing` フラグが OS 主導の停止に
-//! 追随しない)だが、上記2つの通知だけでは塞げない——**ルート変化は割り込み
-//! (`AVAudioSessionInterruptionNotification`)とは別の通知
-//! (`AVAudioSessionRouteChangeNotification`)で飛んでくる**ため。
+//! 上の実装方針は、その後の実機報告(R12 / R13 / R24)で**2箇所が否定された**。
+//! いま実装が満たしている不変条件は次の3つで、**どれも実機でしか確かめられなかった**:
 //!
-//! **cpal 自身がルート変化時に何をしているかをソースで確認した**
-//! (`coreaudio::ios::session_event_manager.rs::route_change_error` /
-//! `host/error_emit.rs::emit_error`/`try_emit_error`)。結論: **cpal はルート変化の
-//! `reason` を分類して `error_callback`(＝このクレートが `build_output_stream` に渡した
-//! `err_fn`)を呼ぶだけ**で、`AudioUnit` にも `StreamInner.playing` フラグにも一切触れない
-//! (`emit_error`/`try_emit_error` の実装はユーザーのコールバックを呼ぶ1行だけ)。
-//! つまり cpal はストリームの作り直しも `stop`/`start` の呼び直しも一切しておらず、
-//! **二重処理の心配は無い**——復帰(`pause()`→`play()`)は完全にこちら側の責務。
-//! (この経路は元々 `err_fn` → `Event::StreamError` として M2-6 の時点から動いており、
-//! これ自体は変更していない。今回追加するのは別の observer から見た「復帰を試みるか」の
-//! 判断だけ)。
+//! 1. **`Began` は必ずしも飛んでこない。** バックグラウンド遷移では
+//!    `AVAudioSessionInterruptionNotification` の Began が届かないことがある(R12)。
+//!    そのため `UIApplicationDidEnterBackgroundNotification` を監視して
+//!    [`InterruptionState::Backgrounded`] へ倒し、前面復帰で必ず復帰を試みる。
+//! 2. **`NewDeviceAvailable` も復帰を要求する。** 当初は「新しい機器が生えただけなら
+//!    ストリームは止まらない」と判断して除外していたが、Bluetooth 再接続で無音になる
+//!    実機報告(R13)がこれを否定した([`RouteChangeReason::requires_recovery`])。
+//!    ⚠️ ただし `CategoryChange` は**意図的に除外したまま** —— 復帰処理自身が
+//!    カテゴリ変更を誘発して自己ループする。
+//! 3. **`pause()`→`play()` が `Ok` を返しても、鳴っているとは限らない。**(R24)
+//!    `AudioOutputUnitStart` の成功と音声コールバックの再開は別事象なので、
+//!    **コールバックが実際に前進したかを実測して確認する**
+//!    ([`confirm_recovery_progress`] / `RECOVERY_WAIT_SCHEDULE_MS`)。
 //!
-//! **`AVAudioSessionRouteChangeReason::OldDeviceUnavailable` のときだけ復帰を試みる**
-//! ([`RouteChangeReason::requires_recovery`] 参照)。判断根拠:
+//! 🔴 **どこまで疑って何が否定されたかの全記録は
+//! [`docs/history/09-2026-09-05.md`](../../../docs/history/09-2026-09-05.md) にある。**
+//! 同じ症状が再発したらそこから読むこと(**このモジュール doc には積み増さない**——
+//! 400行まで膨らんで実装本体に匹敵していたのを 2026-09-05 に移した)。
 //!
-//! (🔴 2026-08-29 追記: この判断のうち `NewDeviceAvailable` を除外する部分は、
-//! 後日実機で否定された。詳細は下記「追記: Bluetooth 再接続で無音になるケース」節
-//! 参照。現在の実装は `OldDeviceUnavailable` と `NewDeviceAvailable` の両方で
-//! 復帰を試みる。以下は当時の判断とその根拠——経緯として残す。)
-//!
-//! - Apple のドキュメント上 `OldDeviceUnavailable` は「直前まで使っていたデバイスが
-//!   無くなった(例: ヘッドフォンが抜かれた)」——BT 切断はまさにこれで、実機報告と一致する。
-//!   cpal 自身もこの reason だけを他(`CategoryChange`/`Override`/
-//!   `RouteConfigurationChange`)と別グループ(`ErrorKind::DeviceChanged`)に分類している
-//! - `NewDeviceAvailable`(BT 接続・イヤホン挿し込み)や `Override`
-//!   は音が途切れず自動的に継続するのが通例。ここで復帰を試みると**正常なルート切替の
-//!   たびに不要な音切れを生む**(`on_app_became_active` と同じ配慮。依頼書の警告どおり)
-//!   ——🔴 **`NewDeviceAvailable` についてこの判断は実機で否定された**(Bluetooth
-//!   再接続で無音になる実機報告 R13。「追記: Bluetooth 再接続で無音になるケース」節
-//!   参照)。`Override` は実機報告が無いため据え置いている
-//! - `CategoryChange` には反応しない——`ios_session::configure()` 自身が
-//!   `setCategory_error` を呼ぶため、復帰処理が自分自身のカテゴリ再設定をトリガーに
-//!   拾ってしまう自己誘発ループの懸念がある(実機で確認できていないため、疑わしきは
-//!   反応しない側に倒した)
-//! - `NoSuitableRouteForCategory`(そもそも鳴らせるルートが無い)は `pause()`→`play()`
-//!   をしても改善しない。`RouteConfigurationChange`/`WakeFromSleep`/`Unknown` は
-//!   今回の実機報告に対応する根拠が無いため見送り(将来別の報告が来たら再検討する)
-//!
-//! **`Event::RouteChanged` はルート変化なら reason を問わず毎回発火する**
-//! (`requires_recovery` の判定とは独立)。これは初期構築仕様『§6 テンプレートとの連携
-//! ポイント』が元々予定していた「ルート変化イベントの経路」(テンプレート側のオフセット
-//! 自動再較正用)で、このモジュールが新設されるまで型だけ予約されて発火していなかった
-//! (`mw_core::event::Event::RouteChanged` のドキュメント参照)。今回そのまま繋いだ——
-//! 復帰(`AudioInterruptionEnded`)とは別軸の情報なので、混ぜずに両方積む。
-//!
-//! ## 追記: `DidBecomeActive` 安全網の前提が崩れていたケース(実機 R12、2026-08-29)
-//!
-//! ユーザー実機報告 R12「iOS でホームに戻って復帰すると音が出ない」。8d90724(このモジュール
-//! 新設。Interruption + `DidBecomeActive` 安全網)と 19099a1(ルート変化対応)を経てもなお
-//! **実機ではまだ直っていなかった**(ユーザー再回答: SE も楽曲も両方鳴らない = 個別ボイスでは
-//! なく出力ストリームごと死んでいることが確定)。
-//!
-//! 上の「実装方針」節にはこう書いていた——「上記の Began は確実に飛んでくる」。これは
-//! Apple のドキュメント・WWDC セッションを根拠にしていたが、**実機の症状はこの前提が
-//! 崩れていることと完全に整合していた**。[`InterruptionState::on_app_became_active`] は
-//! 元々 `Interrupted`/`RecoveryFailed` のときしか `RecoveryPending` へ遷移しなかった。
-//! つまり `AVAudioSessionInterruptionNotification` の Began が(何らかの理由で)一度も
-//! 飛んでこないままバックグラウンドへ行った場合、状態は `Running` のまま変わらず、
-//! 前面復帰で `DidBecomeActive` が飛んできても安全網が一切働かない——ガードに阻まれて
-//! `needs_recovery_attempt()` が `false` のままになり、`pause()`→`play()` が呼ばれない。
-//! 「対応する Ended が確実に飛んでくる保証が無い」という当初の懸念(上記「実装方針」節)は
-//! 正しかったが、**その保険自体が「Began は必ず飛んでくる」という別の未検証の前提の上に
-//! 乗っていた**ため、Began も飛んでこないケースには無力だった。
-//!
-//! **対応: `UIApplicationDidEnterBackgroundNotification` を新たな判別子として追加監視し、
-//! 「実際に背面へ回った」事実そのものを [`InterruptionState::Backgrounded`] として持つ。**
-//! Interruption の Began/Ended が飛ぶかどうかに一切依存しない独立した経路にすることで、
-//! 「Began が確実に飛んでくる」という崩れた前提への依存を無くした。
-//!
-//! これが正しい判別子である理由(「実装方針」節のガード——Control Center・通知バナーでの
-//! 誤発火防止——を壊さないための根拠):
-//!
-//! - **Control Center の引き下ろし・通知バナー表示では `UIApplicationDidEnterBackgroundNotification`
-//!   は飛んでこない**(アプリはあくまで前面のまま。UIKit のアプリライフサイクル上、これらで
-//!   飛ぶのは `UIApplicationWillResignActiveNotification` までで、`DidEnterBackground` は
-//!   アプリが本当に非アクティブ空間(バックグラウンド)へ遷移したときにしか飛ばない)。
-//!   つまり `on_app_became_active` の既存ガード(`Running`/`Recovered` から無条件に
-//!   `pause()`→`play()` しない——通常プレイ中の不要な音切れ防止)が守ろうとしていたものを
-//!   一切損なわずに、「本当に背面へ行った」ケースだけを拾える。
-//! - Began/Ended の到達を一切前提にしない——`Backgrounded` は `DidEnterBackground` 単独で
-//!   立つ状態であり、`on_app_became_active` はここからも無条件で `RecoveryPending` へ
-//!   遷移する([`InterruptionState::on_app_became_active`] 参照)。
-//!
-//! **観測性(この修正でも直らなかった場合に実機ログで切り分けるため)も合わせて足した:**
-//!
-//! - `DidEnterBackground` 到達時に遷移前の状態(`previous_state`)をログへ出す——ログに
-//!   この行が実機で1行も出ていなければ、`DidEnterBackground` 自体が届いていない
-//!   (今回の仮説とは別の穴がある)ことが分かる。
-//! - `DidBecomeActive` 到達時、復帰を試みる場合は遷移前の状態(`previous_state`)を
-//!   ログへ出す。`previous_state=Backgrounded` なら今回追加した経路(Began 未到達)、
-//!   `previous_state=Interrupted`/`RecoveryFailed` なら従来の経路(Began は届いていた)
-//!   ——実機でどちらが起きていたか判別できる。
-//! - `attempt_recovery` にどの通知が起点だったか(`trigger`。Interruption Ended /
-//!   DidBecomeActive / RouteChange のいずれか。DidBecomeActive の場合は上記
-//!   `previous_state` でさらに内訳が分かる)をログへ出す。
-//! - `stream.play()` の成否を**成功時も**ログへ出すようにした(従来は失敗時のみ)。
-//!   実機で「`stream restart succeeded` のログは出ているのに無音」であれば、
-//!   このモジュールの復帰処理自体は正常に動いており、原因は別の層
-//!   (`Renderer`/`Mixer` 側やそもそもの音声グラフ)にあると切り分けられる。
-//!
-//! ## 追記: 実機ログで R12 の修正を確認・Began 未達を確定(2026-08-29)
-//!
-//! 上の「追記: `DidBecomeActive` 安全網の前提が崩れていたケース」節を実装した後、
-//! ユーザーの実機ログで結果が確認できた:
-//!
-//! ```text
-//! -> applicationDidEnterBackground()
-//! [mw-backend] app entered background (previous_state=Running); will attempt recovery on next activation
-//! -> applicationDidBecomeActive()
-//! [mw-backend] app became active while unresolved (previous_state=Backgrounded); attempting recovery
-//! [mw-backend] ios_interruption: stream restart succeeded (pause+play, trigger=AppBecameActive { previous_state: Backgrounded })
-//! ```
-//!
-//! 🔴 **`previous_state=Running` が重要。** `DidEnterBackground` に到達した時点で
-//! `InterruptionState` は `Running` のままだった——つまり `AVAudioSessionInterruptionNotification`
-//! の Began は**一度も飛んでいない**。上の「実装方針」節が前提にしていた「上記の Began は
-//! 確実に飛んでくる」は、**この実機ログにより誤りだったことが確定した**(前の追記時点
-//! では「症状と整合していた」という状況証拠に留まっていたが、これは推測ではなく確定した
-//! 事実になった)。そのうえで `previous_state=Backgrounded` から復帰要求へ、
-//! `stream restart succeeded` まで到達しており、**R12(ホーム復帰で無音になる)はこの
-//! 修正で直ったことが実機で確認できた**。
-//!
-//! ## 追記: Bluetooth 再接続で無音になるケース(実機 R13、2026-08-29)
-//!
-//! ユーザー実機報告その3:
-//!
-//! | 操作 | 結果 |
-//! |---|---|
-//! | Bluetooth **切断** → 内蔵スピーカーへ | 鳴る |
-//! | Bluetooth **再接続** | **鳴らない** |
-//! | ホームに戻ってアプリに戻る | 鳴るようになった |
-//!
-//! 3行目(ホーム復帰で鳴るようになった)は、上の「追記: 実機ログで R12 の修正を確認」節の
-//! 経路(`DidEnterBackground`→`DidBecomeActive`→`attempt_recovery`)がそのまま動いた結果で、
-//! **`attempt_recovery` 自体は正しく動作することの傍証になる**。足りなかったのは
-//! 「Bluetooth 再接続」という契機を復帰のトリガーとして拾っていなかったことだけ。
-//!
-//! 上の「追記: ルート変化」節はこう書いていた——「`NewDeviceAvailable`(BT 接続・イヤホン
-//! 挿し込み)や `Override` は音が途切れず自動的に継続するのが通例。ここで復帰を試みると
-//! 正常なルート切替のたびに不要な音切れを生む」。**この `NewDeviceAvailable` に関する
-//! 判断は実機で否定された。** Bluetooth 再接続(`NewDeviceAvailable`)では音が自動的には
-//! 継続せず、無音のまま固まる——おそらく cpal 0.18.1 の `playing` フラグが OS 主導の
-//! ルート切替(出力先が変わってユニットが再構成される)に追随しないという、モジュール doc
-//! 冒頭「実機バグの原因」に書いた根本原因が、`OldDeviceUnavailable` だけでなく
-//! `NewDeviceAvailable` でも起きるということ。
-//!
-//! **対応: [`RouteChangeReason::requires_recovery`] に `NewDeviceAvailable` を追加した。**
-//! `OldDeviceUnavailable` と `NewDeviceAvailable` の両方で復帰(`pause()`→`play()`)を
-//! 試みる。
-//!
-//! 他の reason をどうしたかの判断根拠:
-//!
-//! - 🔴 **`CategoryChange` は引き続き除外する。** `attempt_recovery` は
-//!   `crate::ios_session::configure()` を呼び、これ自身が内部で `setCategory_error` を
-//!   呼ぶ。`CategoryChange` にも反応させると「復帰処理が自分自身のカテゴリ再設定を
-//!   トリガーに拾って再度復帰処理を呼ぶ」自己誘発ループになりうる——ここは実機報告が
-//!   無いまま緩めるにはリスクが高すぎるため、当初の判断のまま維持する。
-//! - `Override` は今回も実機報告が無いため据え置く(復帰を試みない)。`NewDeviceAvailable`
-//!   について判断が覆ったからといって `Override` も同様に覆ると推測する根拠が無い——
-//!   実機報告があった reason だけを直し、無い reason は現状維持という最小変更に留めた。
-//! - `RouteConfigurationChange`/`WakeFromSleep`/`Unknown`/`NoSuitableRouteForCategory`
-//!   (= `RouteChangeReason::Other`)も同じ理由で据え置く。
-//!
-//! **観測性の穴も見つかった:** ユーザーが貼った実機ログには、BT の切断・再接続の前後で
-//! `route changed` のログが1行も出ていなかった。原因の切り分けとして3通り考えられる——
-//! (a) ログの貼り漏れ、(b) `AVAudioSessionRouteChangeNotification` の observer が
-//! そもそも発火していない、(c) `route_change_reason()` が `None` を返し、
-//! `handle_route_change_notification` が**ログを出す前に** `return` していた。
-//!
-//! ⚠️ **(c) は実際にあり得た。** 修正前の実装は
-//! `let Some(reason) = route_change_reason(notif) else { return; };` で、reason の解釈に
-//! 失敗すると**何も記録せずに黙って捨てる**形になっていた。**このプロジェクトが何度も
-//! 踏んできた「黙って捨てる」罠**そのものなので、通知を受け取った事実そのものを reason の
-//! 解釈より前にログするよう `handle_route_change_notification` を直した
-//! (`AVAudioSession route change notification received` を先に出し、reason の解釈に
-//! 失敗した場合もそれを明示的にログする)。次に実機で BT 切断・再接続を試したとき、
-//! この行が出るかどうかで (a)(b)(c) を切り分けられる。
-//!
-//! ## 追記: `pause()`→`play()` が Ok を返しても無音のままだったケース(実機 R24、2026-08-30)
-//!
-//! ユーザー実機報告その4——今度は Bluetooth を**切断**したときの実機ログ:
-//!
-//! ```text
-//! [mw-backend] output stream error: Audio route changed
-//! [mw-backend] AVAudioSession route change notification received
-//! [mw-backend] AVAudioSession route changed (reason=OldDeviceUnavailable)
-//! [mw-backend] ios_interruption: attempting recovery (trigger=RouteChange { reason: OldDeviceUnavailable })
-//! [mw-backend] AVAudioSession configured: sample_rate=48000 Hz, io_buffer=5.000 ms, output_latency=17.917 ms, output_channels=2
-//! [mw-backend] ios_interruption: stream restart succeeded (pause+play, trigger=RouteChange { reason: OldDeviceUnavailable })
-//! -> applicationDidEnterBackground
-//! [mw-backend] app entered background (previous_state=Recovered); will attempt recovery on next activation
-//! -> applicationDidBecomeActive
-//! [mw-backend] app became active while unresolved (previous_state=Backgrounded); attempting recovery
-//! [mw-backend] ios_interruption: stream restart succeeded (pause+play, trigger=AppBecameActive { previous_state: Backgrounded })
-//! ```
-//!
-//! 🔴 **1回目の `stream restart succeeded` ログが出ているのに、実際には無音のままだった。**
-//! `previous_state=Recovered` から分かる通り、`InterruptionState` は「復帰済み」に
-//! 遷移していた——つまり `on_recovery_attempted(true)` が呼ばれていた。ところが2回目
-//! (バックグラウンド往復を経て `AppBecameActive` から再試行された)の、**全く同じ**
-//! `pause()`→`play()` 呼び出しで実際に音が戻った。同じ呼び出しが1回目は空振り、
-//! 2回目は効いたということは、**AudioUnit 自体は死んでおらず、`AudioOutputUnitStart`
-//! が実際に効果を持つまでのタイミングの問題**である可能性が高いと判断した——
-//! cpal 0.18.1 の `err_fn` はルート変化時に `AudioUnit`/`playing` フラグへ一切触れない
-//! ことは「追記: ルート変化」節で確認済みなので、cpal 自身による二重処理が原因ではない。
-//!
-//! **根本原因: `attempt_recovery` が「復帰できたか」を `stream.play()` の戻り値だけで
-//! 判定していた。** `Result::Ok` は「`AudioOutputUnitStart` の呼び出し自体がエラーを
-//! 返さなかった」ことしか意味せず、「実際に音声コールバックが再び呼ばれているか」を
-//! 何も保証しない。今回のログはこの2つが乖離した実例そのもの——1回目は `Ok` だが
-//! コールバックは進んでおらず、それでも `InterruptionState` は `Recovered` になった。
-//! 直後の `DidBecomeActive` は `on_app_became_active` の既存ガード(`Running`/
-//! `RecoveryPending`/`Recovered` では何もしない——「実装方針」節参照)に阻まれて
-//! 何も試みない。たまたまユーザーがホームへ行って `DidEnterBackground`→
-//! `DidBecomeActive` の安全網(R12 の修正)を踏んだから音が戻っただけで、**アプリを
-//! 前面に置いたままでは永久に無音のままだったはず**。
-//!
-//! **対応: 「復帰できたか」の判定を `play()` の戻り値ではなく、音声コールバックが実際に
-//! 前進したかの実測へ置き換えた。** `CpalBackend` に単調増加のカウンタ
-//! `callback_ticks`(`cpal_backend.rs::CpalBackend::callback_ticks` 参照)を足し、
-//! `attempt_recovery` は `pause()`→`play()` の前後でこのカウンタを比較する。進んで
-//! いなければ `pause()`→`play()` を**呼び直し**、段階的に待機時間を伸ばしながら
-//! 再確認する([`RECOVERY_WAIT_SCHEDULE_MS`] / [`confirm_recovery_progress`] 参照)。
-//! 全ステップで進行が確認できなければ `InterruptionState::RecoveryFailed` として扱う
-//! ——これにより次の `DidBecomeActive`(または新しいルート変化・割り込み)で
-//! 自動的に再試行される。「ユーザーが手動でホームへ行かないと直らない」という
-//! 偶然の救済に頼らない設計にした。
-//!
-//! **判定ロジック(`RECOVERY_WAIT_SCHEDULE_MS` / `confirm_recovery_progress`)は
-//! CoreAudio に一切依存しない純粋な関数として`imp`モジュールの外に切り出した**
-//! ——`InterruptionState`/`RouteChangeReason` と同じ設計判断(下記「自動テストで守れる
-//! 範囲・守れない範囲」参照)。副作用(`pause()`→`play()` の呼び直し・実際のスリープ・
-//! カウンタの読み出し)はすべて呼び出し側からクロージャで注入する形にしたので、
-//! macOS/Linux でも単体テストで固定化できる(本ファイル末尾の `tests` モジュール参照)。
-//!
-//! **待機は `std::thread::sleep` を使う(ブロッキング)。** この経路は音声スレッドでは
-//! ないので §5.3 の対象外(「パニック安全性」節・`ios_session::configure()` の呼び出しと
-//! 同じ扱い)ではあるが、**「observer ブロックを実行する非リアルタイムスレッドをブロック
-//! するだけで実害は無い」という当初の判断は誤りだった(2026-09-03 是正、P0-6)**。
-//! `addObserverForName_object_queue_usingBlock` は `queue` に `None` を渡すと、ブロックを
-//! **通知を post したスレッド上で同期実行する**契約になっており
-//! (`NSNotificationCenter` のドキュメント上の挙動)、`UIApplicationDidBecomeActiveNotification`
-//! はじめ UIKit の通知は必ずメインスレッドから post される。つまり `queue: None` の
-//! observer 登録は**そのままメインスレッド(= UI スレッド)上で `attempt_recovery` を
-//! 同期実行する**ことを意味し、全ステップ空振りした最悪ケースの合計 370ms
-//! (= 20+50+100+200ms)は丸ごとメインスレッドのブロックになる——60fps 換算で約22フレーム
-//! ぶんのヒッチであり、「UI をブロックしない」という前提は成立していなかった。
-//!
-//! **対応: `confirm_recovery_progress` の呼び出し(=待機ループ本体)を専用のワーカー
-//! スレッドへ移した。** `attempt_recovery` は「1回目の `pause()`→`play()`(高速な
-//! CoreAudio 呼び出しのみ、ブロッキング待機を含まない)」までを通知ハンドラのスレッド
-//! (= メインスレッドでありうる)上で同期実行し、**そこで即座に返る**。実際に待機を
-//! 伴う確認・再試行(`confirm_recovery_progress` とその戻り値に基づく状態更新・イベント
-//! 発火)は `std::thread::spawn` した専用スレッドへ丸ごと委譲する(下記
-//! `attempt_recovery` 参照)。これにより observer ブロックそのものは即座に返るようになり、
-//! メインスレッドは一切ブロックされない。「NSOperationQueue を observer に渡す」という
-//! 代替案(cpal 自身の `session_event_manager.rs` と同じパターンで、監視対象4通知すべてを
-//! 丸ごと非メインスレッドへ渡す)も検討したが、(1) 4つの observer 全体の実行順序保証
-//! (`state: Mutex<InterruptionState>` が前提とする「割り込み Began → Ended」等の
-//! 順序)を `NSOperationQueue` の `maxConcurrentOperationCount` で明示的に直列化し直す
-//! 追加の考慮が要ること、(2) 問題の本質は「復帰確認の待機ループ」だけであり通知の
-//! 検知・状態遷移自体は軽量で移す必要が無いこと、の2点から見送った——影響範囲を
-//! 「実際にブロックしていた箇所」だけに絞れるワーカースレッド方式を採用した。
-//! **復帰が1回目で確認できる通常ケースでも、この待機(20ms)自体はメインスレッドから
-//! 完全に切り離されている**(以前のように「短ければ実害が無い」という程度問題ではなく、
-//! 構造的にメインスレッドを一切ブロックしなくなった)。
+//! 📌 **本ファイル中の「…」による節参照は、すべてその調査記録の節を指す**
+//! (「ルート変化」/「`DidBecomeActive` 安全網の前提が崩れていたケース」/
+//! 「実機ログで R12 の修正を確認」/「Bluetooth 再接続で無音になるケース」/
+//! 「`pause()`→`play()` が Ok を返しても無音のままだったケース」の5つ)。
 //!
 //! ## パニック安全性
 //!
@@ -362,23 +116,23 @@
 //! 「ベニンな(実際には中断していない)アクティブ化では何もしない」ガード、
 //! 「`OldDeviceUnavailable` と `NewDeviceAvailable` が復帰を要求し、それ以外の
 //! ルート変化 reason(`CategoryChange` を含む——自己誘発ループ防止のため意図的に除外。
-//! 「追記: Bluetooth 再接続で無音になるケース」参照)は状態を一切変えない」ガード
+//! 「Bluetooth 再接続で無音になるケース」参照)は状態を一切変えない」ガード
 //! ([`RouteChangeReason::requires_recovery`] / [`InterruptionState::on_route_changed`])、
-//! そして追記で足した
+//! そして調査記録の R12 節で足した
 //! 「Began が一度も来ないままバックグラウンドへ行っても、前面復帰したら復帰を試みる」
 //! ([`InterruptionState::Backgrounded`] / [`InterruptionState::on_app_entered_background`])
 //! の4つをカバーする。`DidEnterBackground` が実機で本当に飛んでくるか、`pause()`→`play()`
 //! の順序で `AudioOutputUnitStart` が実際に音を復活させるかは実機検証でしか確認できない
-//! ——前者は上の「追記: 実機ログで R12 の修正を確認」節で確認済み。`NewDeviceAvailable`
+//! ——前者は上の「実機ログで R12 の修正を確認」節で確認済み。`NewDeviceAvailable`
 //! を復帰要求に追加したことが Bluetooth 再接続で実際に無音を解消するか、また
 //! `AVAudioSessionRouteChangeNotification` がそもそも実機で発火しているかは、
-//! 「追記: Bluetooth 再接続で無音になるケース」節に書いた次の実機テストでのみ確認できる。
+//! 「Bluetooth 再接続で無音になるケース」節に書いた次の実機テストでのみ確認できる。
 //!
 //! **5つ目: `pause()`→`play()` が実際にコールバックを前進させたかの判定
 //! ([`confirm_recovery_progress`])。** これも `InterruptionState` と同じ理由で
 //! CoreAudio 非依存の純粋な関数として切り出し、「成功が1回目で確認できる」「途中の
 //! 再試行で確認できる」「最後まで確認できない」の3ケースを単体テストで固定化した
-//! (モジュール doc「追記: `pause()`→`play()` が Ok を返しても無音のままだったケース」
+//! (調査記録「`pause()`→`play()` が Ok を返しても無音のままだったケース」
 //! 参照)。ただし `AudioOutputUnitStart` 後に実際に何 ms で音声コールバックが再開する
 //! かという実機の生の値そのものは自動テスト不可——`RECOVERY_WAIT_SCHEDULE_MS` の
 //! 妥当性(20msで足りるか、370ms待っても復帰しない実機ケースがあるか)は次の実機
@@ -423,7 +177,7 @@ pub enum InterruptionState {
     RecoveryFailed,
     /// 実際にバックグラウンドへ遷移した(`UIApplicationDidEnterBackgroundNotification`)。
     /// `AVAudioSessionInterruptionNotification` の Began が(何らかの理由で)一度も
-    /// 飛んでこないままバックグラウンドへ行った場合の安全網——モジュール doc「追記:
+    /// 飛んでこないままバックグラウンドへ行った場合の安全網——調査記録「
     /// `DidBecomeActive` 安全網の前提が崩れていたケース」参照。前面復帰時
     /// ([`InterruptionState::on_app_became_active`])に無条件で `RecoveryPending` へ遷移する。
     Backgrounded,
@@ -460,7 +214,7 @@ impl InterruptionState {
     /// アプリがアクティブになった(`UIApplicationDidBecomeActiveNotification`)。
     ///
     /// 割り込み中だった(`Interrupted`)、前回の復帰に失敗していた(`RecoveryFailed`)、
-    /// または実際にバックグラウンドへ行っていた(`Backgrounded`。モジュール doc「追記:
+    /// または実際にバックグラウンドへ行っていた(`Backgrounded`。調査記録「
     /// `DidBecomeActive` 安全網の前提が崩れていたケース」参照)場合のみ復帰を試みる。
     /// それ以外(`Running`/`RecoveryPending`/`Recovered`)では何もしない——実際には
     /// 中断していないアクティブ化(Control Center・通知バナー等)のたびに
@@ -487,7 +241,7 @@ impl InterruptionState {
     /// (アプリは前面のままで、これらで飛ぶのは `UIApplicationWillResignActiveNotification`
     /// まで)。そのため `on_app_became_active` の既存ガード(実際には中断していない
     /// アクティブ化での不要な音切れ回避)を壊さずに、「本当に背面へ行った」ケースだけを
-    /// 判別子として使える(モジュール doc「追記: `DidBecomeActive` 安全網の前提が
+    /// 判別子として使える(調査記録「`DidBecomeActive` 安全網の前提が
     /// 崩れていたケース」参照)。
     pub fn on_app_entered_background(self) -> Self {
         Self::Backgrounded
@@ -497,7 +251,7 @@ impl InterruptionState {
     /// [`RouteChangeReason::requires_recovery`] で復帰要否を判断済みの値を渡す。
     ///
     /// 復帰が要る reason(`OldDeviceUnavailable` と `NewDeviceAvailable`。モジュール doc
-    /// 「追記: ルート変化」および「追記: Bluetooth 再接続で無音になるケース」参照)
+    /// 「ルート変化」および「Bluetooth 再接続で無音になるケース」参照)
     /// ならどの状態からでも `RecoveryPending` へ(割り込み中に新しい割り込みが来る
     /// のと同じ「最新の事実を優先」設計)。**要らない reason は現状を一切変えない**
     /// (`self` をそのまま返す)——正常なルート切替(ヘッドフォン挿し込み等)のたびに
@@ -546,7 +300,7 @@ pub enum RouteChangeReason {
     /// 新しいデバイスが使えるようになった(例: Bluetooth 接続・イヤホン挿し込み)。
     /// 実機報告「Bluetooth を再接続すると SE が鳴らなくなる」(R13)に対応する reason
     /// ——当初は「音が途切れず自動的に継続するのが通例」としてここに反応しない判断
-    /// だったが、実機で否定された(モジュール doc「追記: Bluetooth 再接続で無音になる
+    /// だったが、実機で否定された(調査記録「Bluetooth 再接続で無音になる
     /// ケース」参照)。
     NewDeviceAvailable,
     /// オーディオカテゴリが変わった。`ios_session::configure()` 自身が
@@ -562,8 +316,8 @@ pub enum RouteChangeReason {
 impl RouteChangeReason {
     /// この reason で復帰(セッション再アクティブ化 + `pause()`→`play()`)を試みるべきか。
     ///
-    /// **`OldDeviceUnavailable` と `NewDeviceAvailable` が `true`。** 判断根拠はモジュール
-    /// doc「追記: ルート変化」および「追記: Bluetooth 再接続で無音になるケース」に詳述——
+    /// **`OldDeviceUnavailable` と `NewDeviceAvailable` が `true`。** 判断根拠は調査記録
+    /// 「ルート変化」および「Bluetooth 再接続で無音になるケース」に詳述——
     /// 要約すると、当初は `OldDeviceUnavailable` だけが Apple のドキュメント上「直前まで
     /// 使えていたものが無くなった」ことを意味すると判断していたが、`NewDeviceAvailable`
     /// (Bluetooth 再接続等)でも音が自動的には継続せず無音になることが実機報告(R13)で
@@ -578,7 +332,7 @@ impl RouteChangeReason {
 /// [`confirm_recovery_progress`] が「1回目の確認」から「最後の再試行」まで辿る待機
 /// スケジュール(ミリ秒)。CoreAudio に一切依存しない定数——`InterruptionState`/
 /// `RouteChangeReason` と同じ理由で、macOS/Linux でもコンパイル・テストできるように
-/// `imp`(iOS/tvOS 専用)モジュールの外に置いてある(モジュール doc「追記:
+/// `imp`(iOS/tvOS 専用)モジュールの外に置いてある(調査記録「
 /// `pause()`→`play()` が Ok を返しても無音のままだったケース」参照)。
 ///
 /// 各要素は「その回で(2回目以降は追加の `pause()`→`play()` を呼んだ後に)待つ時間」。
@@ -594,7 +348,7 @@ pub const RECOVERY_WAIT_SCHEDULE_MS: [u64; 4] = [20, 50, 100, 200];
 /// 指定時間のブロッキング待機、現在のカウンタの読み出し)はすべて呼び出し側から
 /// クロージャで注入する形にしてあり、`InterruptionState`/`RouteChangeReason` と同じ
 /// 「判定ロジックはここに閉じ込め、副作用は呼び出し側」という設計に倣った
-/// (モジュール doc「追記: `pause()`→`play()` が Ok を返しても無音のままだったケース」
+/// (調査記録「`pause()`→`play()` が Ok を返しても無音のままだったケース」
 /// 参照)。これにより本ファイル末尾の `tests` で macOS 上でも固定化できる。
 ///
 /// - `ticks_before`: 呼び出し側が1回目の `pause()`→`play()` を呼ぶ**前**に読んでおいた
@@ -647,7 +401,7 @@ impl Watcher {
     /// (`EventQueue::push_side_channel`。ここは音声スレッドではないので §5.3 の対象外)。
     /// `callback_ticks` は `CpalBackend` が持つ「音声コールバックが呼ばれた回数」の
     /// 単調増加カウンタ(`Arc` 共有)——`pause()`→`play()` が実際にコールバックを
-    /// 前進させたかを実測するために使う(モジュール doc「追記: `pause()`→`play()` が
+    /// 前進させたかを実測するために使う(調査記録「`pause()`→`play()` が
     /// Ok を返しても無音のままだったケース」参照)。
     ///
     /// `CpalBackend::open` から、ストリームを `play()` した直後に呼ぶこと
@@ -782,7 +536,7 @@ mod imp {
                 });
                 // UIKit 側の通知名。`objc2-ui-kit` を新規依存に追加せず、文字列リテラルから
                 // 直接 NSString を作る(`UIApplicationDidBecomeActiveNotification` と同じ
-                // 理由づけ、下記参照)。モジュール doc「追記: `DidBecomeActive` 安全網の前提が
+                // 理由づけ、下記参照)。調査記録「`DidBecomeActive` 安全網の前提が
                 // 崩れていたケース」参照——Began が一度も飛んでこないままバックグラウンドへ
                 // 行った場合の安全網として、この通知を新たな判別子に使う。
                 let name = ns_string!("UIApplicationDidEnterBackgroundNotification");
@@ -849,7 +603,7 @@ mod imp {
                 // SAFETY: `AVAudioSessionRouteChangeNotification` はプロセス生存中変化しない
                 // 静的な通知名。cpal 自身も同じ通知を独立した observer で監視しているが
                 // (`session_event_manager.rs`)、NSNotificationCenter は同一通知に対する
-                // 複数 observer を問題なく許容する(モジュール doc「追記: ルート変化」で
+                // 複数 observer を問題なく許容する(調査記録「ルート変化」で
                 // 確認済み——cpal 側は `error_callback` を呼ぶだけで `AudioUnit`/`playing`
                 // フラグには一切触れないため、二重処理にはならない)。
                 if let Some(name) = unsafe { AVAudioSessionRouteChangeNotification } {
@@ -933,7 +687,7 @@ mod imp {
     /// (`handle_became_active`)またはルート変化・割り込み終了の契機で行う)。
     ///
     /// `previous_state` をログへ出す。実機でこの行が1行も出なければ
-    /// `DidEnterBackground` 自体が届いていないことが分かる(モジュール doc「追記:
+    /// `DidEnterBackground` 自体が届いていないことが分かる(調査記録「
     /// `DidBecomeActive` 安全網の前提が崩れていたケース」の観測性節参照)。
     fn handle_entered_background(state: &Mutex<InterruptionState>) {
         let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
@@ -951,7 +705,7 @@ mod imp {
     /// 復帰を試みる場合、遷移前の状態(`previous_state`)をログへ出す——
     /// `previous_state=Backgrounded` なら「Began が一度も来ないままバックグラウンドへ
     /// 行った」今回追加した経路、`Interrupted`/`RecoveryFailed` なら従来の経路
-    /// (Began は届いていた)だったと実機ログから判別できる(モジュール doc「追記:
+    /// (Began は届いていた)だったと実機ログから判別できる(調査記録「
     /// `DidBecomeActive` 安全網の前提が崩れていたケース」の観測性節参照)。
     fn handle_became_active(
         state: &Arc<Mutex<InterruptionState>>,
@@ -989,7 +743,7 @@ mod imp {
         // 通知を受け取った事実そのものを reason の解釈より前にログする。以前は
         // `route_change_reason` が `None` を返すとログより先に `return` していたため、
         // userInfo の取得やキャストに失敗すると何も記録せずに黙って捨てていた
-        // (このプロジェクトが何度も踏んできた罠。モジュール doc「追記: Bluetooth
+        // (このプロジェクトが何度も踏んできた罠。調査記録「Bluetooth
         // 再接続で無音になるケース」参照)。
         crate::mw_log!("[mw-backend] AVAudioSession route change notification received");
         let Some(reason) = route_change_reason(notif) else {
@@ -1001,7 +755,7 @@ mod imp {
         };
         crate::mw_log!("[mw-backend] AVAudioSession route changed (reason={reason:?})");
 
-        // `Event::RouteChanged` は reason を問わず毎回発火する(モジュール doc「追記:
+        // `Event::RouteChanged` は reason を問わず毎回発火する(調査記録「
         // ルート変化」参照。テンプレート側のオフセット再較正用で、復帰要否とは別軸)。
         events.push_side_channel(Event::RouteChanged);
 
@@ -1049,7 +803,7 @@ mod imp {
 
     /// 復帰を試みた起点(観測性のためだけの値。`InterruptionState` の遷移ロジックには
     /// 一切影響しない)。`attempt_recovery` のログに出し、実機でどの通知経由の復帰
-    /// だったかを判別できるようにする(モジュール doc「追記: `DidBecomeActive` 安全網の
+    /// だったかを判別できるようにする(調査記録「`DidBecomeActive` 安全網の
     /// 前提が崩れていたケース」の観測性節参照)。
     #[derive(Debug, Clone, Copy)]
     enum RecoveryTrigger {
@@ -1080,7 +834,7 @@ mod imp {
     /// `pause()` でフラグを倒してから `play()` を呼ぶ)。
     ///
     /// 🔴 **`stream.play()` が `Ok` を返しても実際には無音のままのケースが実機で
-    /// 確認された**(モジュール doc「追記: `pause()`→`play()` が Ok を返しても無音の
+    /// 確認された**(調査記録「`pause()`→`play()` が Ok を返しても無音の
     /// ままだったケース」参照)。`Result::Ok` は「`AudioOutputUnitStart` の呼び出し
     /// 自体がエラーを返さなかった」ことしか意味せず、コールバックが実際に再開したかは
     /// 何も保証しない。そのためこの関数は `play()` の戻り値を成否判定に使わない——
@@ -1104,15 +858,15 @@ mod imp {
     /// 🔴 **是正前はここに `confirm_recovery_progress` の呼び出し(=最大370msの
     /// `std::thread::sleep`)が同期的に含まれており、`UIApplicationDidBecomeActiveNotification`
     /// 経由(=メインスレッド)で呼ばれた場合に限り、メインスレッドを最大370ms
-    /// ブロックしていた**(モジュール doc「実装方針」節の「待機は `std::thread::sleep` を
-    /// 使う」パラグラフ参照。P0-6, 2026-09-03 是正)。ワーカースレッドへの委譲により
+    /// ブロックしていた**(調査記録「`pause()`→`play()` が Ok を返しても無音のままだった
+    /// ケース」の「待機は `std::thread::sleep` を使う」パラグラフ参照。P0-6, 2026-09-03 是正)。ワーカースレッドへの委譲により
     /// この問題は解消した——ただし実機での体感(ヒッチが本当に消えたか)は自動テストでは
     /// 確認できない(本ファイル末尾「自動テストで守れる範囲・守れない範囲」参照)。
     ///
     /// `trigger`・`stream.play()` の成否・実測による最終判定は必ずログへ出す——
     /// 「`play()` は成功したが実測では確認できなかった」ケースをログだけで判別できる
-    /// ようにする(モジュール doc「追記: `DidBecomeActive` 安全網の前提が崩れていた
-    /// ケース」の観測性節、および今回の追記の両方を踏襲)。ワーカースレッドへ移した後も
+    /// ようにする(調査記録「`DidBecomeActive` 安全網の前提が崩れていた
+    /// ケース」の観測性節、および R24 節の両方を踏襲)。ワーカースレッドへ移した後も
     /// この観測性は変わらない(ログを出す場所が別スレッドになるだけ)。
     fn attempt_recovery(
         state: &Arc<Mutex<InterruptionState>>,
@@ -1310,7 +1064,7 @@ mod tests {
     /// 変わらず、`on_app_became_active` の当初のガード(`Interrupted`/`RecoveryFailed`
     /// のみ復帰)には引っかからなかった。`UIApplicationDidEnterBackgroundNotification` を
     /// 判別子に足したことで、Began の到達に一切依存せず復帰を要求できることを固定化する
-    /// (モジュール doc「追記: `DidBecomeActive` 安全網の前提が崩れていたケース」参照)。
+    /// (調査記録「`DidBecomeActive` 安全網の前提が崩れていたケース」参照)。
     #[test]
     fn app_became_active_recovers_when_no_interruption_began_before_backgrounding() {
         let state = InterruptionState::new();
@@ -1400,7 +1154,7 @@ mod tests {
 
     /// `on_app_entered_background` はどの状態からでも `Backgrounded` へ遷移する
     /// (`on_interruption_began` の「最新の事実を優先」と同じ設計、モジュール doc
-    /// 「追記: `DidBecomeActive` 安全網の前提が崩れていたケース」参照)。
+    /// 「`DidBecomeActive` 安全網の前提が崩れていたケース」参照)。
     #[test]
     fn entering_background_always_wins_from_any_state() {
         for state in [
@@ -1474,7 +1228,7 @@ mod tests {
     /// 旧名 `only_old_device_unavailable_requires_recovery`。実機報告 R13(Bluetooth
     /// 再接続で無音になる)を受けて `NewDeviceAvailable` も復帰対象に加わったため、
     /// 「old device unavailable だけ」という名前のままでは実態と食い違う。名前を
-    /// 実態に合わせて変更した(モジュール doc「追記: Bluetooth 再接続で無音になる
+    /// 実態に合わせて変更した(調査記録「Bluetooth 再接続で無音になる
     /// ケース」参照)。
     #[test]
     fn old_device_unavailable_and_new_device_available_require_recovery_other_reasons_do_not() {
@@ -1488,7 +1242,7 @@ mod tests {
     /// 実機報告 R13 の最小シナリオ:「Bluetooth を再接続すると SE が鳴らなくなる」——
     /// `NewDeviceAvailable` はどの状態からでも復帰要求(`RecoveryPending`)へ遷移する
     /// (`route_changed_with_old_device_unavailable_requests_recovery_from_any_state` と
-    /// 同じ形。モジュール doc「追記: Bluetooth 再接続で無音になるケース」参照)。
+    /// 同じ形。調査記録「Bluetooth 再接続で無音になるケース」参照)。
     #[test]
     fn route_changed_with_new_device_available_requests_recovery_from_any_state() {
         for state in [
@@ -1509,7 +1263,7 @@ mod tests {
     /// `CategoryChange` は引き続き復帰を要求しない——`attempt_recovery` が呼ぶ
     /// `ios_session::configure()` 自身が `setCategory_error` を呼ぶため、ここで復帰に
     /// 反応すると自分自身のカテゴリ再設定をトリガーに拾う自己誘発ループになりうる
-    /// (モジュール doc「追記: ルート変化」および「追記: Bluetooth 再接続で無音になる
+    /// (調査記録「ルート変化」および「Bluetooth 再接続で無音になる
     /// ケース」参照)。`NewDeviceAvailable` を復帰対象に追加した際もここは意図的に
     /// 据え置いた設計判断であることを、独立したテストとして固定化する。
     #[test]
@@ -1544,7 +1298,7 @@ mod tests {
         assert_eq!(state, InterruptionState::RecoveryPending);
     }
 
-    // --- `confirm_recovery_progress`(実機 R24 の修正。モジュール doc「追記:
+    // --- `confirm_recovery_progress`(実機 R24 の修正。調査記録「
     // `pause()`→`play()` が Ok を返しても無音のままだったケース」参照)---
     //
     // ここは CoreAudio に一切触れない純粋なロジックなので、`cpal::Stream`/`AtomicU64`
