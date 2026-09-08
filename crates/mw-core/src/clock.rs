@@ -433,7 +433,7 @@ pub struct MusicClockSnapshot {
     pub song_frames: u64,
     /// 上記フレーム数に対応するホスト単調時刻(ナノ秒)。
     pub host_time_ns: u64,
-    /// 出力サンプルレート [Hz]。0 は「まだ確定していない」。
+    /// 出力サンプルレート(Hz)。0 は「まだ確定していない」。
     pub sample_rate: u32,
     /// 楽曲ボイスの再生状態(初期構築仕様『§4.3』の4状態。`mw_music_state()` の実体)。
     ///

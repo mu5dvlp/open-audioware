@@ -140,7 +140,7 @@ pub enum StealOutcome {
     Assigned,
     /// 最古のボイスをスティールし、尾スロットへフェードアウト用に退避した。
     Stolen,
-    /// 尾スロットも枯渇していたため、退避できなかった([`VoicePool::render`] 側が
+    /// 尾スロットも枯渇していたため、退避できなかった([`VoicePool::mix_frame`] 側が
     /// 回収キュー送出などの安全な後始末を行う。理論上到達しない防御的経路)。
     TailPoolExhausted,
 }

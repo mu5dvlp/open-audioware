@@ -63,7 +63,7 @@
 //! 複数テストの並列実行で混ざる。[`OutputUnderrunTracker`] が公開用に持つ3本の
 //! `Arc<Atomic*>` は `CpalBackend::new()` のたびに新規生成され(`CpalBackend` の
 //! 他のカウンタ〔`callback_frames` 等〕と全く同じ流儀)、`CpalBackend` インスタンス
-//! ごとに独立する。テスト側も([`tests`] モジュール参照)`OutputUnderrunTracker`
+//! ごとに独立する。テスト側も(同ファイル末尾の `tests` モジュール参照)`OutputUnderrunTracker`
 //! を直接構築して観測系列を注入するため、テスト同士が状態を共有することもない。
 
 use std::sync::Arc;

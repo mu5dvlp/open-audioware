@@ -40,6 +40,8 @@ help:
 	@echo "  make format         - cargo fmt (自動整形)"
 	@echo "  make test           - cargo test --workspace"
 	@echo "  make bench          - criterion ベンチ(未導入。任意)"
+	@echo "  make doc            - API リファレンス(rustdoc)を生成。docs/integration.md §6 が正とする出力"
+	@echo "  make doc-coverage   - C ABI の全エクスポート関数に doc コメントがあるか検査"
 	@echo "  make bindgen        - csbindgen で C# バインディング生成"
 	@echo "  make build-macos    - .dylib をビルドし unity/Runtime/Plugins/macOS/ へ配置(ホストアーチ)"
 	@echo "  make build-ios      - aarch64-apple-ios 静的ライブラリ → xcframework"
@@ -118,6 +120,22 @@ test:
 
 bench:
 	@echo "criterion ベンチマークは未導入(初期構築仕様 §7.3: 任意)。M1 以降のミキサ実装後に追加する。"
+
+# --- API リファレンス(M5)-------------------------------------------------
+#
+# 🔴 手書きの API 一覧は作らない(必ず実装から乖離する)。docs/integration.md §6 は
+# この rustdoc 出力と csbindgen の NativeMethods.g.cs を「正」として指している。
+# --no-deps: 依存クレートまで生成すると出力が巨大になり、見たいもの(mw-ffi の境界)が埋もれる。
+# --document-private-items は付けない: 読者は C ABI の利用者で、内部実装は対象外。
+
+doc: doc-coverage
+	cargo doc -p mw-ffi -p mw-core -p mw-backend --no-deps
+	@echo "generated: target/doc/mw_ffi/index.html"
+
+# doc の前提(全エクスポート関数に doc コメントがある)を機械で見張る。
+# 1つ欠けると API リファレンスに説明なしの関数が並ぶため、doc の依存にしてある。
+doc-coverage:
+	@python3 tools/check-ffi-doc-coverage.py
 
 # csbindgen は mw-ffi の build.rs から実行される。ネイティブ(ホスト)向けビルドを
 # 1回走らせるだけで unity/Runtime/Generated/NativeMethods.g.cs が再生成される
