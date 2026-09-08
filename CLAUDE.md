@@ -27,7 +27,14 @@
   **リアルタイム安全性規約(音声スレッドでの禁止事項)はここに常設**
 - [`crates/mw-backend/CLAUDE.md`](./crates/mw-backend/CLAUDE.md) — 出力デバイス抽象と cpal 実装
 - [`crates/mw-ffi/CLAUDE.md`](./crates/mw-ffi/CLAUDE.md) — C ABI 境界・エラーモデル・ハンドル管理
-- `docs/` — 肥大化する内容の切り出し先(統合手順・API リファレンス・ADR。M5 以降で拡充)
+- [`docs/integration.md`](./docs/integration.md) — **導出プロジェクトへの導入手順**(M5)。
+  ネイティブバイナリが未追跡であること / UPM の `file:` 参照 / **導入の有無を asmdef で
+  切り替える構造** / 未導入構成の検証まで。🔴 **導入について聞かれたらまずここ**
+- **API リファレンスは `make doc`(rustdoc)が正** —— 手書きの一覧は作らない。
+  前提(全エクスポート関数に doc コメントがある)は `make doc-coverage` が機械で検査する。
+  C# から見える形は `unity/Runtime/Generated/NativeMethods.g.cs`(`make bindgen`)
+- `docs/` — 肥大化する内容の切り出し先(設計 ADR は未着手。⚠️ 初期構築仕様と各クレートの
+  `CLAUDE.md` に既にある決定を写すと正が2つになるため、何を切り出すか決めてから作る)
 - [`docs/history.md`](./docs/history.md) — 作業の経緯(索引。本体は `docs/history/`)
 - **ワークスペース全体の状態・次にやること** → 1つ上の階層の `docs/HANDOFF.md`
 - **踏んだ罠と教訓** → 1つ上の階層の `docs/LESSONS.md`
