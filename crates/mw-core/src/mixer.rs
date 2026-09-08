@@ -200,7 +200,7 @@ impl MusicSchedule {
 /// スタック消費量が増える(256フレーム×2ch×4byte = 2KiB)。実測で見直してよい。
 const BGM_CHUNK_FRAMES: usize = 256;
 
-/// [`mixer::build`] が返す、BGM(初期構築仕様『§2』M14, M4-3)専用のゲームスレッド側
+/// [`build`] が返す、BGM(初期構築仕様『§2』M14, M4-3)専用のゲームスレッド側
 /// ハンドル一式。既存の6要素タプルにこれ以上要素を増やすと可読性が落ちるため、
 /// BGM ぶんだけ1つの構造体にまとめてある。
 pub struct BgmHandles {
