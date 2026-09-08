@@ -96,7 +96,7 @@ MPL-2.0 はファイル単位のコピーレフトで、改変したそのファ
 | `proc-macro2` | 1.0.107 | MIT OR Apache-2.0 |
 | `quote` | 1.0.47 | MIT OR Apache-2.0 |
 | `realfft` | 3.5.0 | MIT |
-| `rtrb` | 0.3.4 | MIT OR Apache-2.0 |
+| `rtrb` | 0.3.5 | MIT OR Apache-2.0 |
 | `rubato` | 0.15.0 | MIT |
 | `rustfft` | 6.4.1 | MIT OR Apache-2.0 |
 | `rustversion` | 1.0.23 | MIT OR Apache-2.0 |
@@ -9463,7 +9463,7 @@ DEALINGS IN THE SOFTWARE.
 > 上の SPDX 識別子が示す標準の条文が適用される。
 > 公開前に、上記リポジトリで実物を確認すること。
 
-### rtrb 0.3.4
+### rtrb 0.3.5
 
 - SPDX: `MIT OR Apache-2.0`
 - リポジトリ: https://github.com/mgeier/rtrb
