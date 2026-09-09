@@ -698,6 +698,18 @@ mod imp {
             "[mw-backend] app entered background (previous_state={previous_state:?}); will \
              attempt recovery on next activation"
         );
+
+        // 🔴 <b>出力を手放す</b>(ユーザー決定 2026-09-09。D6「バックグラウンド時に解放して」)。
+        //    カテゴリ Playback は他アプリの音を止めるので、非アクティブ化して
+        //    「もう鳴らさない」ことを OS へ伝えないと、<b>止めた相手の音楽が再開しない</b>
+        //    (`ios_session::deactivate` の doc が理由の正)。
+        //
+        // ⚠️ <b>状態は `Backgrounded` のまま</b>にする —— 前面復帰時の復帰処理
+        //    (`handle_became_active` → `attempt_recovery`)が `ios_session::configure()` を
+        //    呼び、そこで `setActive(true)` に戻る。ここで状態まで触ると復帰が走らなくなる。
+        //
+        // 📌 ロックを外してから呼ぶ(Obj-C 呼び出しをロック内へ持ち込まない)。
+        crate::ios_session::deactivate();
     }
 
     /// アプリがアクティブになった(`UIApplicationDidBecomeActiveNotification`)。

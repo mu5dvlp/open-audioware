@@ -44,9 +44,38 @@ pub fn configure() {
 #[cfg(not(any(target_os = "ios", target_os = "tvos")))]
 pub fn configure() {}
 
+/// AVAudioSession を**非アクティブ化して出力を手放す**(`setActive(false)` +
+/// `NotifyOthersOnDeactivation`)。
+///
+/// **なぜ必要か**(ユーザー決定 2026-09-09。D6「バックグラウンド時に解放して」):
+/// [`configure`] が使うカテゴリ `Playback` は**他アプリの音を止める**(ミックスしない)。
+/// 止められた側(音楽アプリ等)は、こちらがセッションを**非アクティブ化したとき**に
+/// 送られる割り込み終了通知で再開する。一度も非アクティブ化しないと、
+/// **アプリを背面へやっても相手の音楽が戻らない**。
+///
+/// 🔴 **`NotifyOthersOnDeactivation` が要点。** これを付けない `setActive(false)` は
+/// 「自分が止めた」だけで、相手に再開のきっかけを渡さない。
+///
+/// ⚠️ **iOS がセッションを止めることと、これを呼ぶことは別**。背面へ行くと OS は出力
+/// ユニットを止めるが(だから [`ios_interruption`](crate::ios_interruption) が復帰処理を持つ)、
+/// それはこちらの**アクティブ表明を取り下げること**ではない。
+///
+/// 失敗しても致命傷にしない([`configure`] と同じ方針)。前面復帰時は
+/// `ios_interruption` の復帰処理が [`configure`](= `setActive(true)`)を呼び直す。
+#[cfg(any(target_os = "ios", target_os = "tvos"))]
+pub fn deactivate() {
+    imp::deactivate();
+}
+
+/// iOS / tvOS 以外では何もしない。
+#[cfg(not(any(target_os = "ios", target_os = "tvos")))]
+pub fn deactivate() {}
+
 #[cfg(any(target_os = "ios", target_os = "tvos"))]
 mod imp {
-    use objc2_avf_audio::{AVAudioSession, AVAudioSessionCategoryPlayback};
+    use objc2_avf_audio::{
+        AVAudioSession, AVAudioSessionCategoryPlayback, AVAudioSessionSetActiveOptions,
+    };
 
     use super::{PREFERRED_IO_BUFFER_DURATION_SEC, PREFERRED_SAMPLE_RATE_HZ};
 
@@ -104,6 +133,29 @@ mod imp {
                 session.IOBufferDuration() * 1000.0,
                 session.outputLatency() * 1000.0,
                 session.outputNumberOfChannels(),
+            );
+        }
+    }
+
+    pub fn deactivate() {
+        // SAFETY: `configure` と同じ——プロセス唯一の共有インスタンスに対する
+        // 失敗を NSError で返す API のみを呼ぶ。
+        unsafe {
+            let session = AVAudioSession::sharedInstance();
+
+            // 🔴 `NotifyOthersOnDeactivation` を必ず付ける(この関数の存在理由。
+            //    付けないと、こちらが止めた他アプリの音楽が再開しない)。
+            let options = AVAudioSessionSetActiveOptions::NotifyOthersOnDeactivation;
+            if let Err(err) = session.setActive_withOptions_error(false, options) {
+                crate::mw_log!(
+                    "[mw-backend] AVAudioSession setActive(false, NotifyOthersOnDeactivation) \
+                     failed: {err:?}"
+                );
+                return;
+            }
+
+            crate::mw_log!(
+                "[mw-backend] AVAudioSession deactivated (others notified; app went to background)"
             );
         }
     }
