@@ -95,6 +95,13 @@
 //!    ウォッチドッグを入れた([`OutputStallDetector`] / `spawn_output_stall_watchdog`)。
 //!    📌 **原因を問わない直し方にしたのが要点。** 「なぜ止まったか」を突き止めて拾う
 //!    通知を足すやり方は R12 / R13 で2度やり直しており、通知の網羅は原理的に終わらない。
+//! 5. 🔴 **`recovered: false` は「もうダメ」ではない。**(2026-09-10、実機で初観測)
+//!    [`confirm_recovery_progress`] は最大 370ms しか待たないので、**復帰そのものは効いていて
+//!    確認だけが間に合わなかった**ことがある —— 実機で「`recovered=false` のログが出たあとも
+//!    音は出ていた」が確認された。放置するとホスト側の表示(「音声が無音のままの可能性があります」)が
+//!    そのまま残り、ログを読む人を誤らせる。ウォッチドッグは
+//!    [`InterruptionState::RecoveryFailed`] のままコールバックが動き出したのを見つけたら、
+//!    改めて `AudioInterruptionEnded { recovered: true }` を上げ直す。
 //!
 //! 🔴 **どこまで疑って何が否定されたかの全記録は
 //! [`docs/history/09-2026-09-05.md`](../../../docs/history/09-2026-09-05.md) にある。**
@@ -1058,10 +1065,37 @@ mod imp {
             .spawn(move || {
                 let mut detector = OutputStallDetector::new();
                 let threshold_ms = OutputStallDetector::stall_threshold_ms();
+                let mut previous_ticks = callback_ticks.load(Ordering::Relaxed);
 
                 while sleep_unless_shutdown(&shutdown, WATCHDOG_POLL_INTERVAL_MS) {
                     let current = *state.lock().unwrap_or_else(|p| p.into_inner());
                     let ticks = callback_ticks.load(Ordering::Relaxed);
+                    let advanced = ticks != previous_ticks;
+                    previous_ticks = ticks;
+
+                    // 🔴 <b>「復帰できなかった」で終わった話を、そのまま放置しない</b>
+                    // (実機報告 2026-09-10)。`confirm_recovery_progress` は最大 370ms しか
+                    // 待たないので、**復帰そのものは効いていて確認だけが間に合わなかった**ことがある
+                    // ——実機で実際に「recovered=false のログが出たあとも音は出ていた」が観測された。
+                    //
+                    // ⚠️ <b>放置するとログが嘘をつく。</b> ホスト側(`NativeMusicClock`)は
+                    // `recovered=false` を「音が無音のままの可能性がある」と表示するので、
+                    // 最後の一行がそれで終わっていると、実機ログを読む人を確実に誤らせる
+                    // (このプロジェクトが繰り返し戒めている「実行していないものを緑と記録するな」と同じ性質)。
+                    //
+                    // 📌 状態を `Recovered` へ進めるのも同じ理由 —— 次の観測でまたここへ来ないようにする。
+                    if current == InterruptionState::RecoveryFailed && advanced {
+                        {
+                            let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+                            *guard = InterruptionState::Recovered;
+                        }
+                        crate::mw_log!(
+                            "[mw-backend] ios_interruption: output resumed after a failed confirmation \
+                             (callback_ticks={ticks}); reporting recovery"
+                        );
+                        events.push_side_channel(Event::AudioInterruptionEnded { recovered: true });
+                        continue;
+                    }
 
                     if !detector.observe(current, ticks) {
                         continue;
