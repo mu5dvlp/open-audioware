@@ -26,7 +26,7 @@ PLUGINS_ANDROID_DIR   := unity/Runtime/Plugins/Android/libs/$(ANDROID_ABI)
 
 XCFRAMEWORK           := $(PLUGINS_IOS_DIR)/MwFfi.xcframework
 
-.PHONY: help setup lint format test bench bindgen \
+.PHONY: help setup lint format gitleaks test bench bindgen \
         build-macos build-ios build-android \
         package unity-sample-create unity-test \
         measurement-scene measurement-export-ios measurement-build-android clean
@@ -93,6 +93,33 @@ lint:
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo deny check
 	@$(MAKE) --no-print-directory third-party-licenses-check
+
+# ===========================================================================
+# gitleaks(秘密情報のコミット検知)
+# ===========================================================================
+
+# 🔴 **バージョンはここ1箇所だけで固定する。** CI もこのターゲットを呼ぶので、
+# 「CI と Makefile で同じ検査を二重に書いて手で揃える」形を作らない。
+# ⚠️ ローカルに gitleaks のバイナリが入っている場合はそちらが使われるため、
+# バージョン差で結果が変わりうる —— 実行時に必ずどちらを使ったかを表示する。
+#
+# ⚠️ **lint には含めない。** lint は毎回の内側ループで回すもので、gitleaks は git 履歴を
+# 丸ごと読む(このリポジトリで約3秒、client では約25秒)。目的も頻度も違うので独立させる。
+GITLEAKS_VERSION := v8.30.1
+GITLEAKS_IMAGE := zricethezav/gitleaks:$(GITLEAKS_VERSION)
+
+gitleaks: ## 秘密情報がコミットされていないか git 履歴ごと検査する
+	@if command -v gitleaks >/dev/null 2>&1; then \
+		echo "== gitleaks(ローカルのバイナリ: $$(gitleaks version)。CI は $(GITLEAKS_VERSION)) =="; \
+		gitleaks git . --redact --no-banner; \
+	elif command -v docker >/dev/null 2>&1; then \
+		echo "== gitleaks（$(GITLEAKS_IMAGE)） =="; \
+		docker run --rm -v "$(CURDIR):/repo" $(GITLEAKS_IMAGE) git /repo --redact --no-banner; \
+	else \
+		echo "[error] gitleaks も docker も見つかりません。どちらかを用意してください。"; \
+		echo "        brew install gitleaks  # または Docker Desktop を起動する"; \
+		exit 1; \
+	fi
 
 # --- ライセンス -----------------------------------------------------------
 

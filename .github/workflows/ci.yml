@@ -113,3 +113,20 @@ jobs:
           name: android-native
           path: target/aarch64-linux-android/release/libmw_ffi.so
           retention-days: 7
+
+  # 秘密情報のコミット検知(2026-09-10 追加)。
+  # 🔴 private リポジトリでは GitHub の secret scanning は GitHub Advanced Security(有料)が
+  # 要るため無料では効かない。⚠️ このリポジトリは**将来 UPM パッケージとして配布する**予定で、
+  # 履歴ごと配られる —— 入ってしまった鍵は消せない。
+  # 🔴 **検査の定義は Makefile 1箇所**(`make gitleaks`)。⚠️ `fetch-depth: 0` が必須
+  # (浅いクローンだと「過去にコミットされた鍵」を取りこぼして緑になる)。
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout(履歴全体)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: make gitleaks
+        run: make gitleaks
