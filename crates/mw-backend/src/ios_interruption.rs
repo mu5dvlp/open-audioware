@@ -71,8 +71,8 @@
 //!
 //! ## 実機で判明したこと(調査記録は `docs/history/09-2026-09-05.md`)
 //!
-//! 上の実装方針は、その後の実機報告(R12 / R13 / R24)で**2箇所が否定された**。
-//! いま実装が満たしている不変条件は次の3つで、**どれも実機でしか確かめられなかった**:
+//! 上の実装方針は、その後の実機報告(R12 / R13 / R24 / V14)で**3箇所が否定された**。
+//! いま実装が満たしている不変条件は次の4つで、**どれも実機でしか確かめられなかった**:
 //!
 //! 1. **`Began` は必ずしも飛んでこない。** バックグラウンド遷移では
 //!    `AVAudioSessionInterruptionNotification` の Began が届かないことがある(R12)。
@@ -87,6 +87,14 @@
 //!    `AudioOutputUnitStart` の成功と音声コールバックの再開は別事象なので、
 //!    **コールバックが実際に前進したかを実測して確認する**
 //!    ([`confirm_recovery_progress`] / `RECOVERY_WAIT_SCHEDULE_MS`)。
+//! 4. 🔴 **通知が1つも来ないまま止まることがある。**(V14、2026-09-10)
+//!    実機の診断で「音源のロードも `mw_se_play` も全部成功しているのに無音、アプリを
+//!    再起動すると直る」が確定した。上の1〜3はすべて**OS から通知が来ること**が前提で、
+//!    通知の来ない止まり方には何も反応しない。そこで通知に頼らず、
+//!    **コールバックが進んでいるかを定期的に実測して、止まっていたら復帰する**
+//!    ウォッチドッグを入れた([`OutputStallDetector`] / `spawn_output_stall_watchdog`)。
+//!    📌 **原因を問わない直し方にしたのが要点。** 「なぜ止まったか」を突き止めて拾う
+//!    通知を足すやり方は R12 / R13 で2度やり直しており、通知の網羅は原理的に終わらない。
 //!
 //! 🔴 **どこまで疑って何が否定されたかの全記録は
 //! [`docs/history/09-2026-09-05.md`](../../../docs/history/09-2026-09-05.md) にある。**
@@ -152,6 +160,17 @@
 //! (是正前は Xcode の Time Profiler で `UIApplicationDidBecomeActiveNotification` の
 //! ハンドラ内に370ms級のブロックが見えていたはず——是正後はそれが消えていることを
 //! 確認する)。
+//!
+//! **7つ目(V14, 2026-09-10): 出力停止ウォッチドッグの判定([`OutputStallDetector`])。**
+//! 他の3つと同じく OS 非依存の値型として切り出したので、「進み続けている間は黙っている」
+//! 「連続して止まっていたら要求する」「1回では要求しない」「要求後はクールダウンする」
+//! 「止まっているのが正常な状態(`Interrupted`/`Backgrounded`/`RecoveryPending`)では
+//! 見張らない」「`RecoveryFailed` は見張る(R24 の穴)」「見張らない状態を挟んでも
+//! 数えた分を持ち越さない」の7ケースをホストの単体テストで固定化した。
+//! ⚠️ **実機でしか確かめられないのは「実際に音が戻るか」**——ウォッチドッグが叩くのは
+//! 既存の `attempt_recovery` そのものなので、復帰の効き自体は上の1〜3と同じ土俵に乗る。
+//! 閾値([`WATCHDOG_STALL_SAMPLES`] × [`WATCHDOG_POLL_INTERVAL_MS`] = 1秒)が
+//! 短すぎて正常時に誤検知しないかも、実機でのみ確認できる。
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -279,6 +298,23 @@ impl InterruptionState {
     pub fn needs_recovery_attempt(self) -> bool {
         matches!(self, Self::RecoveryPending)
     }
+
+    /// 出力停止のウォッチドッグ([`OutputStallDetector`])が、この状態のときに
+    /// 「コールバックが進んでいない = 異常」と判断してよいか。
+    ///
+    /// 🔴 **止まっているのが正常な状態では見張らない。**
+    /// - `Interrupted`: OS が意図的に止めている(割り込み終了で復帰する)。
+    /// - `Backgrounded`: こちらから [`crate::ios_session::deactivate`] で手放した
+    ///   (D6。前面復帰で復帰する)。
+    /// - `RecoveryPending`: 通知ハンドラがこれから復帰を試みる。横から二重に叩かない。
+    ///
+    /// 逆に **`RecoveryFailed` は見張る対象に含める**——「復帰を試みたが空振りし、
+    /// 次の `DidBecomeActive` を待つしかない」というのが調査記録 R24 で問題になった
+    /// 状態そのもので、**アプリを前面に置いたままだと永久に誰も再試行しない**。
+    /// ウォッチドッグはまさにこの穴を塞ぐために入れた(モジュール doc の不変条件4)。
+    pub fn allows_stall_watchdog(self) -> bool {
+        matches!(self, Self::Running | Self::Recovered | Self::RecoveryFailed)
+    }
 }
 
 impl Default for InterruptionState {
@@ -383,6 +419,129 @@ pub fn confirm_recovery_progress(
     None
 }
 
+/// 出力停止ウォッチドッグの観測間隔(ms)。
+///
+/// 音声コールバックは 5ms 前後のバッファ長で回り続ける([`crate::ios_session`])ので、
+/// 250ms あれば「進んでいれば必ず進んでいる」と言える(数十回ぶん)。短くしても
+/// 検知が早くなるだけで精度は上がらず、ゲームスレッド外とはいえ無駄に起きるだけ。
+pub const WATCHDOG_POLL_INTERVAL_MS: u64 = 250;
+
+/// 「止まった」と判定するまでに必要な、**連続して進んでいない**観測の回数。
+///
+/// 250ms × 4 = **1秒**進まなければ停止とみなす。⚠️ 1回で判定しないのは、観測の
+/// タイミングとコールバックの周期がたまたま噛み合わない・OS が一瞬スケジュールを
+/// 落とす、といった正常な揺れで誤検知しないため。
+pub const WATCHDOG_STALL_SAMPLES: u32 = 4;
+
+/// 復帰を試みた直後に、次の停止判定を再開するまで空ける観測の回数。
+///
+/// 250ms × 8 = **2秒**。[`confirm_recovery_progress`] 自身が最大 370ms 待つうえ、
+/// `AudioOutputUnitStart` からコールバックが立ち上がるまでにも猶予が要る。
+/// 🔴 **クールダウンが無いと、復帰できない状況で `pause()`→`play()` を撃ち続ける**
+/// (ログも埋まる)。
+pub const WATCHDOG_COOLDOWN_SAMPLES: u32 = 8;
+
+/// 音声コールバックが止まったままになっていないかを見張る、純粋な検知器。
+///
+/// ## なぜ要るか(実機報告 V14、2026-09-10)
+///
+/// 実機の診断レポートで「**音源のロードも `mw_se_play` も全部成功しているのに無音**、
+/// アプリを再起動すると直る」という状態が確定した(SE 発音16/待ち0/失敗0/委譲0、
+/// `outputLatencyNs` は非 0 = コールバックは**起動直後に一度は走っている**)。
+/// つまり出力コールバックが途中で止まり、**そのまま誰も気付かない**。
+///
+/// 既存の復帰経路(割り込み・ルート変化・前面復帰)は、いずれも **OS から通知が来ること**を
+/// 前提にしている。通知が来ないまま止まった場合——例えば `CategoryChange`
+/// (自己誘発ループを避けるため [`RouteChangeReason::requires_recovery`] が意図的に
+/// 除外している)でユニットが止まった場合——**何も再試行しない**。
+/// 調査記録 R24 が「アプリを前面に置いたままでは永久に無音のままだったはず」と書いた
+/// 穴が、通知の来ないケースとして残っていた。
+///
+/// ## 何をするか
+///
+/// [`WATCHDOG_POLL_INTERVAL_MS`] ごとにコールバックカウンタを観測し、
+/// [`WATCHDOG_STALL_SAMPLES`] 回連続で進んでいなければ「止まった」と判定する。
+/// 判定後は [`WATCHDOG_COOLDOWN_SAMPLES`] 回ぶん判定を止める(撃ち続けない)。
+///
+/// 🔴 **原因を問わない直し方**である点が肝。「なぜ止まったか」を突き止めて個別に
+/// 通知を拾い足すやり方は R12 / R13 で2度やり直しており(`Began` が来ない /
+/// `NewDeviceAvailable` でも止まる)、**通知の網羅は原理的に終わらない**。
+/// 「進んでいないなら直す」なら、まだ知らない止まり方にも効く。
+///
+/// ⚠️ 「止まっているのが正常」な状態では見張らない
+/// ([`InterruptionState::allows_stall_watchdog`])。
+///
+/// OS API に一切触れない値型なので、`InterruptionState` / [`confirm_recovery_progress`] と
+/// 同じくホスト(macOS/Linux)の単体テストで固定化できる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputStallDetector {
+    /// 直近の観測で読んだカウンタ値。
+    last_ticks: u64,
+    /// 連続して進んでいない観測の回数。
+    stalled_samples: u32,
+    /// 残りクールダウン観測回数(0 なら判定する)。
+    cooldown_samples: u32,
+}
+
+impl OutputStallDetector {
+    /// 初期状態。`last_ticks` は 0 から始まる——**起動直後に一度もコールバックが
+    /// 走らなかった場合もカウンタは 0 のままなので、そのまま停止として検知できる**
+    /// (「一度も鳴り始めなかった」も直す対象に含める)。
+    pub const fn new() -> Self {
+        Self {
+            last_ticks: 0,
+            stalled_samples: 0,
+            cooldown_samples: 0,
+        }
+    }
+
+    /// 1回ぶんの観測。復帰を試みるべきなら `true` を返す(実際に試みるのは呼び出し側)。
+    ///
+    /// - `state`: いまの割り込み状態。見張ってよい状態でなければ計測をリセットする
+    ///   ——復帰直後に「割り込み中に進まなかったぶん」を持ち越して誤検知しないため。
+    /// - `ticks`: `CpalBackend::callback_ticks` の現在値(単調増加)。
+    pub fn observe(&mut self, state: InterruptionState, ticks: u64) -> bool {
+        if !state.allows_stall_watchdog() {
+            self.last_ticks = ticks;
+            self.stalled_samples = 0;
+            return false;
+        }
+
+        if self.cooldown_samples > 0 {
+            self.cooldown_samples -= 1;
+            self.last_ticks = ticks;
+            self.stalled_samples = 0;
+            return false;
+        }
+
+        if ticks != self.last_ticks {
+            self.last_ticks = ticks;
+            self.stalled_samples = 0;
+            return false;
+        }
+
+        self.stalled_samples += 1;
+        if self.stalled_samples < WATCHDOG_STALL_SAMPLES {
+            return false;
+        }
+
+        self.stalled_samples = 0;
+        self.cooldown_samples = WATCHDOG_COOLDOWN_SAMPLES;
+        true
+    }
+
+    /// 停止と判定するまでに実際に経過する時間(ms)。ログ用。
+    pub const fn stall_threshold_ms() -> u64 {
+        WATCHDOG_POLL_INTERVAL_MS * WATCHDOG_STALL_SAMPLES as u64
+    }
+}
+
+impl Default for OutputStallDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// `AVAudioSessionInterruptionNotification` / `UIApplicationDidBecomeActiveNotification` /
 /// `UIApplicationDidEnterBackgroundNotification` / `AVAudioSessionRouteChangeNotification` の
 /// 監視・復帰処理。iOS / tvOS 以外では何もしない no-op(`ios_session::configure` と同じ
@@ -432,7 +591,7 @@ impl Watcher {
 mod imp {
     use std::panic::{self, AssertUnwindSafe};
     use std::ptr::NonNull;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
@@ -451,11 +610,22 @@ mod imp {
     use objc2_foundation::{NSNotification, NSNotificationCenter, NSNumber, NSString, ns_string};
 
     use super::{
-        InterruptionState, RECOVERY_WAIT_SCHEDULE_MS, RouteChangeReason, confirm_recovery_progress,
+        InterruptionState, OutputStallDetector, RECOVERY_WAIT_SCHEDULE_MS, RouteChangeReason,
+        WATCHDOG_POLL_INTERVAL_MS, confirm_recovery_progress,
     };
+
+    /// ウォッチドッグの待機を刻む単位(ms)。[`WATCHDOG_POLL_INTERVAL_MS`] をこの粒度で
+    /// 分割して眠り、そのたびに停止要求を確認する —— `Drop`(= `CpalBackend::close`)が
+    /// 最大でもこの時間しか待たされないようにするため。
+    const WATCHDOG_SHUTDOWN_SLICE_MS: u64 = 25;
 
     pub(super) struct Watcher {
         observers: Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
+        /// ウォッチドッグへの停止要求([`Watcher::drop`] で立てる)。
+        watchdog_shutdown: Arc<AtomicBool>,
+        /// 出力停止ウォッチドッグのスレッド。spawn に失敗した場合は `None`
+        /// (ウォッチドッグが無いだけで、既存の通知経由の復帰はそのまま動く)。
+        watchdog: Option<thread::JoinHandle<()>>,
     }
 
     // SAFETY: NSNotificationCenter はスレッドセーフ。ここへ保持する observer トークンは
@@ -624,12 +794,36 @@ mod imp {
                 }
             }
 
-            Self { observers }
+            // 出力停止ウォッチドッグ(実機報告 V14。`OutputStallDetector` のクラス doc)。
+            // observer の登録がすべて済んだ後に起こす —— 先に起こすと、まだ observer が
+            // 揃っていない状態で復帰を試みることになりうる。
+            let watchdog_shutdown = Arc::new(AtomicBool::new(false));
+            let watchdog = spawn_output_stall_watchdog(
+                Arc::clone(&state),
+                Arc::clone(&stream),
+                Arc::clone(&events),
+                Arc::clone(&callback_ticks),
+                Arc::clone(&watchdog_shutdown),
+            );
+
+            Self {
+                observers,
+                watchdog_shutdown,
+                watchdog,
+            }
         }
     }
 
     impl Drop for Watcher {
         fn drop(&mut self) {
+            // 先にウォッチドッグを止める —— ストリームが閉じられた後に
+            // `pause()`→`play()` を撃たせないため。待たされるのは最大でも
+            // `WATCHDOG_SHUTDOWN_SLICE_MS`(25ms)。
+            self.watchdog_shutdown.store(true, Ordering::Relaxed);
+            if let Some(handle) = self.watchdog.take() {
+                let _ = handle.join();
+            }
+
             let nc = NSNotificationCenter::defaultCenter();
             for observer in &self.observers {
                 // SAFETY: `observer` はこの `Watcher` が `addObserverForName_...` から
@@ -836,6 +1030,95 @@ mod imp {
         /// ここへ来ない)。
         #[allow(dead_code)]
         RouteChange { reason: RouteChangeReason },
+        /// 🆕 出力停止ウォッチドッグ(実機報告 V14、2026-09-10)。**OS からの通知は何も
+        /// 来ていない** —— 音声コールバックが進まなくなったことを実測だけで検知した経路。
+        /// `stalled_ms` は「進んでいない」と判定するまでに実際に経過した時間。
+        #[allow(dead_code)]
+        OutputStalled { stalled_ms: u64 },
+    }
+
+    /// 出力停止ウォッチドッグのスレッドを起こす(実機報告 V14。判定そのものは
+    /// [`OutputStallDetector`]、なぜ要るかもそちらのクラス doc が正)。
+    ///
+    /// ⚠️ **ゲームスレッドでも音声スレッドでもない専用スレッド**で回す。
+    /// [`WATCHDOG_POLL_INTERVAL_MS`] ごとにアトミックを2つ読むだけなので負荷は無視できる
+    /// (§5.3 の対象外なのは `attempt_recovery` のワーカースレッドと同じ理由)。
+    ///
+    /// spawn に失敗しても致命傷にしない —— ウォッチドッグが無いだけで、通知経由の
+    /// 既存の復帰経路はそのまま動く(`ios_session::configure` と同じ「失敗は記録して続行」)。
+    fn spawn_output_stall_watchdog(
+        state: Arc<Mutex<InterruptionState>>,
+        stream: Arc<cpal::Stream>,
+        events: Arc<EventQueue>,
+        callback_ticks: Arc<AtomicU64>,
+        shutdown: Arc<AtomicBool>,
+    ) -> Option<thread::JoinHandle<()>> {
+        let spawned = thread::Builder::new()
+            .name("mw-ios-output-stall-watchdog".to_owned())
+            .spawn(move || {
+                let mut detector = OutputStallDetector::new();
+                let threshold_ms = OutputStallDetector::stall_threshold_ms();
+
+                while sleep_unless_shutdown(&shutdown, WATCHDOG_POLL_INTERVAL_MS) {
+                    let current = *state.lock().unwrap_or_else(|p| p.into_inner());
+                    let ticks = callback_ticks.load(Ordering::Relaxed);
+
+                    if !detector.observe(current, ticks) {
+                        continue;
+                    }
+
+                    crate::mw_log!(
+                        "[mw-backend] ios_interruption: output stall detected \
+                         (callback_ticks={ticks} unchanged for {threshold_ms}ms, \
+                         state={current:?}); attempting recovery"
+                    );
+
+                    // 通知ハンドラと二重に走らないよう、先に「これから復帰する」状態にする
+                    // (他の経路が `needs_recovery_attempt()` で自分の番だと誤認しないため)。
+                    {
+                        let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+                        *guard = InterruptionState::RecoveryPending;
+                    }
+
+                    attempt_recovery(
+                        &state,
+                        &stream,
+                        &events,
+                        &callback_ticks,
+                        RecoveryTrigger::OutputStalled {
+                            stalled_ms: threshold_ms,
+                        },
+                    );
+                }
+            });
+
+        match spawned {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                crate::mw_log!(
+                    "[mw-backend] ios_interruption: failed to spawn the output stall watchdog \
+                     ({err}); falling back to notification-driven recovery only"
+                );
+                None
+            }
+        }
+    }
+
+    /// `total_ms` だけ眠る。ただし [`WATCHDOG_SHUTDOWN_SLICE_MS`] ごとに停止要求を確認し、
+    /// 立っていたら即座に `false` を返して切り上げる(`Drop` を待たせないため)。
+    ///
+    /// 戻り値: 眠り切って**まだ続けてよい**なら `true`、停止要求が来ていたら `false`。
+    fn sleep_unless_shutdown(shutdown: &AtomicBool, total_ms: u64) -> bool {
+        let mut remaining = total_ms;
+        while remaining > 0 {
+            if shutdown.load(Ordering::Relaxed) {
+                return false;
+            }
+            let slice = remaining.min(WATCHDOG_SHUTDOWN_SLICE_MS);
+            thread::sleep(Duration::from_millis(slice));
+            remaining -= slice;
+        }
+        !shutdown.load(Ordering::Relaxed)
     }
 
     /// セッション再アクティブ化 + ストリーム再始動を試み、**音声コールバックが実際に
@@ -1018,7 +1301,8 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::{
-        InterruptionState, RECOVERY_WAIT_SCHEDULE_MS, RouteChangeReason, confirm_recovery_progress,
+        InterruptionState, OutputStallDetector, RECOVERY_WAIT_SCHEDULE_MS, RouteChangeReason,
+        WATCHDOG_COOLDOWN_SAMPLES, WATCHDOG_STALL_SAMPLES, confirm_recovery_progress,
     };
 
     /// 依頼書が明示した最小シナリオ:「停止した → 再開要求 → 再開した」。
@@ -1405,6 +1689,143 @@ mod tests {
             waits.iter().sum::<u64>(),
             370,
             "合計待機時間は依頼書の目安どおり370ms"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 出力停止ウォッチドッグ(実機報告 V14、2026-09-10)。
+    // OutputStallDetector のクラス doc「なぜ要るか」参照。
+    // ------------------------------------------------------------------
+
+    /// コールバックが進み続けている限り、ウォッチドッグは何も言わない。
+    #[test]
+    fn watchdog_stays_quiet_while_the_callback_keeps_advancing() {
+        let mut detector = OutputStallDetector::new();
+        for tick in 1..=100u64 {
+            assert!(
+                !detector.observe(InterruptionState::Running, tick),
+                "正常に鳴っている最中に復帰を要求しています(不要な音切れの原因になります)"
+            );
+        }
+    }
+
+    /// 進まないまま WATCHDOG_STALL_SAMPLES 回観測したら復帰を要求する。
+    /// ⚠️ **1回では要求しない**——観測とコールバック周期の噛み合わせによる正常な揺れで
+    /// 誤検知しないため。
+    #[test]
+    fn watchdog_requests_recovery_after_consecutive_stalled_samples() {
+        let mut detector = OutputStallDetector::new();
+        // まず一度進めて基準を作る。
+        assert!(!detector.observe(InterruptionState::Running, 10));
+
+        for sample in 1..WATCHDOG_STALL_SAMPLES {
+            assert!(
+                !detector.observe(InterruptionState::Running, 10),
+                "{sample} 回目で早まって復帰を要求しています"
+            );
+        }
+        assert!(
+            detector.observe(InterruptionState::Running, 10),
+            "{WATCHDOG_STALL_SAMPLES} 回連続で進んでいないのに復帰を要求していません(V14 が直りません)"
+        );
+    }
+
+    /// 起動直後に一度もコールバックが走らなかった場合(カウンタが 0 のまま)も検知する。
+    #[test]
+    fn watchdog_detects_a_callback_that_never_started() {
+        let mut detector = OutputStallDetector::new();
+        let mut requested = false;
+        for _ in 0..WATCHDOG_STALL_SAMPLES {
+            requested = detector.observe(InterruptionState::Running, 0);
+        }
+        assert!(
+            requested,
+            "一度も鳴り始めなかったケースを取りこぼしています"
+        );
+    }
+
+    /// 復帰を要求した直後はクールダウンし、撃ち続けない。
+    #[test]
+    fn watchdog_backs_off_after_requesting_recovery() {
+        let mut detector = OutputStallDetector::new();
+        // 1回目は基準作り(last_ticks の初期値 0 から 7 へ動く)なので、発火まで
+        // STALL_SAMPLES + 1 回ぶん観測が要る。
+        let mut fired = false;
+        for _ in 0..=WATCHDOG_STALL_SAMPLES {
+            fired = detector.observe(InterruptionState::Running, 7);
+        }
+        assert!(fired, "前提が崩れています(ここで1回発火しているはず)");
+
+        // クールダウン中は、止まったままでも要求しない。
+        for sample in 0..WATCHDOG_COOLDOWN_SAMPLES {
+            assert!(
+                !detector.observe(InterruptionState::Running, 7),
+                "クールダウン {sample} 回目で復帰を撃ち直しています(pause/play の連射になります)"
+            );
+        }
+
+        // 明けたら、また STALL_SAMPLES 回ぶん数え直してから要求する。
+        for _ in 1..WATCHDOG_STALL_SAMPLES {
+            assert!(!detector.observe(InterruptionState::Running, 7));
+        }
+        assert!(
+            detector.observe(InterruptionState::Running, 7),
+            "クールダウン明けに再試行できていません(1回空振りしたら二度と直らなくなります)"
+        );
+    }
+
+    /// 🔴 止まっているのが正常な状態では見張らない。
+    #[test]
+    fn watchdog_ignores_states_where_a_stopped_callback_is_expected() {
+        for state in [
+            InterruptionState::Interrupted,
+            InterruptionState::Backgrounded,
+            InterruptionState::RecoveryPending,
+        ] {
+            assert!(!state.allows_stall_watchdog(), "{state:?} を見張っています");
+
+            let mut detector = OutputStallDetector::new();
+            for _ in 0..WATCHDOG_STALL_SAMPLES * 3 {
+                assert!(
+                    !detector.observe(state, 42),
+                    "{state:?} 中に復帰を要求しています(OS が止めている/自分で手放した状態です)"
+                );
+            }
+        }
+    }
+
+    /// 🔴 `RecoveryFailed` は**見張る対象**(R24 で残っていた穴。クラス doc 参照)。
+    #[test]
+    fn watchdog_retries_after_a_failed_recovery() {
+        assert!(
+            InterruptionState::RecoveryFailed.allows_stall_watchdog(),
+            "復帰に失敗したまま前面に居座ると、誰も再試行しなくなります(R24 の穴)"
+        );
+
+        let mut detector = OutputStallDetector::new();
+        let mut requested = false;
+        for _ in 0..WATCHDOG_STALL_SAMPLES {
+            requested = detector.observe(InterruptionState::RecoveryFailed, 0);
+        }
+        assert!(requested);
+    }
+
+    /// 見張らない状態を挟んでも、そこで数えた分を持ち越さない
+    /// (割り込み中に進まなかったぶんで、復帰直後に誤検知しないこと)。
+    #[test]
+    fn watchdog_does_not_carry_stalled_samples_across_an_interruption() {
+        let mut detector = OutputStallDetector::new();
+        detector.observe(InterruptionState::Running, 5);
+
+        // 割り込み中は当然進まない。
+        for _ in 0..WATCHDOG_STALL_SAMPLES * 2 {
+            assert!(!detector.observe(InterruptionState::Interrupted, 5));
+        }
+
+        // 復帰直後の1回目で即座に「止まっている」と判定してはいけない。
+        assert!(
+            !detector.observe(InterruptionState::Running, 5),
+            "割り込み中に数えた分を持ち越しています"
         );
     }
 }
