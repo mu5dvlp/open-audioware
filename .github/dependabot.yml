@@ -1,0 +1,33 @@
+# Dependabot(依存更新の見張り)。2026-09-11 導入。
+#
+# 🔴 **これは設定ファイルであってワークフローではない。** GitHub 側で動くので
+# Actions の実行時間を消費しない。
+#
+# 📌 `cargo-deny`(`make lint` / CI)は**既知の脆弱性とライセンス**を見ているが、
+# 「新しいバージョンが出たこと」自体は見ていない。両方あって初めて追随できる。
+version: 2
+
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    groups:
+      cargo:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps)"
