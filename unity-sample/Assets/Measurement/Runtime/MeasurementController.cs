@@ -12,7 +12,7 @@ namespace Measurement
     /// </list>
     /// 両方式とも <see cref="ClickSeGenerator"/> が生成する同一波形のクリック SE を鳴らし、
     /// タップと同一フレームで <see cref="ScreenFlash"/> により画面を白フラッシュする
-    /// (外部録音でのトリガー時刻特定用、init.md 要件)。
+    /// (外部録音でのトリガー時刻特定用。初期構築仕様『§4 機能仕様』の要件)。
     /// フィールドはシーン組み立てスクリプト(<c>Measurement.EditorTools.MeasurementSceneBuilder</c>)
     /// から配線される想定のため public にしてある。
     /// </summary>

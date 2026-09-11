@@ -8,7 +8,7 @@ namespace Measurement
     /// 画面全体を覆う白フラッシュオーバーレイ(docs/measurement-m1.md §2.2 方式A)。
     /// 別端末のスロー動画から、無音のタップ操作の代わりにトリガー時刻を特定するために使う。
     /// <see cref="Flash"/> は呼び出しと同一フレームで即座にアルファを最大へ上げる
-    /// (発音要求もこれと同一フレーム内で行うこと。init.md 要件)。
+    /// (発音要求もこれと同一フレーム内で行うこと。初期構築仕様『§4 機能仕様』の要件)。
     /// </summary>
     [RequireComponent(typeof(Image))]
     public class ScreenFlash : MonoBehaviour
