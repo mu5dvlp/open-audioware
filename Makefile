@@ -26,7 +26,7 @@ PLUGINS_ANDROID_DIR   := unity/Runtime/Plugins/Android/libs/$(ANDROID_ABI)
 
 XCFRAMEWORK           := $(PLUGINS_IOS_DIR)/MwFfi.xcframework
 
-.PHONY: help setup lint format gitleaks test bench bindgen \
+.PHONY: help setup lint format gitleaks test bench bindgen csharp-check \
         build-macos build-ios build-android \
         package unity-sample-create unity-test \
         measurement-scene measurement-export-ios measurement-build-android clean
@@ -34,7 +34,8 @@ XCFRAMEWORK           := $(PLUGINS_IOS_DIR)/MwFfi.xcframework
 help:
 	@echo "open-audioware — make ターゲット"
 	@echo "  make setup          - ツールチェーン・ターゲット・cargo-ndk 等の導入確認"
-	@echo "  make lint           - fmt --check + clippy -D warnings + cargo-deny + 第三者表記の鮮度検査"
+	@echo "  make lint           - fmt --check + clippy -D warnings + cargo-deny + 第三者表記の鮮度検査 + C# ラッパのコンパイル"
+	@echo "  make csharp-check   - unity/Runtime/MwNative.cs を Unity 無しでコンパイル(P3-8)"
 	@echo "  make third-party-licenses       - THIRD-PARTY-LICENSES.md を再生成(依存を足したら必ず実行)"
 	@echo "  make third-party-licenses-check - 再生成して差分が無いか検査(CI 用)"
 	@echo "  make format         - cargo fmt (自動整形)"
@@ -93,6 +94,48 @@ lint:
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo deny check
 	@$(MAKE) --no-print-directory third-party-licenses-check
+	@$(MAKE) --no-print-directory csharp-check
+
+# ===========================================================================
+# C# ラッパのコンパイル検査(P3-8)
+# ===========================================================================
+#
+# 🔴 `unity/Runtime/MwNative.cs` は**手書き**で、csbindgen 生成物のフィールドを
+# 名指しで詰め替えている。Rust 側でフィールド名・型・シグネチャが変わると
+# **壊れるのは C# のコンパイルだけ**で、cargo test は全部緑のまま通る。
+# Unity のテストは CI で回さない方針(コーヒー基準)なので、2026-09-15 まで
+# **この C# は CI で一度もコンパイルされていなかった** —— ズレに気付くのは
+# テンプレート利用者が IL2CPP ビルドを回したとき、という状態だった。
+#
+# ⚠️ **レイアウト(オフセット・サイズ)はこちらでは見ていない。**
+# そちらは `crates/mw-ffi/src/csharp_abi_sync.rs` の `offset_of!` assert が固定する
+# (フィールドの並べ替えは C# のコンパイルを通ってしまう。実測で確認済み)。
+# 理由と分担は `tools/csharp-abi-check/README.md`。
+#
+# ⚠️ **iOS の `__Internal` 分岐も別に1回コンパイルする。** 生成物の
+# `#if UNITY_IOS && !UNITY_EDITOR` は既定ビルドでは通らず、ここは過去に実際の
+# iOS リンク失敗を生んだ箇所(`crates/mw-ffi/build.rs` のコメント参照)。
+CSHARP_ABI_PROJECT := tools/csharp-abi-check/MwAbiCheck.csproj
+CSHARP_GENERATED := unity/Runtime/Generated/NativeMethods.g.cs
+
+csharp-check: ## MwNative.cs を Unity 無しでコンパイルする(P3-8)
+	@command -v dotnet >/dev/null 2>&1 || { \
+	  echo "[error] dotnet が見つかりません。C# ラッパのコンパイル検査ができないため中断します。"; \
+	  echo "        インストール: https://dotnet.microsoft.com/download (SDK 8.0 以降)"; \
+	  echo "        ⚠️ 未インストールを黙って skip すると『嘘の緑』になるため、あえて失敗させています。"; \
+	  exit 1; \
+	}
+	@test -f $(CSHARP_GENERATED) || { \
+	  echo "[info] $(CSHARP_GENERATED) が無いので cargo build で生成します"; \
+	  cargo build -p mw-ffi; \
+	}
+	@echo "[csharp-check] 既定(Unity Editor / macOS / Android 経路)"
+	@dotnet build $(CSHARP_ABI_PROJECT) -v q --nologo
+	@echo "[csharp-check] UNITY_IOS(__Internal 静的リンク経路)"
+	@dotnet build $(CSHARP_ABI_PROJECT) -v q --nologo \
+	  -p:DefineConstants=UNITY_IOS \
+	  -p:BaseOutputPath=$(CURDIR)/tools/csharp-abi-check/obj/out-ios/
+	@echo "[ok] C# ラッパは両方の分岐でコンパイルできました"
 
 # ===========================================================================
 # gitleaks(秘密情報のコミット検知)

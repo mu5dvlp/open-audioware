@@ -23,7 +23,7 @@
 //! したがって C# 側の対応する列挙は必ず手書きになり、今後もこのテストのような
 //! 手動同期の検証が要る。
 //!
-//! # 設計: 二重の防御
+//! # 設計: 三重の防御
 //!
 //! 1. **コンパイル時**: 各 `describe_*` 関数の中で Rust の enum を **ワイルドカード
 //!    無しの `match`** に通す。Rust 側に新しい判別子(variant)が増えると、この
@@ -35,6 +35,23 @@
 //!    `unity/Runtime/MwNative.cs` を `include_str!` で読み込んでテキストとして
 //!    抽出した C# 側の値と突き合わせる。名前の集合(過不足)と値の両方を検査するため、
 //!    「C# 側に新しい判別子が無い」「値がズレている」の両方を検出する。
+//!
+//! 3. **レイアウト**(`cargo test`、P3-8 で追加): FFI 境界を越える blittable 構造体
+//!    (`MwMusicPosition` / `MwOutputUnderrunStats` / `MwEvent`)の**各フィールドの
+//!    オフセットと構造体全体のサイズ**を `std::mem::offset_of!` で固定する。
+//!
+//!    🔴 **1・2 では絶対に捕まらないズレがある** —— フィールドの**並べ替え**と
+//!    **パディングの移動**である。名前も型も enum の値も全部合っているのに、
+//!    `#[repr(C)]` のレイアウトだけが変わるので、C# 側は**黙って隣のフィールドを読む。**
+//!    `u64` と `u32` が隣り合っている構造体(`MwMusicPosition` の
+//!    `sample_rate`/`state`/`is_playing`/`generation` の並び)では現実に起こりうる。
+//!    ⚠️ ズレた結果は「クラッシュ」ではなく「**それらしい値が入っている**」なので、
+//!    音がずれる・時計が飛ぶといった形でしか表に出ない(初期構築仕様『§4.4』の
+//!    音楽クロックはこの構造体そのもの)。
+//!
+//!    📌 **C# 側の名前・型のズレは Rust からは見えない**(あちらのコンパイルが要る)。
+//!    そちらは `tools/csharp-abi-check`(`make csharp-check`)が担当する ——
+//!    **レイアウトはこちら、名前と型はあちら**で、両方無いと P3-8 は埋まらない。
 //!
 //! # なぜ `unity-sample` の EditMode テストではなくこの形にしたか
 //!
@@ -380,5 +397,96 @@ mod tests {
     #[should_panic(expected = "が見つからない")]
     fn extract_csharp_enum_panics_when_the_enum_is_missing() {
         extract_csharp_enum(MW_NATIVE_CS, "ThisEnumDoesNotExistInMwNativeCs");
+    }
+
+    // =======================================================================
+    // レイアウトの固定(P3-8。モジュール doc「三重の防御」の 3)
+    // =======================================================================
+    //
+    // 🔴 **フィールドを1つ足す・順番を入れ替えるだけで、C# 側は黙って別のバイトを読む。**
+    // `#[repr(C)]` は「C と同じ規則で並べる」ことしか保証しておらず、**宣言順を
+    // 変えたらオフセットも変わる。** 名前・型・enum の値は全部合ったままなので、
+    // このファイルの他のテストも `dotnet build`(`tools/csharp-abi-check`)も緑のまま通る。
+    //
+    // ⚠️ **ここが落ちたときに「数字を直す」で済ませてはいけない。**
+    // 落ちたということは C# 側(`unity/Runtime/MwNative.cs` の詰め替え)と
+    // csbindgen 生成物の再生成が要るという合図である。
+    // 手順: (1) Rust 側の意図した変更か確認 → (2) `cargo build` で生成物を作り直す →
+    // (3) `make csharp-check` を通す → (4) そのうえでこの期待値を更新する。
+
+    /// 音楽クロックのスナップショット(初期構築仕様『§4.4』)。
+    ///
+    /// 🔴 **このリポジトリでいちばん危ないレイアウト。** `u32`(`sample_rate`)/
+    /// `MwMusicState`(`i32` 相当)/ `u8`(`is_playing`)/ `u32`(`generation`)が
+    /// 連続しており、**順番を入れ替えるとパディングの入り方が変わって全体サイズは
+    /// 32 のまま**になりうる —— サイズ assert だけでは通ってしまう。
+    /// だからフィールドごとのオフセットを1つずつ固定する。
+    #[test]
+    fn mw_music_position_field_offsets_are_pinned() {
+        use crate::types::MwMusicPosition;
+
+        assert_eq!(std::mem::offset_of!(MwMusicPosition, song_frames), 0);
+        assert_eq!(std::mem::offset_of!(MwMusicPosition, host_time_ns), 8);
+        assert_eq!(std::mem::offset_of!(MwMusicPosition, sample_rate), 16);
+        assert_eq!(std::mem::offset_of!(MwMusicPosition, state), 20);
+        assert_eq!(std::mem::offset_of!(MwMusicPosition, is_playing), 24);
+        assert_eq!(std::mem::offset_of!(MwMusicPosition, generation), 28);
+        assert_eq!(std::mem::size_of::<MwMusicPosition>(), 32);
+        assert_eq!(std::mem::align_of::<MwMusicPosition>(), 8);
+    }
+
+    /// 出力アンダーラン + 予約 SE オーバーフローの統計。
+    /// ⚠️ `se_schedule_overflow_count`(P3-12 で追加)は `consecutive_count`(`u32`)の
+    /// 後の4バイトパディングを跨いで 24 に乗る。**この「跨ぐ」性質が、
+    /// フィールドを足す位置を変えた瞬間に壊れる。**
+    #[test]
+    fn mw_output_underrun_stats_field_offsets_are_pinned() {
+        use crate::types::MwOutputUnderrunStats;
+
+        assert_eq!(std::mem::offset_of!(MwOutputUnderrunStats, count), 0);
+        assert_eq!(
+            std::mem::offset_of!(MwOutputUnderrunStats, last_host_time_ns),
+            8
+        );
+        assert_eq!(
+            std::mem::offset_of!(MwOutputUnderrunStats, consecutive_count),
+            16
+        );
+        assert_eq!(
+            std::mem::offset_of!(MwOutputUnderrunStats, se_schedule_overflow_count),
+            24
+        );
+        assert_eq!(std::mem::size_of::<MwOutputUnderrunStats>(), 32);
+        assert_eq!(std::mem::align_of::<MwOutputUnderrunStats>(), 8);
+    }
+
+    /// イベント(初期構築仕様『§4.6』)。`mw_poll_events` は C# 側が確保した配列へ
+    /// **これを直接書き込む** ——🔴 サイズがズレると**呼び出し側のバッファを踏み越える**
+    /// (このリポジトリで唯一の「ヒープ破壊」クラスの経路。P3-8 が 🔴 な理由そのもの)。
+    #[test]
+    fn mw_event_field_offsets_are_pinned() {
+        use crate::event::MwEvent;
+
+        assert_eq!(std::mem::offset_of!(MwEvent, kind), 0);
+        assert_eq!(std::mem::offset_of!(MwEvent, payload), 8);
+        assert_eq!(std::mem::size_of::<MwEvent>(), 16);
+        assert_eq!(std::mem::align_of::<MwEvent>(), 8);
+    }
+
+    /// 判別子を運ぶ enum が C# 側の想定どおり **4バイト**であること。
+    ///
+    /// 🔴 `#[repr(i32)]`(または `#[repr(C)]`)を外すと Rust は**サイズを自由に選べる**
+    /// (判別子が少ない enum なら 1バイトにしうる)。その瞬間、これらを
+    /// フィールドに持つ構造体のレイアウトが丸ごとずれる。
+    /// ⚠️ **上のオフセット assert だけでは足りない** —— `MwEventKind` が 1バイトに
+    /// なっても `payload` は 8 に揃うので `MwEvent` のオフセットは変わらないが、
+    /// C# 側が `int` として読む4バイトのうち3バイトがゴミになる。
+    #[test]
+    fn discriminant_carrying_enums_are_four_bytes() {
+        assert_eq!(std::mem::size_of::<MwEventKind>(), 4);
+        assert_eq!(std::mem::size_of::<MwMusicState>(), 4);
+        assert_eq!(std::mem::size_of::<MwResult>(), 4);
+        assert_eq!(std::mem::size_of::<MwSoundMode>(), 4);
+        assert_eq!(std::mem::size_of::<MwBus>(), 4);
     }
 }

@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    🔴 Unity 無しで `unity/Runtime/MwNative.cs` をコンパイルするだけのプロジェクト(P3-8)。
+    理由・何を見ていて何を見ていないかは同ディレクトリの README.md。
+
+    ⚠️ 実行しない(ライブラリとしてビルドするだけ)。ネイティブライブラリの解決も
+    しないので、`DllImport` 先が存在しなくても構わない —— 見たいのは「C# として
+    コンパイルが通るか」だけ。
+  -->
+
+  <PropertyGroup>
+    <!--
+      Unity 2022+ のスクリプティングランタイムに合わせる。⚠️ Unity 側の C# バージョンより
+      新しい言語機能を**通してしまわない**ことが目的なので、上げるときは Unity 側の
+      対応状況を確認すること(ここが緩いと「CI は通るが Unity で落ちる」に戻る)。
+    -->
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- 🔴 警告もエラーにする。ここを緩めると、利用側 Unity で初めて気付くことになる。 -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <!-- 成果物は捨てるだけなので、リポジトリを汚さない位置へ出す。 -->
+    <BaseOutputPath>$(MSBuildThisFileDirectory)obj/out/</BaseOutputPath>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      検査対象は2つだけ。⚠️ ワイルドカードにしないこと —— 「Unity 型に依存しない」性質を
+      保っているのはこの2ファイルだけで、将来 Unity 依存のファイルが unity/Runtime/ に
+      増えたときに、この検査が黙って壊れるのを避ける。
+    -->
+    <Compile Include="../../unity/Runtime/MwNative.cs" />
+    <Compile Include="../../unity/Runtime/Generated/NativeMethods.g.cs" />
+  </ItemGroup>
+
+</Project>

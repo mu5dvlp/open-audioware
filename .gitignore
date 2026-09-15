@@ -49,3 +49,8 @@ unity-sample/.utmp/
 # --- IDE ---
 .vscode/
 *.swp
+
+# C# ラッパのコンパイル検査(tools/csharp-abi-check)の中間・成果物。
+# 🔴 コンパイルが通るかだけを見る捨て成果物で、リポジトリには入れない(P3-8)。
+tools/csharp-abi-check/obj/
+tools/csharp-abi-check/bin/

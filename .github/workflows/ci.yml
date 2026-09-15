@@ -46,6 +46,24 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
+      # 🔴 P3-8: 手書きの C# ラッパ(unity/Runtime/MwNative.cs)を Unity 無しで
+      # コンパイルする。ここまでの cargo ステップは Rust 側しか見ておらず、
+      # C# 側のフィールド名・型・シグネチャのズレは**一切検出できない**
+      # (Unity のテストは CI で回さない方針なので、他に見る場所が無い)。
+      #
+      # ⚠️ **cargo test より後に置くこと。** 検査対象の
+      # unity/Runtime/Generated/NativeMethods.g.cs は crates/mw-ffi/build.rs が
+      # 生成する成果物で、リポジトリには入っていない(.gitignore)。
+      # 📌 3秒で終わるのでコーヒー基準を壊さない。Makefile と二重に書かないため
+      # `make csharp-check` を呼ぶ(既定分岐と UNITY_IOS 分岐の両方を見る)。
+      - name: Setup .NET (C# ラッパのコンパイル検査用)
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: make csharp-check
+        run: make csharp-check
+
   # macos: .dylib(Unity Editor 用)+ xcframework(iOS)
   macos-build:
     runs-on: macos-latest
