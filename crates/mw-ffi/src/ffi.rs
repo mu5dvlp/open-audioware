@@ -768,22 +768,22 @@ fn set_music_track(handle: u64, sound_id: u64, target: MusicTarget) -> MwResult 
             };
             let output_sample_rate = instance.backend_sample_rate();
 
-            // `SymphoniaDecoder::open` は `Vec<u8>` を値で要求するため複製する
-            // (`Instance::remove_music_bytes` のドキュメント参照——この複製により
-            // デコードスレッドはストレージと独立したメモリを持つことになる)。
-            let decoder =
-                match mw_core::SymphoniaDecoder::open((*bytes).clone(), output_sample_rate) {
-                    Ok(decoder) => decoder,
-                    Err(err) => {
-                        mw_backend::mw_log!(
-                            "[mw-ffi] {}: decode open failed: {err}",
-                            target.set_fn_name()
-                        );
-                        // P1-6: エラーコードへの変換は `impl From<DecodeError> for MwResult`
-                        // (`result.rs`)へ集約した。
-                        return err.into();
-                    }
-                };
+            // 🔴 **複製しない**(P3-13)。`open_shared` は `Arc<Vec<u8>>` をそのまま取るので、
+            // 数十MB の ogg でもここでの `memcpy` はゼロ。デコードスレッドは同じバイト列を
+            // `Arc` で共有し、`mw_sound_release` されても参照が生きている限り解放されない
+            // (`Instance::remove_music_bytes` のドキュメント参照)。
+            let decoder = match mw_core::SymphoniaDecoder::open_shared(bytes, output_sample_rate) {
+                Ok(decoder) => decoder,
+                Err(err) => {
+                    mw_backend::mw_log!(
+                        "[mw-ffi] {}: decode open failed: {err}",
+                        target.set_fn_name()
+                    );
+                    // P1-6: エラーコードへの変換は `impl From<DecodeError> for MwResult`
+                    // (`result.rs`)へ集約した。
+                    return err.into();
+                }
+            };
 
             // 1) 先にデコーダを差し替える(このドキュメントの「曲の切り替えで
             //    前曲の PCM が漏れる問題への対処」参照。順序は変えないこと)。

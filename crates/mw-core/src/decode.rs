@@ -37,6 +37,7 @@
 
 use std::fmt;
 use std::io::Cursor;
+use std::sync::Arc;
 
 use symphonia::core::audio::{SampleBuffer, SignalSpec};
 use symphonia::core::codecs::{CODEC_TYPE_NULL, Decoder, DecoderOptions};
@@ -354,13 +355,66 @@ pub struct SymphoniaDecoder {
     position_frames: u64,
 }
 
+/// `Arc<Vec<u8>>` を Symphonia の `MediaSource`(= `Cursor<T> where T: AsRef<[u8]>`)へ
+/// そのまま載せるための薄いラッパ。
+///
+/// 🔴 **これが無いと、曲を切り替えるたびに圧縮バイト列を丸ごと複製することになる。**
+/// `Arc<T>` が実装しているのは `AsRef<T>`(= `AsRef<Vec<u8>>`)であって `AsRef<[u8]>` では
+/// ないため、`Cursor<Arc<Vec<u8>>>` は `MediaSource` を満たさない。newtype を1枚挟んで
+/// `AsRef<[u8]>` を自分で実装するのが、余分なコピーを増やさない唯一の方法
+/// (`Arc<[u8]>` へ持ち替える案もあるが、`Vec<u8>` → `Arc<[u8]>` の変換自体が1回コピーで、
+/// 呼び出し側〔`mw-ffi` の音源ストレージ〕の型も一緒に変える必要がある)。
+///
+/// 実害の規模: 数十MB の ogg を持つ曲で、切り替えのたびにゲームスレッドで
+/// 数十MB の `memcpy` + ピークメモリ倍(REFACTOR-PLAN P3-13)。
+#[derive(Debug, Clone)]
+pub struct SharedBytes(Arc<Vec<u8>>);
+
+impl SharedBytes {
+    /// 共有バイト列を包む(複製しない)。
+    pub fn new(bytes: Arc<Vec<u8>>) -> Self {
+        Self(bytes)
+    }
+}
+
+impl AsRef<[u8]> for SharedBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl From<Arc<Vec<u8>>> for SharedBytes {
+    fn from(bytes: Arc<Vec<u8>>) -> Self {
+        Self(bytes)
+    }
+}
+
+impl From<Vec<u8>> for SharedBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self(Arc::new(bytes))
+    }
+}
+
 impl SymphoniaDecoder {
     /// メモリ上のバイト列を開き、デコード可能かを確認する。
     ///
     /// `output_sample_rate` は出力(デバイス)側のサンプルレート。素材のレートと一致しない
     /// 場合は内部でリサンプラ(`resample.rs::StreamResampler`)を構築する(モジュール doc)。
+    ///
+    /// 📌 **既に `Arc<Vec<u8>>` を持っているなら [`SymphoniaDecoder::open_shared`] を使うこと**
+    /// —— こちらは `Vec<u8>` を受け取るので、呼び出し側が複製を作る羽目になる
+    /// (`mw-ffi` が実際にそうなっていた。P3-13)。
     pub fn open(bytes: Vec<u8>, output_sample_rate: u32) -> Result<Self, DecodeError> {
-        let cursor = Cursor::new(bytes);
+        Self::open_shared(Arc::new(bytes), output_sample_rate)
+    }
+
+    /// [`SymphoniaDecoder::open`] と同じだが、**共有された**バイト列を複製せずに開く。
+    ///
+    /// 🔴 曲の切り替え(`mw_music_set`)と再オープン後の復元は、音源ストレージが持つ
+    /// `Arc<Vec<u8>>` をそのまま渡せる。数十MB の ogg でゲームスレッドが `memcpy` に
+    /// 費やしていた時間と、ピークメモリの倍増が無くなる(P3-13)。
+    pub fn open_shared(bytes: Arc<Vec<u8>>, output_sample_rate: u32) -> Result<Self, DecodeError> {
+        let cursor = Cursor::new(SharedBytes::new(bytes));
         let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
 
         // 拡張子等のヒントは持たない(入力はメモリ上のバイト列のみ。§4.7)。
@@ -653,6 +707,55 @@ mod tests {
             }
         }
         got
+    }
+
+    /// 🔴 **P3-13 の退行防止。** `open_shared` が「共有」でなくなったら(= 内部で
+    /// 複製を作るように戻したら)ここで落ちる。
+    ///
+    /// ⚠️ これを `total_frames` 等の「動く」確認だけで守ろうとしても無理 ——
+    /// 複製しても動きは一切変わらず、**変わるのは曲切り替えの所要時間とピークメモリだけ**
+    /// だからである(数十MB の ogg でゲームスレッドがヒッチする)。
+    /// 参照カウントを直接見るのが、この性質を固定できる唯一の方法。
+    #[test]
+    fn open_shared_shares_the_compressed_bytes_instead_of_copying_them() {
+        let samples: Vec<i16> = vec![0, 0, 16384, -16384];
+        let bytes = Arc::new(make_pcm16_wav(SAMPLE_RATE, 2, &samples));
+        let before = Arc::strong_count(&bytes);
+
+        let decoder = SymphoniaDecoder::open_shared(Arc::clone(&bytes), SAMPLE_RATE)
+            .expect("valid wav must open");
+
+        assert!(
+            Arc::strong_count(&bytes) > before,
+            "open_shared がバイト列を共有していない(複製して捨てている)。\n             呼び出し側〔mw-ffi の mw_music_set〕は曲を切り替えるたびに数十MB の memcpy を\n             ゲームスレッドで行うことになる(REFACTOR-PLAN P3-13)。"
+        );
+
+        drop(decoder);
+        assert_eq!(
+            Arc::strong_count(&bytes),
+            before,
+            "デコーダを落としても参照が残っている(バイト列が解放されない)。"
+        );
+    }
+
+    /// `open`(`Vec<u8>` を値で受ける既存の入口)も `open_shared` 経由で動くこと。
+    /// ⚠️ テストの大半がこちらを使っているので、委譲を壊すと広範囲に落ちる ——
+    /// **落ちる前にここで分かるようにしておく。**
+    #[test]
+    fn open_still_works_and_is_equivalent_to_open_shared() {
+        let samples: Vec<i16> = vec![0, 0, 16384, -16384, -16384, 16384];
+        let bytes = make_pcm16_wav(SAMPLE_RATE, 2, &samples);
+
+        let mut by_value =
+            SymphoniaDecoder::open(bytes.clone(), SAMPLE_RATE).expect("valid wav must open");
+        let mut shared = SymphoniaDecoder::open_shared(Arc::new(bytes), SAMPLE_RATE)
+            .expect("valid wav must open");
+
+        assert_eq!(by_value.total_frames(), shared.total_frames());
+        assert_eq!(
+            drain_left_channel(&mut by_value, 4),
+            drain_left_channel(&mut shared, 4)
+        );
     }
 
     #[test]

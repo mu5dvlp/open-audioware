@@ -293,12 +293,19 @@ impl Instance {
     /// `id` をストレージから取り除く(`mw_sound_release` の楽曲 ID 経路)。
     ///
     /// 再生中の楽曲を release した場合の挙動: 拒否せず即座に解放を受け付ける。
-    /// `mw_music_set` は `SymphoniaDecoder::open` にバイト列の**複製**を渡す
-    /// (`SymphoniaDecoder::open` が `Vec<u8>` を値で要求するため)ので、デコード
-    /// スレッドが実際に読んでいるメモリはここで管理する `Arc<Vec<u8>>` とは
-    /// 最初から独立している。したがって release してもデコードスレッド側の
-    /// 再生には一切影響しない(参照カウントが尽きるまで生かす、という `Arc` 由来の
-    /// 間接的な挙動ではなく、そもそも別々のメモリになっている、という単純な話)。
+    ///
+    /// 🔴 **P3-13(2026-09-15)で理由が変わった。** それまでは `mw_music_set` が
+    /// `SymphoniaDecoder::open` へバイト列の**複製**を渡していた(`Vec<u8>` を値で
+    /// 要求するため)ので「そもそも別々のメモリ」だった。いまは
+    /// `SymphoniaDecoder::open_shared` に `Arc<Vec<u8>>` をそのまま渡しており、
+    /// **デコードスレッドとストレージは同じメモリを共有している。**
+    ///
+    /// それでも release が安全なのは `Arc` の参照カウントによる ——
+    /// ここでマップから外れても、デコーダが保持している複製(`Arc` の複製であって
+    /// バイト列の複製ではない)が生きている限りメモリは解放されない。
+    /// ⚠️ したがって「release したのにメモリが減らない」ことが**ありうる**
+    /// (再生中の曲を release した場合。曲を切り替えるかデコーダが落ちた時点で減る)。
+    /// 数十MB の複製を毎回作るコストと引き換えに、これは受け入れる判断。
     pub fn remove_music_bytes(&self, id: u64) -> Option<Arc<Vec<u8>>> {
         let mut map = self
             .music_bytes
@@ -776,7 +783,8 @@ impl Instance {
             return;
         };
         let output_sample_rate = self.backend_sample_rate();
-        let decoder = match SymphoniaDecoder::open((*bytes).clone(), output_sample_rate) {
+        // 🔴 複製しない(P3-13)。`get_music_bytes` が返す `Arc` をそのまま渡す。
+        let decoder = match SymphoniaDecoder::open_shared(bytes, output_sample_rate) {
             Ok(decoder) => decoder,
             Err(err) => {
                 mw_backend::mw_log!("[mw-ffi] attempt_reopen: re-decoding music failed: {err}");
@@ -830,7 +838,8 @@ impl Instance {
             return;
         };
         let output_sample_rate = self.backend_sample_rate();
-        let decoder = match SymphoniaDecoder::open((*bytes).clone(), output_sample_rate) {
+        // 🔴 複製しない(P3-13)。`get_music_bytes` が返す `Arc` をそのまま渡す。
+        let decoder = match SymphoniaDecoder::open_shared(bytes, output_sample_rate) {
             Ok(decoder) => decoder,
             Err(err) => {
                 mw_backend::mw_log!("[mw-ffi] attempt_reopen: re-decoding bgm failed: {err}");
