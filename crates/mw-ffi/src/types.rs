@@ -175,10 +175,18 @@ pub struct MwMusicPosition {
 /// `mw_backend::underrun` モジュール doc / `mw_backend::Backend::output_underrun_count`
 /// のドキュメントを参照。
 ///
-/// フィールドは `mw_backend::Backend` の `output_underrun_count` /
+/// 先頭3フィールドは `mw_backend::Backend` の `output_underrun_count` /
 /// `last_output_underrun_host_time_ns` / `consecutive_output_underrun_count` に
 /// 1:1で対応する。`MwMusicPosition` と同じ設計方針(Marshal を挟まず直接読める
 /// 構造体、GC アロケーションゼロ)。
+///
+/// 🔴 **`se_schedule_overflow_count` だけは出自が違う**(`mw_core::Mixer` のカウンタで、
+/// バックエンドとは無関係)。それでもここへ相乗りさせているのは、**この構造体が
+/// 「音声スレッド側で黙って失われたものを、ゲームスレッドが1回の呼び出しで拾う口」**
+/// だからである —— 用途(毎フレームの診断ポーリング)も要求(GC アロケーションゼロ)も
+/// 同じで、カウンタ1本のために P/Invoke をもう1回増やすほうが割に合わない。
+/// ⚠️ **フィールドを足すときは、この「黙って失われたもの」という基準に合うかで判断すること。**
+/// 合わないものを足し始めると、この構造体は雑多な診断値の置き場になる。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MwOutputUnderrunStats {
@@ -190,6 +198,16 @@ pub struct MwOutputUnderrunStats {
     /// 直近まで連続して検知した回数。検知されなかったコールバックが1回でも
     /// 挟まると 0 に戻る。
     pub consecutive_count: u32,
+    /// 予約 SE(`mw_se_schedule`)のキューが満杯で挿入できず、**発音されなかった**
+    /// 累計件数(`mw_core::Mixer::se_schedule_overflow_count`)。
+    ///
+    /// 🔴 **0 以外なら、鳴るはずの音が鳴っていない。** `mw_se_schedule` 自体は
+    /// コマンドキューへ積めた時点で `Ok` を返すため、**この値を見るまで失敗は一切表に出ない。**
+    /// 増え続けるなら `Config::schedule_queue_capacity` が足りていないか、
+    /// 予約を出しすぎている(メトロノーム・キャリブレーションのクリック)。
+    ///
+    /// ⚠️ 上3つと違い、これはバックエンド由来ではなくミキサ由来(構造体 doc 参照)。
+    pub se_schedule_overflow_count: u64,
 }
 
 #[cfg(test)]
@@ -226,11 +244,16 @@ mod tests {
     }
 
     /// blittable であることの直接的な確認(`mw_music_position_size_is_32_bytes` と
-    /// 同じ流儀)。8/8/4 バイトのフィールド列は末尾の `consecutive_count`(4バイト)
-    /// の後に4バイトのパディングが入り、8バイト境界に揃って24バイトになる。
+    /// 同じ流儀)。8/8/4/8 バイトのフィールド列は `consecutive_count`(4バイト)の後に
+    /// 4バイトのパディングが入って `se_schedule_overflow_count` が8バイト境界へ乗り、
+    /// 全体で32バイトになる。
+    ///
+    /// ⚠️ **この値が変わったら C# 側(`unity/Runtime/MwNative.cs`)も必ず見直すこと。**
+    /// `MwNative.GetOutputUnderrunStats` は生成された blittable 構造体を経由して
+    /// 詰め替えるため、レイアウトがずれると**静かに壊れた値を読む。**
     #[test]
-    fn mw_output_underrun_stats_size_is_24_bytes() {
-        assert_eq!(std::mem::size_of::<MwOutputUnderrunStats>(), 24);
+    fn mw_output_underrun_stats_size_is_32_bytes() {
+        assert_eq!(std::mem::size_of::<MwOutputUnderrunStats>(), 32);
     }
 
     #[test]

@@ -163,6 +163,16 @@ pub struct Instance {
     bgm_decode_thread_stop: Arc<AtomicBool>,
     /// BGM 用デコードスレッドの join ハンドル(`decode_thread` の BGM 版)。
     bgm_decode_thread: Option<JoinHandle<()>>,
+    /// 予約 SE のキューが満杯で挿入できず**発音されなかった**累計件数
+    /// (`mw_core::Mixer::se_schedule_overflow_count` の複製)。`mw_get_output_underrun_stats`
+    /// がここから読む。
+    ///
+    /// 🔴 **`Renderer` を `Backend::open` へムーブする前に取ること** —— ムーブ後は
+    /// `Mixer` へ触れない(`mw_core::renderer` モジュール doc「所有権の設計」)。
+    /// ⚠️ 再オープン(`attempt_reopen`)は `Mixer` ごと作り直すので、**このフィールドも
+    /// 一緒に差し替える**(差し替え忘れると、誰も増やさない古いカウンタを読み続けて
+    /// 「ずっと 0」に見える)。
+    se_schedule_overflow_count: Arc<AtomicU64>,
 
     // --- M3「Android(AAudio)切断復旧」案A(初期構築仕様『§6』確定) ------------------
     //
@@ -398,11 +408,15 @@ impl Instance {
     /// **`mw_core::Event::Underrun`(`mw_poll_events` 経由)とは別物。**
     /// `mw_backend::underrun` モジュール doc / `crate::types::MwOutputUnderrunStats`
     /// のドキュメント参照。
-    pub fn output_underrun_stats(&self) -> (u64, u64, u32) {
+    /// ⚠️ 4つ目(`se_schedule_overflow_count`)だけは**バックエンド由来ではない** ——
+    /// ミキサのカウンタで、相乗りさせている理由は `crate::types::MwOutputUnderrunStats`
+    /// のドキュメント参照。
+    pub fn output_underrun_stats(&self) -> (u64, u64, u32, u64) {
         (
             self.backend.output_underrun_count(),
             self.backend.last_output_underrun_host_time_ns(),
             self.backend.consecutive_output_underrun_count(),
+            self.se_schedule_overflow_count.load(Ordering::Relaxed),
         )
     }
 
@@ -653,6 +667,12 @@ impl Instance {
         //    (`MusicClockPublisher::seed_generation_after_reopen` のドキュメント参照)。
         music_clock.seed_generation_after_reopen(clock_before.generation.wrapping_add(1));
 
+        // 🔴 `renderer` を `Backend::open` へムーブする**前に**、予約 SE オーバーフローの
+        //    カウンタを取っておく(ムーブ後は `Mixer` へ触れない)。
+        //    ⚠️ ここで取り忘れると、再オープン後は**誰も増やさない古いカウンタ**を
+        //    読み続けることになり、診断値が「ずっと 0」に見える。
+        let se_schedule_overflow_count = renderer.se_schedule_overflow_counter();
+
         // 5) 実際にバックエンドを開き直す。
         match self.backend.open(renderer, Arc::clone(&self.events)) {
             Ok(()) => {
@@ -671,6 +691,7 @@ impl Instance {
                 self.bgm_decoder_tx = bgm_decoder_tx;
                 self.bgm_decode_thread_stop = bgm_decode_thread_stop;
                 self.bgm_decode_thread = Some(bgm_decode_thread_handle);
+                self.se_schedule_overflow_count = se_schedule_overflow_count;
                 // 新しいセッション用に「1回だけ」ログのフラグも仕切り直す(そうしないと
                 // 新しいストリームの実測値〔I/O バッファ長〕が二度とログされない)。
                 self.logged_buffer_info.store(false, Ordering::Relaxed);
@@ -888,6 +909,9 @@ pub fn init() -> InitOutcome {
         bgm,
     ) = Renderer::build(Config::default(), PROVISIONAL_SAMPLE_RATE);
 
+    // 🔴 `renderer` を `Backend::open` へムーブする**前に**取る(`attempt_reopen` と同じ理由)。
+    let se_schedule_overflow_count = renderer.se_schedule_overflow_counter();
+
     let mut backend = CpalBackend::new();
     if let Err(err) = backend.open(renderer, Arc::clone(&events)) {
         // 実機(特に iOS)では失敗理由が分からないと原因を特定できないため、
@@ -935,6 +959,7 @@ pub fn init() -> InitOutcome {
         bgm_decoder_tx,
         bgm_decode_thread_stop,
         bgm_decode_thread: Some(bgm_decode_thread_handle),
+        se_schedule_overflow_count,
         last_music_sound_id: AtomicU64::new(0),
         last_music_loop: Mutex::new(None),
         last_bgm_sound_id: AtomicU64::new(0),

@@ -457,9 +457,12 @@ pub unsafe extern "C" fn mw_se_play(
 ///
 /// 予約キューは固定容量(`Config::schedule_queue_capacity`)。この呼び出し自体は
 /// コマンドキューへ積めた時点で成功を返すが、音声スレッドが実際に予約キューへ
-/// 挿入する段階で満杯だった場合は**その予約は発音されない**
-/// (`mw_core::Renderer::se_schedule_overflow_count` で検知できる。イベント通知への
-/// 昇格は M2-6 以降)。
+/// 挿入する段階で満杯だった場合は**その予約は発音されない**。
+/// 🔴 **検知する口は [`mw_get_output_underrun_stats`] の `se_schedule_overflow_count`**
+/// (カウンタの実体は `mw_core::Mixer::se_schedule_overflow_count`。`Renderer` にも
+/// 同名の委譲メソッドがあるが、`Renderer` は `Backend::open` へムーブされるので
+/// ゲームスレッドからは触れない —— **FFI 経由で読むこと**)。
+/// 初期構築仕様『§4.6』の6種に含まれないため、イベント通知への昇格はしていない。
 ///
 /// # Safety
 /// `out_voice` は書き込み可能な `u64` を指す有効なポインタであるか、null でなければならない。
@@ -1140,6 +1143,11 @@ pub unsafe extern "C" fn mw_get_output_latency_ns(handle: u64, out_ns: *mut u64)
 /// `mw_host_time_ns()` と同じ時計。未検知なら 0)・直近まで連続して検知した回数
 /// (`consecutive_count`)を書き込む。GC アロケーションゼロ。
 ///
+/// あわせて **`se_schedule_overflow_count`**(予約 SE のキューが満杯で挿入できず
+/// 発音されなかった累計件数)も書き込む。🔴 **`mw_se_schedule` は予約が捨てられても
+/// `Ok` を返す**ので、鳴らなかったことに気付ける口はここしか無い。
+/// バックエンド由来の上3つと出自が違う理由は [`MwOutputUnderrunStats`] のドキュメント参照。
+///
 /// あわせて、新たに検知した分があれば[`CpalBackend::log_new_output_underruns`]
 /// (`mw_backend::CpalBackend`)をこのゲームスレッド経路から呼ぶ(**コールバック内
 /// から呼んではいけない**——`mw_log!` はアロケーションとロックを伴うため、初期構築
@@ -1163,13 +1171,14 @@ pub unsafe extern "C" fn mw_get_output_underrun_stats(
             instance.output_underrun_stats()
         });
         match result {
-            Some((count, last_host_time_ns, consecutive_count)) => {
+            Some((count, last_host_time_ns, consecutive_count, se_schedule_overflow_count)) => {
                 // SAFETY: 上で null チェック済み。
                 unsafe {
                     *out = MwOutputUnderrunStats {
                         count,
                         last_host_time_ns,
                         consecutive_count,
+                        se_schedule_overflow_count,
                     };
                 }
                 MwResult::Ok
@@ -1634,10 +1643,13 @@ mod tests {
         // 混ぜていないので count は 0 のはず(アンダーラン検知そのものの単体テストは
         // `mw_backend::underrun` — 実デバイス無しで「モックの」コールバック系列を
         // 直接駆動して確認済み)。
+        // ⚠️ わざと 0 以外で埋めてから渡す —— 「書き込まれなかった」と
+        // 「0 が書き込まれた」を区別するため。
         let mut underrun_stats = MwOutputUnderrunStats {
             count: 1,
             last_host_time_ns: 1,
             consecutive_count: 1,
+            se_schedule_overflow_count: 1,
         };
         assert_eq!(
             unsafe {
@@ -1651,6 +1663,10 @@ mod tests {
         assert_eq!(underrun_stats.count, 0);
         assert_eq!(underrun_stats.last_host_time_ns, 0);
         assert_eq!(underrun_stats.consecutive_count, 0);
+        // 🔴 予約 SE のオーバーフローも同じ呼び出しで書き込まれること(P3-12)。
+        // このテストは予約を1件も出していないので 0。⚠️ 渡す前に 1 で埋めてあるため、
+        // 「書き込み漏れ」なら 1 のまま残ってここで落ちる。
+        assert_eq!(underrun_stats.se_schedule_overflow_count, 0);
 
         // 楽曲バイト列を release しても SE 側は無事(ID 空間分離が効いていることの
         // 実ハンドル越しの確認、依頼書のテスト要件)。
@@ -2693,6 +2709,7 @@ mod tests {
             count: 0,
             last_host_time_ns: 0,
             consecutive_count: 0,
+            se_schedule_overflow_count: 0,
         };
         let result = unsafe {
             mw_get_output_underrun_stats(0xDEAD_BEEF_u64, &mut out as *mut MwOutputUnderrunStats)

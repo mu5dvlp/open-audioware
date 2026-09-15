@@ -16,6 +16,7 @@
 //! 追加の同期プリミティブが一切不要になる(単一の書き手のみが `&mut self` で触る)。
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use crate::clock::{MusicClockPublisher, RenderedFrameCounter};
 use crate::config::Config;
@@ -174,6 +175,13 @@ impl Renderer {
     /// 予約 SE のキューが満杯で挿入できず、発音されなかった累計件数(初期構築仕様『§4.5』)。
     pub fn se_schedule_overflow_count(&self) -> u64 {
         self.mixer.se_schedule_overflow_count()
+    }
+
+    /// 上のカウンタを**ゲームスレッドから読むための複製**を返す
+    /// ([`crate::mixer::Mixer::se_schedule_overflow_counter`] への委譲)。
+    /// 🔴 `Backend::open` へこの `Renderer` をムーブする**前に**取ること。
+    pub fn se_schedule_overflow_counter(&self) -> Arc<AtomicU64> {
+        self.mixer.se_schedule_overflow_counter()
     }
 }
 

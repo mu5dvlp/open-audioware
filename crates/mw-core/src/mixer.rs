@@ -250,7 +250,15 @@ pub struct Mixer {
     /// `se_schedule` が満杯で挿入できなかった回数(`clipper.rs` の動作回数カウントと
     /// 同じ流儀)。初期構築仕様『§4.6』の6種(M2-6 で実装済み)には含まれないため、
     /// イベント通知への昇格は行っていない(問い合わせ API 経由のままでよいと判断)。
-    se_schedule_overflow_count: AtomicU64,
+    ///
+    /// 🔴 **`Arc` にしてあるのは、ゲームスレッドから読ませるため。** `Mixer` 自体は
+    /// `Backend::open` へムーブされて音声コールバックスレッドの排他所有物になる
+    /// (`renderer.rs` モジュール doc「所有権の設計」)ので、ゲームスレッドは
+    /// `Mixer` へ触れない。[`Mixer::se_schedule_overflow_counter`] で取った複製を
+    /// `mw-ffi` 側の `Instance` が保持し、`mw_get_output_underrun_stats` から読む。
+    /// ⚠️ 音声スレッド側の操作は `fetch_add`(Relaxed)のみで、アロケーションもロックも
+    /// 増えない(初期構築仕様『§5.3』のリアルタイム安全性規約に抵触しない)。
+    se_schedule_overflow_count: Arc<AtomicU64>,
     /// 音楽クロックの相関点(初期構築仕様『§4.4』)。音声スレッドが書き、
     /// ゲームスレッドが `Arc` の複製経由でロック無しに読む(seqlock、`clock.rs`)。
     music_clock: Arc<MusicClockPublisher>,
@@ -354,7 +362,7 @@ pub fn build_with_events(
         bgm_source,
         bgm_state: Arc::clone(&bgm_state),
         se_schedule: ScheduleQueue::with_capacity(config.schedule_queue_capacity),
-        se_schedule_overflow_count: AtomicU64::new(0),
+        se_schedule_overflow_count: Arc::new(AtomicU64::new(0)),
         music_clock: Arc::clone(&music_clock),
         events: Arc::clone(&events),
         underrun_accumulator: 0,
@@ -804,6 +812,14 @@ impl Mixer {
     /// `se_schedule` が満杯で挿入できず、発音されなかった予約 SE の累計件数。
     pub fn se_schedule_overflow_count(&self) -> u64 {
         self.se_schedule_overflow_count.load(Ordering::Relaxed)
+    }
+
+    /// 上のカウンタを**ゲームスレッドから読むための複製**を返す
+    /// (`Backend::open` へムーブする**前に**取っておくこと —— ムーブ後は `Mixer` に
+    /// 触れない)。⚠️ 返した `Arc` は読み取り専用に使うこと。増やすのは音声スレッドだけ
+    /// (`Command::SeSchedule` の処理)という単一書き手の前提を崩さない。
+    pub fn se_schedule_overflow_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.se_schedule_overflow_count)
     }
 
     /// 現在キューに残っている予約 SE の件数(診断・テスト用)。

@@ -21,6 +21,9 @@ C ABI 境界。`mw-core` / `mw-backend` 両方に依存する唯一のクレー�
   M3 で `MwOutputUnderrunStats`(`#[repr(C)]`、blittable。`mw_get_output_underrun_stats`
   の out 引数)を追加した——`MwMusicPosition` と同じ設計方針(count/last_host_time_ns/
   consecutive_count の3値をひとまとめに返す)。
+  🔴 **P3-12(2026-09-15)で4つ目 `se_schedule_overflow_count` を足した**(構造体は 24 → **32 バイト**)。
+  これだけバックエンド由来ではなく `mw_core::Mixer` 由来で、相乗りの理由・**足してよいものの
+  基準**(「音声スレッド側で黙って失われたもの」)は `types.rs` の同構造体 doc に書いてある。
 - `src/handle.rs` — init/shutdown のグローバルレジストリ(`OnceLock<Mutex<Option<Instance>>>`)。
   ハンドルは不透明な `u64`(ポインタを C# に渡さない)。二重 init は同一ハンドルを返す
   (冪等)、無効ハンドルの shutdown はエラーコードで検出する。`Instance` は M1 で
@@ -168,7 +171,10 @@ mw_get_output_latency_ns(handle, out_ns: *mut u64) -> MwResult
 mw_get_output_underrun_stats(handle, out: *mut MwOutputUnderrunStats) -> MwResult
     // 出力コールバックのアンダーラン(の疑い)統計(初期構築仕様『§2』M3)。
     // count(累計)/ last_host_time_ns(直近検知時刻、未検知なら0)/
-    // consecutive_count(直近まで連続した検知回数)。mw_poll_events の
+    // consecutive_count(直近まで連続した検知回数)/
+    // se_schedule_overflow_count(P3-12。予約 SE が満杯で発音されなかった累計。
+    //   🔴 mw_se_schedule は捨てられても Ok を返すので、気付ける口はここだけ)。
+    // mw_poll_events の
     // MwEventKind.Underrun(楽曲/BGM のデコードリングバッファ枯渇)とは別物——
     // こちらは音声コールバック自体の間隔異常(OS 側出力バッファの枯渇の兆候)。
     // 詳細は mw_backend::underrun モジュール doc 参照。

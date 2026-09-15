@@ -342,6 +342,24 @@ namespace Mw.Native
         /// 挟まると 0 に戻る。
         /// </summary>
         public uint ConsecutiveCount;
+
+        /// <summary>
+        /// 予約 SE(<see cref="MwNative.ScheduleSe"/>)のキューが満杯で挿入できず、
+        /// <b>発音されなかった</b>累計件数。
+        /// <para>
+        /// 🔴 <b>0 以外なら、鳴るはずのクリックが鳴っていない。</b>
+        /// <see cref="MwNative.ScheduleSe"/> 自体はコマンドキューへ積めた時点で
+        /// <see cref="MwResult.Ok"/> を返すため、<b>この値を見るまで失敗は一切表に出ない</b>
+        /// (メトロノーム・キャリブレーションのクリックが「たまに抜ける」ときはここを見る)。
+        /// </para>
+        /// <para>
+        /// ⚠️ 上3つと違い、これは出力コールバックのアンダーランとは<b>無関係</b>で、
+        /// ミキサ側のカウンタである。同じ構造体に入っているのは「音声スレッド側で
+        /// 黙って失われたものを1回の呼び出しで拾う」という用途が同じだからで、
+        /// 詳細はネイティブ側 <c>MwOutputUnderrunStats</c> のドキュメント参照。
+        /// </para>
+        /// </summary>
+        public ulong SeScheduleOverflowCount;
     }
 
     /// <summary>
@@ -483,7 +501,10 @@ namespace Mw.Native
         /// <para>
         /// 予約時刻が既に過去だった場合は取りこぼさず、そのバッファの先頭で即座に発音する。
         /// また予約キューは固定容量で、<b>この呼び出しが成功しても音声スレッド側で満杯だった予約は
-        /// 発音されない</b>(<c>se_schedule_overflow_count</c> で検知できる)。
+        /// 発音されない</b>。🔴 <b>検知できる口は
+        /// <see cref="GetOutputUnderrunStats"/> の
+        /// <see cref="OutputUnderrunStats.SeScheduleOverflowCount"/> だけ</b> ——
+        /// この戻り値が <see cref="MwResult.Ok"/> でも鳴っていないことがある。
         /// </para>
         /// </summary>
         /// <param name="handle"><see cref="Init"/> が返したハンドル。</param>
@@ -627,6 +648,7 @@ namespace Mw.Native
                 Count = native.count,
                 LastHostTimeNs = native.last_host_time_ns,
                 ConsecutiveCount = native.consecutive_count,
+                SeScheduleOverflowCount = native.se_schedule_overflow_count,
             };
             return ToPublicResult(result);
         }
