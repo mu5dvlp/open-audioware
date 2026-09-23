@@ -24,46 +24,37 @@ jobs:
       - name: Install ALSA dev headers (cpal の Linux ビルドに必要)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
 
-      # 🔴 CI にはオーディオデバイスが無く、`CpalBackend::open()` が即座に失敗する。
-      # すると `mw_init` が `InitOutcome::Failed` を返し、**そこから先のテストが
-      # すべて未到達**になる —— 2026-09-23 の実測で、同じテスト一式が
-      # 実デバイスのあるマシンでは TOTAL 95.84%(handle.rs 83% / ffi.rs 98%)なのに対し、
-      # CI では handle.rs 13% / ffi.rs 49% だった。
-      # **テストは書けていて、CI が実行できていないだけ**という状態。
+      # 🔴🔴 **CI にオーディオデバイスを用意するのは諦めた(2026-09-23)。同じ道を掘り直さないこと。**
       #
-      # ## 試した順と結果(2026-09-23。⚠️ 同じ道を二度試さないため残す)
+      # 動機: 同じテスト一式が**実デバイスのあるマシンでは TOTAL 95.84%**
+      # (handle.rs 83.04% / ffi.rs 98.15%)なのに、**CI では handle.rs 13% / ffi.rs 49%**。
+      # CI にデバイスが無いと `CpalBackend::open()` が失敗 → `mw_init` が `Failed` を返し、
+      # ffi.rs の統合テストが `mw_init` 成功後に続ける一連(SE / 楽曲 / BGM / イベント /
+      # 再オープン)が**丸ごと未到達**になるため。**テストは書けていて、CI が実行できていない。**
       #
-      # 1. ❌ **ALSA の `null` PCM**(`$HOME/.asoundrc` で既定を差し替え)——
-      #    ストリームは開けるが **音声コールバックが回らない**(`null` は書き込みを
-      #    捨てるだけで**クロックを持たない**)。投入した再生コマンドが掃かれず
-      #    `state: Ready / song_frames: 0` のままで、
-      #    `init_se_lifecycle_then_shutdown_or_gracefully_reports_no_device` が落ちた。
+      # ## 試した3案と、落ちた場所(すべて実測)
+      #
+      # 1. ❌ **ALSA の `null` PCM**($HOME/.asoundrc で既定を差し替え)——
+      #    ストリームは開ける。しかし `null` は書き込みを捨てるだけで**クロックを持たない**ため
+      #    **音声コールバックが回らない**。投入した再生コマンドが掃かれず
+      #    `state: Ready / song_frames: 0` のまま 5 秒待ってタイムアウト。
       # 2. ❌ **`snd-dummy` カーネルモジュール** —— GitHub の ubuntu runner では
-      #    `modprobe` できず(`/dev/snd/controlC0` が生えない)。
-      #    `linux-modules-extra-$(uname -r)` も入らない。
-      # 3. ⬜ **PulseAudio の null sink**(いまこれ)—— カーネルモジュールを使わず、
-      #    ユーザ空間のデーモンがタイマーを持つので `null` PCM の問題が起きないはず。
-      #    cpal(ALSA ホスト)からは `libasound2-plugins` の `pulse` PCM 経由で見える。
+      #    `modprobe` できない(`/dev/snd/controlC0` が生えず、
+      #    `linux-modules-extra-$(uname -r)` も入らない)。
+      # 3. ❌ **PulseAudio の null sink**(`pactl load-module module-null-sink` + `pcm.!default {
+      #    type pulse }`)—— **シンク自体は立ち上がる**(ログに `ci_dummy ... IDLE` が出る)。
+      #    cpal もストリームを開ける。しかし**やはりコールバックが回らず**、1 と同じ
+      #    `state: Ready / song_frames: 0` で落ちた(シンクが IDLE のままなのが傍証)。
       #
-      # 📌 **どれも失敗しても安全** —— デバイスが無ければ上記テストは名前のとおり
-      # "gracefully reports no device" の経路を通って緑になる。
-      # 🔴 **これ以上は追わない。** 3 が駄目ならこのステップごと落として、
-      # 「CI のカバレッジは構造的に低い」と受け入れる(数字ではなく patch を見る運用)。
-      - name: Set up a dummy sound card (CI にデバイスが無いため)
-        run: |
-          sudo apt-get install -y pulseaudio pulseaudio-utils libasound2-plugins || true
-          pulseaudio --start --exit-idle-time=-1 --daemonize=true || true
-          pactl load-module module-null-sink sink_name=ci_dummy || true
-          pactl set-default-sink ci_dummy || true
-          cat > "$HOME/.asoundrc" <<'ASOUNDRC'
-          pcm.!default { type pulse }
-          ctl.!default { type pulse }
-          ASOUNDRC
-          if pactl info >/dev/null 2>&1; then
-            echo "✅ PulseAudio available:"; pactl list short sinks || true
-          else
-            echo "⚠️ PulseAudio NOT available —— デバイス無しのまま続行する"
-          fi
+      # ## 結論
+      #
+      # 🔴 **CI のカバレッジの数字(total)は、この構成では構造的に低い。** それを是として運用する:
+      # **見るのは `codecov.yml` の `patch`(新しく書いた行)**。total は手元で
+      # `cargo llvm-cov --workspace --summary-only` を回して確認する(実デバイスがあるので正確)。
+      # ⚠️ **数字を上げるために薄いテストを足さないこと** —— 足りないのはテストではない。
+      #
+      # 📌 この探索の副産物として、`ffi.rs` のアンダーラン検証が環境依存だった潜在 flaky を
+      # 1件見つけて直してある(番兵で「書き込まれたこと」だけを見る形へ)。
 
       - name: Install Rust
         # `@stable` は rust-toolchain.toml を読まず常に最新 stable を入れてしまい、
