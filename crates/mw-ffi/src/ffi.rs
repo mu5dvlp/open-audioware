@@ -1638,18 +1638,22 @@ mod tests {
             MwResult::Ok
         );
 
-        // 出力コールバックのアンダーラン(の疑い)統計。実デバイスの有無に関わらず
-        // 書き込み自体は成功し、このテストでは実際のコールバックに人工的な間隔異常を
-        // 混ぜていないので count は 0 のはず(アンダーラン検知そのものの単体テストは
-        // `mw_backend::underrun` — 実デバイス無しで「モックの」コールバック系列を
-        // 直接駆動して確認済み)。
-        // ⚠️ わざと 0 以外で埋めてから渡す —— 「書き込まれなかった」と
-        // 「0 が書き込まれた」を区別するため。
+        // 出力コールバックのアンダーラン(の疑い)統計。
+        //
+        // 🔴 **アンダーランの「件数が 0 であること」を assert しないこと。**
+        // 2026-09-23 に CI(PulseAudio の null sink を用意して初めてここまで到達した)で
+        // `count == 1` を引いて落ちた —— **仮想シンクの上や負荷のかかった VM では
+        // アンダーランは普通に起きる**。静かなマシンでたまたま 0 だっただけで、
+        // これは環境依存の決めつけだった(潜在的な flaky を CI が暴いた形)。
+        //
+        // ⚠️ このブロックが本当に確かめたいのは「**全フィールドが書き込まれること**」
+        // (書き込み漏れの検出)なので、**ありえない番兵で埋めてから「変わったこと」を見る**。
+        // 件数そのものは環境に委ね、代わりに**環境に依らない不変条件**だけを固定する。
         let mut underrun_stats = MwOutputUnderrunStats {
-            count: 1,
-            last_host_time_ns: 1,
-            consecutive_count: 1,
-            se_schedule_overflow_count: 1,
+            count: u64::MAX,
+            last_host_time_ns: u64::MAX,
+            consecutive_count: u32::MAX,
+            se_schedule_overflow_count: u64::MAX,
         };
         assert_eq!(
             unsafe {
@@ -1660,12 +1664,31 @@ mod tests {
             },
             MwResult::Ok
         );
-        assert_eq!(underrun_stats.count, 0);
-        assert_eq!(underrun_stats.last_host_time_ns, 0);
-        assert_eq!(underrun_stats.consecutive_count, 0);
+        // (1) 書き込み漏れの検出: 番兵が残っていないこと。
+        assert_ne!(underrun_stats.count, u64::MAX, "count が書き込まれていない");
+        assert_ne!(
+            underrun_stats.last_host_time_ns,
+            u64::MAX,
+            "last_host_time_ns が書き込まれていない"
+        );
+        assert_ne!(
+            underrun_stats.consecutive_count,
+            u32::MAX,
+            "consecutive_count が書き込まれていない"
+        );
+        // (2) 環境に依らない不変条件。
+        assert!(
+            u64::from(underrun_stats.consecutive_count) <= underrun_stats.count,
+            "連続回数が総数を超えている: {underrun_stats:?}"
+        );
+        assert_eq!(
+            underrun_stats.count == 0,
+            underrun_stats.last_host_time_ns == 0,
+            "count と last_host_time_ns の整合が取れていない: {underrun_stats:?}"
+        );
         // 🔴 予約 SE のオーバーフローも同じ呼び出しで書き込まれること(P3-12)。
-        // このテストは予約を1件も出していないので 0。⚠️ 渡す前に 1 で埋めてあるため、
-        // 「書き込み漏れ」なら 1 のまま残ってここで落ちる。
+        // ⚠️ こちらは**環境に依らず 0 が正しい** —— このテストは予約を1件も出していないため。
+        // 番兵で埋めてあるので、書き込み漏れならここで落ちる。
         assert_eq!(underrun_stats.se_schedule_overflow_count, 0);
 
         // 楽曲バイト列を release しても SE 側は無事(ID 空間分離が効いていることの
