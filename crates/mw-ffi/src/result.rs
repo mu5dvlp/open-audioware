@@ -107,4 +107,112 @@ mod tests {
         assert!((MwResult::ErrInvalidBus as i32) < 0);
         assert!((MwResult::ErrInvalidLoopRegion as i32) < 0);
     }
+
+    // --- P1-6 の変換(WavError / DecodeError → MwResult)---------------------------
+    //
+    // 🔴 <b>この2つの From は「C# 側が見るエラーコード」を決めている唯一の場所。</b>
+    // 腕を1つ取り違えると、たとえば「壊れたファイル」が
+    // <c>ErrUnsupportedSampleRate</c> として届き、client 側の分岐が別の道へ行く
+    // (しかも<b>どちらも「失敗」なので気付きにくい</b>)。
+    // ⚠️ デバイスが要らない純粋関数なので CI でも必ず通る —— 2026-09-23 の
+    // カバレッジ確認で「全14腕にテストが1本も無い」と分かったため足した。
+
+    #[test]
+    fn wav_error_maps_to_the_documented_result_code() {
+        let cases: [(mw_core::WavError, MwResult); 10] = [
+            (
+                mw_core::WavError::InvalidSampleRate(0),
+                MwResult::ErrUnsupportedSampleRate,
+            ),
+            (
+                mw_core::WavError::Resample(mw_core::ResampleError::Construction("x".into())),
+                MwResult::ErrDecodeFailed,
+            ),
+            (
+                mw_core::WavError::UnsupportedFormatTag(3),
+                MwResult::ErrUnsupportedFormat,
+            ),
+            (
+                mw_core::WavError::UnsupportedBitsPerSample(24),
+                MwResult::ErrUnsupportedFormat,
+            ),
+            (
+                mw_core::WavError::UnsupportedChannelCount(6),
+                MwResult::ErrUnsupportedFormat,
+            ),
+            (mw_core::WavError::Truncated, MwResult::ErrDecodeFailed),
+            (mw_core::WavError::NotRiff, MwResult::ErrDecodeFailed),
+            (mw_core::WavError::NotWave, MwResult::ErrDecodeFailed),
+            (
+                mw_core::WavError::MissingFmtChunk,
+                MwResult::ErrDecodeFailed,
+            ),
+            (
+                mw_core::WavError::MissingDataChunk,
+                MwResult::ErrDecodeFailed,
+            ),
+        ];
+
+        for (err, expected) in cases {
+            // ⚠️ `into()` が err を消費するので、ラベルは先に作っておく
+            // (WavError / DecodeError は Clone を実装していない)。
+            let label = format!("{err:?}");
+            let actual: MwResult = err.into();
+            assert_eq!(
+                actual, expected,
+                "WavError::{label} の変換先が変わっています"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_error_maps_to_the_documented_result_code() {
+        let cases: [(mw_core::DecodeError, MwResult); 6] = [
+            (
+                mw_core::DecodeError::InvalidSampleRate(0),
+                MwResult::ErrUnsupportedSampleRate,
+            ),
+            (
+                mw_core::DecodeError::UnsupportedChannelCount(6),
+                MwResult::ErrUnsupportedFormat,
+            ),
+            (
+                mw_core::DecodeError::Symphonia("x".into()),
+                MwResult::ErrDecodeFailed,
+            ),
+            (
+                mw_core::DecodeError::NoAudioTrack,
+                MwResult::ErrDecodeFailed,
+            ),
+            (
+                mw_core::DecodeError::Resample(mw_core::ResampleError::Processing("x".into())),
+                MwResult::ErrDecodeFailed,
+            ),
+            (
+                mw_core::DecodeError::ResetRequired,
+                MwResult::ErrDecodeFailed,
+            ),
+        ];
+
+        for (err, expected) in cases {
+            let label = format!("{err:?}");
+            let actual: MwResult = err.into();
+            assert_eq!(
+                actual, expected,
+                "DecodeError::{label} の変換先が変わっています"
+            );
+        }
+    }
+
+    /// ⚠️ <b>「デコード失敗」と「フォーマット非対応」を取り違えていないこと。</b>
+    /// 両方とも失敗なので、取り違えても<b>テストが無ければ誰も気付かない</b>。
+    #[test]
+    fn unsupported_format_and_decode_failed_are_not_interchangeable() {
+        let format: MwResult = mw_core::WavError::UnsupportedBitsPerSample(24).into();
+        let decode: MwResult = mw_core::WavError::NotRiff.into();
+
+        assert_ne!(format, decode);
+        assert_eq!(format, MwResult::ErrUnsupportedFormat);
+        assert_eq!(decode, MwResult::ErrDecodeFailed);
+    }
 }

@@ -237,6 +237,72 @@ mod tests {
         assert_eq!(renderer.rendered_frames(), 2);
     }
 
+    // --- build_with_events / 委譲アクセサ(2026-09-23 のカバレッジ確認で足した)-------
+    //
+    // ⚠️ どれも「一行の委譲」に見えるが、<b>委譲先を取り違えても誰も気付かない</b>種類の
+    // コードで、テストが無いと壊れたことが分からない。
+
+    /// 🔴 <b>渡した `events` の identity を変えないこと</b>が契約
+    /// (`Instance::attempt_reopen` は再オープンの前後で `mw_poll_events` の読み出し先を
+    /// 差し替えずに済ませる前提でこれに依存している —— P3-11)。
+    #[test]
+    fn build_with_events_keeps_the_identity_of_the_passed_event_queue() {
+        let events = Arc::new(EventQueue::new(64));
+
+        let (_renderer, _sender, _reclaim, _producer, _clock, returned, _bgm) =
+            Renderer::build_with_events(Config::default(), 48_000, Arc::clone(&events));
+
+        assert!(
+            Arc::ptr_eq(&events, &returned),
+            "build_with_events が別の EventQueue を返しています(再オープン後に \
+             mw_poll_events の読み出し先がずれます)"
+        );
+    }
+
+    #[test]
+    fn set_sample_rate_is_readable_back() {
+        let mut renderer = renderer_for_test();
+        assert_eq!(renderer.sample_rate(), 48_000);
+
+        renderer.set_sample_rate(44_100);
+
+        assert_eq!(renderer.sample_rate(), 44_100);
+    }
+
+    /// 🔴 <b>ゲームスレッド用に取り出したカウンタが、レンダラ側が増やす実体と同じであること。</b>
+    /// ⚠️ ここが別物になると、診断値が<b>ずっと 0 のまま</b>に見える
+    /// (`Instance::attempt_reopen` が「Backend::open へムーブする前に取れ」と
+    /// 書いているのと同じ罠)。
+    #[test]
+    fn se_schedule_overflow_counter_is_the_same_object_the_renderer_counts_with() {
+        let renderer = renderer_for_test();
+
+        let first = renderer.se_schedule_overflow_counter();
+        let second = renderer.se_schedule_overflow_counter();
+
+        assert!(Arc::ptr_eq(&first, &second), "毎回別の Arc を返しています");
+        assert_eq!(
+            first.load(std::sync::atomic::Ordering::Relaxed),
+            renderer.se_schedule_overflow_count()
+        );
+    }
+
+    /// 何も鳴らしていない状態の見え方を固定する(委譲先の取り違えの検出)。
+    #[test]
+    fn a_fresh_renderer_reports_nothing_playing() {
+        let renderer = renderer_for_test();
+
+        assert_eq!(renderer.active_voice_count(), 0);
+        assert_eq!(renderer.clipper_engaged_count(), 0);
+        assert_eq!(renderer.se_schedule_overflow_count(), 0);
+        assert_eq!(renderer.rendered_frames(), 0);
+        assert!(!renderer.music_schedule_deferred());
+        // 🔴 楽曲と BGM は<b>別のボイス</b>。どちらも未設定なので Loading から始まる
+        // (`MusicState::Loading` の doc「プリロール中、または楽曲が未設定」)。
+        assert_eq!(renderer.music_state(), MusicState::Loading);
+        assert_eq!(renderer.bgm_state(), MusicState::Loading);
+    }
+
     #[test]
     fn music_clock_handle_reflects_renderer_state_across_the_shared_arc() {
         // `Renderer::build` が返す `Arc<MusicClockPublisher>` は、
