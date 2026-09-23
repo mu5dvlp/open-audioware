@@ -29,6 +29,14 @@
 
 ### [2026-09-23](history/12-2026-09-20.md)
 
+- 🆕 **P3-11 のネイティブを利用側へ届けた**(23:25〜23:27。`make build-macos` / `build-ios` /
+  `build-android`)—— それまで client の `libmw_ffi.dylib` は 2026-09-20 15:52 の版で、
+  **P3-11 は1行も届いていなかった**。✅ **FFI の表面は不変**(`NativeMethods.g.cs` に差分なし /
+  公開シンボル31個のまま。3段階 reopen は Rust 内部関数)。
+  📌 **成果物は `.gitignore` 済み** —— コミットに現れないので、クローンし直したら焼き直しが要る。
+  ⬜ 受け入れ確認は **Android 実機の切断→復帰**(ユーザー作業)
+- 🆕 **UPM パッケージ名(MU7)を決定**(ユーザー判断)—— `displayName` = **Open Source Audio
+  Middleware** / `name` = `com.mu5dvlp.open-audioware`(load-bearing なのは `name` のほう)
 - 🔴 **CI のカバレッジを 81.66% → 98.2% にした**(ユーザー指示)。眼目は
   **仮想オーディオデバイス**(`test_backend::VirtualBackend`)—— `Renderer::render` を
   実ホスト時刻つきで回すので、デバイスの無い CI でも `ffi.rs` の統合テスト一式
