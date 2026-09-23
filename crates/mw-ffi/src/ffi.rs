@@ -1384,6 +1384,66 @@ mod tests {
         }
     }
 
+    /// `init_se_lifecycle_then_shutdown_or_gracefully_reports_no_device` と同じ一式を、
+    /// 実デバイスの代わりに仮想デバイス越しに走らせる。
+    ///
+    /// CI にはオーディオデバイスが無く、実デバイス版は `mw_init` が
+    /// `ErrBackendOpenFailed` を返して一式をスキップすることがある。このテストは
+    /// 仮想デバイスのレンダリングスレッドで `Renderer::render` まで駆動し、FFI 境界
+    /// から上のロジック(引数検証・ハンドル管理・コマンド列・状態遷移・イベント通知・
+    /// 内部再オープン)を CI でも実行する。
+    ///
+    /// 実デバイス版は置き換えない。cpal の実デバイスオープン・OS のコールバック時刻・
+    /// 実機のレート交渉を検証する経路として、引き続き実デバイス版だけが担う。
+    #[test]
+    fn se_and_music_lifecycles_over_a_virtual_device() {
+        let _lock = crate::test_backend::registry_lock();
+        let _factory = crate::test_backend::install_virtual_device_factory();
+
+        let mut handle_out: u64 = 0;
+        assert_eq!(
+            unsafe { mw_init(&mut handle_out as *mut u64) },
+            MwResult::Ok
+        );
+        assert_ne!(handle_out, 0);
+        run_se_lifecycle(handle_out);
+
+        let devices = _factory.devices();
+        assert!(
+            devices.len() >= 3,
+            "reopen must receive fresh virtual devices"
+        );
+        // 段1で `make_backend()` が払い出す未オープンの差し替え用デバイスも
+        // ファクトリの記録対象。実際に open されるのは初回と段2の新バックエンド。
+        assert_eq!(
+            devices
+                .iter()
+                .filter(|device| device.open_calls() == 1)
+                .count(),
+            2
+        );
+        assert!(devices.iter().any(|device| device.close_calls() != 0));
+        assert!(
+            devices
+                .iter()
+                .any(|device| device.last_callback_frames() != 0)
+        );
+        assert!(
+            devices
+                .iter()
+                .any(|device| device.log_output_latency_calls() != 0)
+        );
+        assert!(
+            devices
+                .iter()
+                .any(|device| device.log_new_output_underruns_calls() != 0)
+        );
+        assert!(devices.iter().any(|device| device.is_open()));
+
+        assert_eq!(mw_shutdown(handle_out), MwResult::Ok);
+        assert!(devices.iter().all(|device| !device.is_open()));
+    }
+
     /// 初期構築仕様 §8「Unity 統合テスト」の Rust 版に相当する一連の流れ:
     /// wav ロード → SE 発音 → ボイス操作 → バス操作 → サウンド解放。
     fn run_se_lifecycle(handle: u64) {
