@@ -26,5 +26,10 @@ ignore:
   - "crates/mw-backend/src/cpal_backend.rs"
   # iOS の割り込み処理も同じ理由(実機でしか走らない)。
   - "crates/mw-backend/src/ios_interruption.rs"
+  # 🔴 テスト専用モジュール(`#[cfg(test)]`)は**製品コードではない**ので計測対象から外す。
+  # `test_backend.rs` は実デバイスの無い環境で内部再オープンを通すためのテストダブルで、
+  # ここを分母に入れると「テストのためのコードにテストが要る」という無意味な圧力になる。
+  - "crates/mw-ffi/src/test_backend.rs"
+  - "crates/mw-ffi/src/csharp_abi_sync.rs"
   # ベンチはテスト対象ではない。
   - "benches/**"

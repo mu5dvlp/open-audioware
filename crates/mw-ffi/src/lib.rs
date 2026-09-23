@@ -19,6 +19,10 @@ mod decode_thread;
 mod event;
 mod ffi;
 mod handle;
+// テスト専用のバックエンド差し替え口。実デバイスが無い環境でも内部再オープンの
+// 段2・段3と、段2中の shutdown 割り込みを実際に通すための fake と直列化ヘルパを置く。
+#[cfg(test)]
+mod test_backend;
 // Android の JNI エントリポイント。**csbindgen の入力に含めない**
 // (理由はモジュール doc と build.rs のコメントを参照)。
 mod jni_entry;

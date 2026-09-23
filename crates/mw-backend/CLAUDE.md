@@ -26,6 +26,13 @@
   (リアルタイム安全性規約に抵触しない)。初期構築仕様 M3「出力レイテンシ問い合わせ」の第一歩。
 - `backend::BackendError` — デバイス無し・対応構成無し・ストリーム構築/開始失敗・
   二重 open・未 open close、の6種。
+- `backend::log_output_latency_once` / `backend::log_new_output_underruns` —
+  🔴 **2026-09-23 に `CpalBackend` の固有メソッドから `Backend` トレイトの必須メソッドへ
+  上げた。** `mw-ffi` がバックエンドを `Box<dyn Backend + Send>` で持つようになり
+  (下記「テストダブルを差せる形にした」)、`dyn` 越しに呼べる必要が生じたため。
+  **既定実装は付けていない** —— 将来の oboe / RemoteIO 実装が「気付かずにログを失う」
+  のを避けるため(実装しなければコンパイルが通らない)。どちらも**ゲームスレッド専用**
+  (`mw_log!` はアロケーションとロックを伴う)。
 - `cpal_backend::CpalBackend` — 既定の出力デバイスに **f32 ステレオ**のストリームを開く。
   対応する構成が無い場合(モノ/サラウンド専用デバイス、非対応サンプルフォーマット等)は
   `BackendError::NoSupportedStreamConfig` を返す(サンプルフォーマット変換は未実装、将来課題)。
@@ -103,6 +110,15 @@
   その置き換えは `Backend` trait を実装する新しい struct を追加するだけで済むようにしてある
   — `mw-ffi` 側は `Backend` トレイトオブジェクト(または将来的にジェネリクス)越しにしか
   バックエンドを触らない設計を維持すること。
+  🔴 **2026-09-23 に実際にそうなった**(それまで `Instance.backend` は具象型
+  `CpalBackend` を直接持っていた)—— `mw-ffi` は `Box<dyn Backend + Send>` で持つ。
+  きっかけは置き換えではなく**テスト**: CI にもビルドマシンにもオーディオデバイスが
+  無い場面で `CpalBackend::open()` が必ず失敗し、内部再オープンの段2・段3
+  (`mw-ffi::handle::run_reopen_worker` / `finalize_reopen_success` /
+  `teardown_orphaned_reopen`)へ到達する手段が他に無かった。
+  ⚠️ **リアルタイム安全性への影響は無い** —— 音声コールバックは `Instance` を経由せず、
+  `Renderer` は `Backend::open` へムーブ済み。動的ディスパッチが乗るのはゲームスレッドの
+  FFI 呼び出しだけで、そこは元々 FFI 越えのコストを払っている。
 - オーディオコールバック(`build_output_stream` に渡すクロージャ)は音声スレッド上で実行される。
   ここから呼ぶのは `Renderer::render` のみに保つこと
   (`mw-core/CLAUDE.md` のリアルタイム安全性規約がこの経路にも適用される)。

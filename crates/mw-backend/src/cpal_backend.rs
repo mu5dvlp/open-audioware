@@ -50,7 +50,7 @@ pub struct CpalBackend {
     /// 音声スレッドが書き、ゲームスレッドが読む「直近の出力レイテンシ(ns)」。
     /// 詳細は [`Backend::output_latency_ns`]。
     output_latency_ns: Arc<AtomicU64>,
-    /// [`CpalBackend::log_output_latency_once`] が既にログを出したか。
+    /// [`Backend::log_output_latency_once`] が既にログを出したか。
     /// 1オープンにつき1回だけ出す(`close` でリセットする)。
     logged_output_latency: AtomicBool,
     /// オープン時にネゴシエートしたサンプルレート(未オープンなら 0)。
@@ -63,7 +63,7 @@ pub struct CpalBackend {
     last_output_underrun_host_time_ns: Arc<AtomicU64>,
     /// 直近まで連続して検知した回数。[`Backend::consecutive_output_underrun_count`] 参照。
     consecutive_output_underrun_count: Arc<AtomicU32>,
-    /// [`CpalBackend::log_new_output_underruns`] が直近にログへ出した
+    /// [`Backend::log_new_output_underruns`] が直近にログへ出した
     /// `output_underrun_count` の値(まだログしていなければ 0)。1オープンにつき
     /// 何度でも呼べる(`logged_output_latency` と異なり `AtomicBool` ではなく値そのもの
     /// を持つ——「初回だけ」ではなく「新しく増えた分だけ都度」ログしたいため)。
@@ -86,19 +86,16 @@ impl CpalBackend {
             logged_output_underrun_count: AtomicU64::new(0),
         }
     }
+}
 
-    /// 出力レイテンシの実測値([`Backend::output_latency_ns`])を、1オープンにつき
-    /// 1回だけログへ出す。実機デバッグで「実際にどれだけの出力レイテンシが申告されて
-    /// いるか」を起動ログから追えるようにするため
+impl Backend for CpalBackend {
+    /// 実機デバッグで「実際にどれだけの出力レイテンシが申告されているか」を起動ログから
+    /// 追えるようにするため、1オープンにつき1回だけ出す
     /// (`crates/mw-ffi/src/handle.rs::Instance::log_buffer_info_once` と同じ動機・設計)。
     ///
     /// コールバックがまだ1度も走っておらず [`Backend::output_latency_ns`] が 0(未計測)
     /// を返す間は何もせず、次に呼ばれた機会に持ち越す。
-    ///
-    /// **ゲームスレッドから呼ぶこと。** `mw_log!` は `format!` によるヒープアロケーションと
-    /// stderr/logcat のロックを伴うため、音声コールバック経路(音声スレッド)からは
-    /// 呼んではならない(`crates/mw-core/CLAUDE.md` のリアルタイム安全性規約)。
-    pub fn log_output_latency_once(&self) {
+    fn log_output_latency_once(&self) {
         if self.logged_output_latency.load(Ordering::Relaxed) {
             return;
         }
@@ -114,16 +111,12 @@ impl CpalBackend {
         );
     }
 
-    /// 出力コールバックのアンダーラン(の疑い、[`crate::underrun`] モジュール doc参照)
-    /// を新たに検知していれば、その分だけログへ出す。`log_output_latency_once` と同じ
-    /// 配線パターン(**ゲームスレッドから、FFI 呼び出しの合間に日和見的に呼ぶこと**。
-    /// `mw_log!` はヒープアロケーションとロックを伴うため音声コールバック経路からは
-    /// 呼んではならない、`crates/mw-core/CLAUDE.md` のリアルタイム安全性規約)。
+    /// 検知の定義は [`crate::underrun`] モジュール doc 参照。
     ///
-    /// `log_output_latency_once` と異なり「初回だけ」ではなく、**呼ぶたびに前回ログ時
-    /// からの増分があればその都度**出す——アンダーランは起動時に1回きりの情報ではなく、
-    /// 実運用中いつ何回起きたかを追いたいテレメトリのため。
-    pub fn log_new_output_underruns(&self) {
+    /// [`Backend::log_output_latency_once`] と異なり「初回だけ」ではなく、**呼ぶたびに
+    /// 前回ログ時からの増分があればその都度**出す——アンダーランは起動時に1回きりの
+    /// 情報ではなく、実運用中いつ何回起きたかを追いたいテレメトリのため。
+    fn log_new_output_underruns(&self) {
         let current = self.output_underrun_count.load(Ordering::Relaxed);
         let last_logged = self.logged_output_underrun_count.load(Ordering::Relaxed);
         if current <= last_logged {
@@ -140,9 +133,7 @@ impl CpalBackend {
              (cumulative={current}, consecutive={consecutive})"
         );
     }
-}
 
-impl Backend for CpalBackend {
     fn open(
         &mut self,
         mut renderer: Renderer,

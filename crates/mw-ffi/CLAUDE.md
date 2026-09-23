@@ -92,6 +92,46 @@ C ABI 境界。`mw-core` / `mw-backend` 両方に依存する唯一のクレー�
   `StreamErrorReason`)と ABI バージョン定数が、Rust 側の判別子・値と一致することを
   `cargo test` で機械的に検証する。詳細・設計根拠はモジュール doc 参照
   (「C# 側ラッパ列挙とのズレを自動検出する仕組み」節も参照)。
+- `src/test_backend.rs`(`#[cfg(test)]` 専用、2026-09-23)— **オーディオデバイスが無い
+  環境でも内部再オープンの段2・段3を通すためのテストダブル**(`FakeBackend`)と、
+  グローバルレジストリを触るテストを直列化する `registry_lock()`。
+  🔴 **`Instance.backend` を `Box<dyn Backend + Send>` にしたのはこれを差すため**
+  (下記「バックエンドをトレイトオブジェクトで持つ理由」)。
+
+## バックエンドをトレイトオブジェクトで持つ理由(2026-09-23)
+
+`Instance.backend` は `Box<dyn Backend + Send>`。生成は `handle::make_backend()` の1箇所に
+集約してあり、**本番は常に `CpalBackend`、テストビルドだけ `test_backend` のファクトリが
+差し込めるようにしてある**(`#[cfg(test)]` で分岐)。
+
+🔴 **動機はカバレッジの数字ではない。** P3-11 で足した
+`teardown_orphaned_reopen`(**段2の最中に `mw_shutdown` が割り込んだときに、段2が
+組み立てた新バックエンドと新デコードスレッド2本を自分で畳む経路**)が一度もテストされて
+おらず、壊れるとスレッドリークか二重解放になるのに検証手段が無かった。具象型のままでは
+`CpalBackend::open()` が実デバイスを要求するため、CI でも段2・段3へ到達できない
+(CI にダミー音声デバイスを載せる3案はすべて実測で失敗。`.github/workflows/ci.yml` の
+`lint-test` の上に結論がコメントで残っている)。
+
+⚠️ **リアルタイム安全性への影響は無い** —— 音声コールバックは `Instance` を経由せず
+(`Renderer` は `Backend::open` へムーブ済み)、動的ディスパッチが乗るのはゲームスレッドの
+FFI 呼び出しだけ。そこは元々 FFI 越えのコストを払っている。
+`Send` が要るのは、再オープンで切り離した一式(`ReopenDetached`)をワーカースレッドへ
+ムーブし、`Instance` を `static` のレジストリへ置くため。`Sync` は要らない。
+
+固定化したテスト(`handle.rs` の `mod tests`):
+
+| テスト | 何を固定しているか |
+|---|---|
+| `shutdown_during_stage2_tears_down_the_orphaned_reopen` | 🔴 **本命。** 段2の `open()` を門で止めて `mw_shutdown` を割り込ませ、(1) `shutdown` が `Closed`(`CloseFailed` ではない)を返すこと、(2) 段2の窓の中で `backend_sample_rate()` が直近値へフォールバックすること、(3) ワーカーが新バックエンドを自分で閉じること、(4) その後 `init` し直せること |
+| `teardown_orphaned_reopen_closes_the_backend_and_joins_both_decode_threads` | 後始末が close だけでなく**デコードスレッド2本の join まで**やること(停止フラグの `Arc::strong_count` で join を観測する) |
+| `reopen_succeeds_and_swaps_in_the_new_backend` | 段1→段2→段3(成功)の通し。旧 backend の close / 新 backend の差し込み / `last_known_sample_rate` の更新 / `AudioInterruptionEnded { recovered: true }` |
+| `reopen_failure_is_recorded_and_eventually_gives_up` | 段3(失敗)。中間の失敗では通知しないこと / バックオフを使い切ったら `recovered: false` を通知すること / **段2が進行中でないときの `NotOpen` は正直に `CloseFailed` を返すこと** |
+
+⚠️ **`registry_lock()` を取り忘れないこと。** グローバルレジストリと
+`REOPEN_IN_PROGRESS` を触るテストは直列化が必須で、特に
+`ffi::tests::init_se_lifecycle_then_shutdown_or_gracefully_reports_no_device`
+(**実デバイス越し**の統合テスト)がロックを取らないと、fake のファクトリがそちらの
+`mw_init` に紛れ込んで**そのテストの意味が壊れる**。
 
 ## 現状の公開 API(M1: SE 再生 / M2-5: ホスト時刻・予約発音 / M2-6: イベント通知 /
 M2-7: 楽曲再生 / M4-3: BGM のネイティブ化)

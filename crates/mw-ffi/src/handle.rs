@@ -119,7 +119,13 @@ impl MusicTarget {
 
 pub struct Instance {
     handle: u64,
-    backend: CpalBackend,
+    /// `Box<dyn Backend + Send>` にしてテスト時だけ fake backend を差し込めるようにする。
+    /// 音声コールバックは `Backend::open` へムーブ済みの `Renderer` から駆動され、
+    /// `Instance` を経由しないため、動的ディスパッチが増えるのは元から FFI 越えの
+    /// コストを払っているゲームスレッド側の呼び出しだけで、リアルタイム安全性への
+    /// 影響はない。`Send` は再オープンの切り離し一式をワーカースレッドへムーブし、
+    /// `Instance` を static なレジストリへ保持するために必要で、`Sync` は要らない。
+    backend: Box<dyn Backend + Send>,
     pub command_sender: CommandSender,
     pub reclaim_receiver: Mutex<ReclaimReceiver>,
     pub sounds: Mutex<SoundStorage>,
@@ -204,13 +210,13 @@ pub struct Instance {
     reopen: ReopenPolicy,
 
     // --- P3-11(2026-09-23)「段2」の間だけ有効な補助フィールド ---------------------
-    /// 直近に実際にネゴシエートできていた出力サンプルレート(`CpalBackend::open` が
+    /// 直近に実際にネゴシエートできていた出力サンプルレート(`Backend::open` が
     /// 成功するたびに書き込む。`init()`/段3 `finalize_reopen_success` 参照)。
     ///
     /// 🔴 [`Instance::backend_sample_rate`] のフォールバック専用。P3-11 で再オープンの
     /// 「段2」(バックエンドを `Instance` から切り離してワーカースレッド上で
     /// close→open し直す間)を導入した結果、その間だけ `self.backend` が新品の
-    /// 未オープン `CpalBackend`(`sample_rate() == 0`)になる——`mw_sound_load` の
+    /// 未オープンバックエンド(`sample_rate() == 0`)になる——`mw_sound_load` の
     /// リサンプル要否判定(初期構築仕様『§4.7』)がこの窓で 0 を掴むと壊れた wav
     /// として扱われかねないため、直近の実測値をここに保持してフォールバックする。
     /// 詳しいトレードオフは [`Instance::backend_sample_rate`] のドキュメント参照。
@@ -218,14 +224,14 @@ pub struct Instance {
 }
 
 impl Instance {
-    /// 出力デバイスの実サンプルレート(`CpalBackend::open` がネゴシエートした値)。
+    /// 出力デバイスの実サンプルレート(`Backend::open` がネゴシエートした値)。
     ///
     /// `mw_sound_load`(SE ロード)が wav のリサンプル要否を判定するために使う
     /// (初期構築仕様『§4.7』: 「SE はロード時に全デコード + 必要ならロード時に
     /// リサンプルして出力レート化」)。
     ///
     /// 🔴 P3-11(2026-09-23): 内部再オープンの「段2」の間(`self.backend` がまだ
-    /// 新品の未オープン `CpalBackend` に差し替わっているだけの状態)は
+    /// 新品の未オープンバックエンドに差し替わっているだけの状態)は
     /// `self.backend.sample_rate()` が 0 になる——このときは代わりに
     /// 直近に実際にオープンできていたときの値([`Instance::last_known_sample_rate`])
     /// を返す。⚠️ **トレードオフを承知で受け入れる**: デバイス側のレートが再オープンを
@@ -432,7 +438,7 @@ impl Instance {
     }
 
     /// 出力レイテンシの実測値を1回だけログへ出す
-    /// (`CpalBackend::log_output_latency_once` へ委譲)。`mw_get_output_latency_ns`
+    /// (`Backend::log_output_latency_once` へ委譲)。`mw_get_output_latency_ns`
     /// (ゲームスレッド経路)から呼ぶこと。コールバック内から呼んではいけない
     /// (`mw_log!` はアロケーションとロックを伴う)。
     pub fn log_output_latency_once(&self) {
@@ -458,7 +464,7 @@ impl Instance {
     }
 
     /// 出力コールバックのアンダーラン(の疑い)を新たに検知していれば、その分だけ
-    /// ログへ出す(`CpalBackend::log_new_output_underruns` へ委譲)。
+    /// ログへ出す(`Backend::log_new_output_underruns` へ委譲)。
     /// `mw_get_output_underrun_stats`(ゲームスレッド経路)から呼ぶこと。
     /// コールバック内から呼んではいけない(`mw_log!` はアロケーションとロックを伴う)。
     pub fn log_new_output_underruns(&self) {
@@ -605,7 +611,7 @@ impl Instance {
     /// 段1(このメソッド。ロック保持中)
     ///   → 復元に要るスナップショットを読み取る
     ///   → 重い部品(`backend`/デコードスレッドの JoinHandle)を Instance から
-    ///     切り離す(`self.backend` は新品の未オープン CpalBackend に、
+    ///     切り離す(`self.backend` は新品の未オープンバックエンドに、
     ///     `self.decode_thread`/`self.bgm_decode_thread` は None になる)
     ///   → [`ReopenDetached`] を返す(呼び出し元がロックを手放してから
     ///     `crate::handle::run_reopen_worker` へ渡す)
@@ -621,7 +627,7 @@ impl Instance {
     /// **この間、`Instance` はレジストリに存在し続ける。** これが「25箇所の FFI 呼び
     /// 出しサイトを1つも変えずに済む」ための鍵——`with_instance` は段2の間も同じ
     /// `Instance` を見つけ、`f(instance)` を呼べる:
-    /// - getter 系は `self.backend`(段2の間は新品の未オープン `CpalBackend`)を読む
+    /// - getter 系は `self.backend`(段2の間は新品の未オープンバックエンド)を読む
     ///   だけなので、[`Backend`] トレイトが元々持つ「未オープンなら 0」の契約
     ///   (`crates/mw-backend/src/backend.rs` の各メソッド doc)にそのまま乗る——
     ///   新しいエラーコードもパニックも要らない。
@@ -749,12 +755,12 @@ impl Instance {
         );
 
         // 2) 重い部品を切り離す(ロックはまだ握ったまま——ここは安い代入・take だけ)。
-        //    `self.backend` は新品の未オープン `CpalBackend` に、`decode_thread`/
+        //    `self.backend` は新品の未オープンバックエンドに、`decode_thread`/
         //    `bgm_decode_thread` は `None` になる。close・stop・join は一切ここでは
         //    やらない(それをやるのは段2、`run_reopen_worker`)——このメソッドの
         //    ドキュメント「例外」節、および `Backend` トレイトの「未オープンなら 0」
         //    契約により、他の FFI 呼び出しはこの間もクラッシュせず動く。
-        let old_backend = std::mem::replace(&mut self.backend, CpalBackend::new());
+        let old_backend = std::mem::replace(&mut self.backend, make_backend());
         let old_decode_thread = self.decode_thread.take();
         let old_bgm_decode_thread = self.bgm_decode_thread.take();
         // 停止フラグ自体は複製(Arc::clone)するだけで、`self` 側からは奪わない——
@@ -939,7 +945,7 @@ struct ReopenDetached {
     /// ためのキー(`guard.as_ref().map(|i| i.handle)` と比較する)。
     handle: u64,
     /// 切り離した旧バックエンド(段2 が `close()` する)。
-    old_backend: CpalBackend,
+    old_backend: Box<dyn Backend + Send>,
     /// 切り離した旧デコードスレッドの `JoinHandle`(段2 が停止フラグを立てたうえで
     /// join する)。`None` はここには来ない想定だが、`Instance::stop_and_join_decode_threads`
     /// と同じ「念のための `Option`」の流儀に合わせておく。
@@ -1086,7 +1092,7 @@ fn run_reopen_worker(detached: ReopenDetached) {
 
     // 4) 実際にバックエンドを開き直す(cpal のデバイスオープン。数百 ms かかりうる。
     //    ここもロック無しで行われる——今回の分割の目的そのもの)。
-    let mut new_backend = CpalBackend::new();
+    let mut new_backend = make_backend();
     match new_backend.open(renderer, Arc::clone(&events)) {
         Ok(()) => {
             let (decoder_tx, decode_thread_stop, decode_thread_handle) =
@@ -1128,7 +1134,7 @@ fn run_reopen_worker(detached: ReopenDetached) {
 #[allow(clippy::too_many_arguments)]
 fn finalize_reopen_success(
     handle: u64,
-    new_backend: CpalBackend,
+    new_backend: Box<dyn Backend + Send>,
     command_sender: CommandSender,
     reclaim_receiver: ReclaimReceiver,
     music_clock: Arc<MusicClockPublisher>,
@@ -1249,7 +1255,7 @@ fn finalize_reopen_failure(handle: u64, now_ns: u64) {
 /// (新バックエンド・新デコードスレッド2本)を自分で畳む。レジストリには一切触れない
 /// (呼び出し元 [`finalize_reopen_success`] が既にロックを手放した後に呼ぶこと)。
 fn teardown_orphaned_reopen(
-    mut new_backend: CpalBackend,
+    mut new_backend: Box<dyn Backend + Send>,
     decode_thread_stop: Arc<AtomicBool>,
     decode_thread_handle: JoinHandle<()>,
     bgm_decode_thread_stop: Arc<AtomicBool>,
@@ -1285,6 +1291,22 @@ pub fn with_instance<T>(handle: u64, f: impl FnOnce(&Instance) -> T) -> Option<T
         Some(instance) if instance.handle == handle => Some(f(instance)),
         _ => None,
     }
+}
+
+/// バックエンドを1つ作る唯一の口。本番は常に [`CpalBackend`]。
+///
+/// 🔴 テストビルドでのみ、テストダブルを差し込めるようにしてある —— CI にもこの環境にも
+/// 実デバイスが無く、`CpalBackend::open()` が必ず失敗するため、再オープンの段2・段3
+/// (`run_reopen_worker` / `finalize_reopen_success` / `teardown_orphaned_reopen`)へ
+/// 実際に到達させる手段が他に無い(`crates/mw-ffi/src/test_backend.rs` 参照)。
+#[cfg(not(test))]
+fn make_backend() -> Box<dyn Backend + Send> {
+    Box::new(CpalBackend::new())
+}
+
+#[cfg(test)]
+fn make_backend() -> Box<dyn Backend + Send> {
+    crate::test_backend::take_from_factory().unwrap_or_else(|| Box::new(CpalBackend::new()))
 }
 
 pub enum InitOutcome {
@@ -1327,7 +1349,7 @@ pub fn init() -> InitOutcome {
     // 同じ理由)。
     let se_schedule_overflow_count = renderer.se_schedule_overflow_counter();
 
-    let mut backend = CpalBackend::new();
+    let mut backend = make_backend();
     if let Err(err) = backend.open(renderer, Arc::clone(&events)) {
         // 実機(特に iOS)では失敗理由が分からないと原因を特定できないため、
         // 具体的な BackendError を必ず残す(docs/measurement-m1.md §7.6-1)。
@@ -1415,7 +1437,7 @@ pub fn shutdown(handle: u64) -> ShutdownOutcome {
     }
 
     // P3-11: 段2(`run_reopen_worker`)がまだ走っている最中に呼ばれた場合、
-    // `instance.backend` は既に段1が切り離した新品の未オープン `CpalBackend`
+    // `instance.backend` は既に段1が切り離した新品の未オープンバックエンド
     // (「旧バックエンドは段2のワーカースレッドが握っている」状態)——これは
     // `close()` が失敗する(`BackendError::NotOpen`)が、「本当に閉じ損なった」の
     // ではなく「段2の途中でたまたま検出した」だけなので、`CloseFailed` は誤解を招く。
@@ -1446,7 +1468,7 @@ pub fn shutdown(handle: u64) -> ShutdownOutcome {
             match instance.backend.close() {
                 Ok(()) => ShutdownOutcome::Closed,
                 // 🔴 段2 が進行中だったなら、`self.backend` が「本物の未クローズの
-                // バックエンド」ではなく段1が置いた新品の未オープン `CpalBackend`
+                // バックエンド」ではなく段1が置いた新品の未オープンバックエンド
                 // であることが分かっている——旧バックエンドは段2側で既に(または
                 // まもなく)`close()` される。ここでの `NotOpen` は「本当に閉じ損なった」
                 // ことを意味しないため `Closed` として報告する(段2側は段3で
@@ -1458,6 +1480,9 @@ pub fn shutdown(handle: u64) -> ShutdownOutcome {
                 // 本当に「開けなかった」状態のままだからで、この場合の挙動は
                 // P3-11 以前から変えていない(`Instance::begin_reopen` のドキュメント
                 // 「再オープンに失敗したとき」参照)。
+                // 📌 この「失敗後は `CloseFailed`」は
+                // `tests::reopen_failure_is_recorded_and_eventually_gives_up` が
+                // 固定化している(2026-09-23。それまで未検証だった)。
                 Err(BackendError::NotOpen) if reopen_was_in_progress => ShutdownOutcome::Closed,
                 Err(_) => ShutdownOutcome::CloseFailed,
             }
@@ -1541,6 +1566,8 @@ pub fn maybe_reopen(handle: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     // Note: これらのテストはグローバルレジストリを共有するため、cpal のデバイス有無に
     // 依存する部分(実際に `Opened` になるかどうか)は環境依存。ここでは
@@ -1579,18 +1606,17 @@ mod tests {
 
     #[test]
     fn is_reopen_in_progress_is_false_at_rest() {
-        // 📌 理論上のごく僅かなレース: 同じテストバイナリ内で
-        // `crate::ffi::tests::run_reopen_lifecycle`(実デバイス越しの再オープン
-        // 統合テスト)が偶然この一瞬と重なって走っていると `true` を観測しうる。
-        // 実害は無い(CI はデバイス無しでそちらのテストが早期リターンするため
-        // 常に安全。実機/開発機で完全並列実行した場合のみ理論上の可能性がある)。
+        // レジストリと進行中フラグを共有するテストを直列化することで、他のテストの
+        // 再オープンが一瞬だけ true を作る理論上のレースも起こらないことを固定する。
+        let _lock = crate::test_backend::registry_lock();
         assert!(!is_reopen_in_progress());
     }
 
     #[test]
     fn maybe_reopen_with_unknown_handle_is_a_noop_and_does_not_touch_the_flag() {
-        // グローバルなレジストリ・フラグを共有する他テストと並走しても安全なように、
-        // 絶対値ではなく「このテスト自身の呼び出しが値を変えないこと」だけを見る。
+        // グローバルなレジストリ・進行中フラグを共有するテストを直列化し、未知ハンドル
+        // の no-op 以外の変化が混ざらないことを固定する。
+        let _lock = crate::test_backend::registry_lock();
         let before = is_reopen_in_progress();
         maybe_reopen(u64::MAX);
         assert_eq!(
@@ -1625,5 +1651,230 @@ mod tests {
             !TEST_FLAG.load(Ordering::Acquire),
             "Drop must clear the flag even when the guarded scope unwinds via panic"
         );
+    }
+
+    #[test]
+    fn shutdown_during_stage2_tears_down_the_orphaned_reopen() {
+        use crate::test_backend::{FakeBackendShared, Gate, install_scripted_factory, wait_until};
+
+        // 段2の open を門の内側で止め、shutdown が差し替え用 backend を閉じた後に
+        // ワーカーが自分の新 backend とデコードスレッド2本を畳む経路を固定する。
+        let _lock = crate::test_backend::registry_lock();
+        let first = FakeBackendShared::new(48_000);
+        let replacement = FakeBackendShared::new(0);
+        let third = FakeBackendShared::new(44_100);
+        let gate = Gate::closed();
+        third.set_open_gate(Some(Arc::clone(&gate)));
+        let _factory = install_scripted_factory(vec![
+            Arc::clone(&first),
+            Arc::clone(&replacement),
+            Arc::clone(&third),
+        ]);
+
+        let handle = match init() {
+            InitOutcome::Opened(handle) => handle,
+            InitOutcome::AlreadyOpen(_) => panic!("test registry must start empty"),
+            InitOutcome::Failed => panic!("the first fake backend must open"),
+        };
+        assert_eq!(
+            with_instance(handle, |instance| instance.backend_sample_rate()),
+            Some(48_000)
+        );
+        with_instance(handle, |instance| {
+            instance.note_stream_error(StreamErrorReason::DeviceUnavailable);
+        });
+        maybe_reopen(handle);
+
+        assert!(third.wait_entered_open(Duration::from_secs(5)));
+        // 段2の門の中だけで、未オープンの差し替え用 backend と直近値フォールバックを
+        // 同時に観測できることを固定する。
+        assert!(is_reopen_in_progress());
+        assert_eq!(
+            with_instance(handle, |instance| instance.backend_sample_rate()),
+            Some(48_000)
+        );
+        assert!(matches!(shutdown(handle), ShutdownOutcome::Closed));
+
+        gate.release();
+        assert!(wait_until(
+            || !is_reopen_in_progress(),
+            Duration::from_secs(5)
+        ));
+        assert_eq!(third.open_calls(), 1);
+        assert_eq!(third.close_calls(), 1);
+        assert!(!third.is_open());
+        assert!(with_instance(handle, |_| ()).is_none());
+        assert!(matches!(shutdown(handle), ShutdownOutcome::InvalidHandle));
+
+        let handle2 = match init() {
+            InitOutcome::Opened(handle) => handle,
+            InitOutcome::AlreadyOpen(_) => panic!("orphan teardown must clear the registry"),
+            InitOutcome::Failed => panic!("the default fake backend must open"),
+        };
+        assert_ne!(handle2, handle);
+        assert!(matches!(shutdown(handle2), ShutdownOutcome::Closed));
+    }
+
+    #[test]
+    fn teardown_orphaned_reopen_closes_the_backend_and_joins_both_decode_threads() {
+        use crate::test_backend::{FakeBackend, FakeBackendShared};
+
+        // 孤児化した段3の後始末が backend の close だけでなく、デコードスレッド2本の
+        // 停止要求と join まで完了させることを固定する。
+        let (
+            renderer,
+            _command_sender,
+            _reclaim_receiver,
+            music_producer,
+            _music_clock,
+            events,
+            bgm,
+        ) = Renderer::build(Config::default(), 48_000);
+        let (_music_tx, stop_a, join_a) = decode_thread::spawn(music_producer, Arc::clone(&events));
+        let (_bgm_tx, stop_b, join_b) =
+            decode_thread::spawn(bgm.stream_producer, Arc::clone(&events));
+        let observed_a = Arc::clone(&stop_a);
+        let observed_b = Arc::clone(&stop_b);
+
+        let shared = FakeBackendShared::new(48_000);
+        let mut fake = FakeBackend::from_shared(Arc::clone(&shared));
+        fake.open(renderer, events).expect("fake backend must open");
+        teardown_orphaned_reopen(Box::new(fake), stop_a, join_a, stop_b, join_b);
+
+        assert_eq!(shared.close_calls(), 1);
+        assert!(!shared.is_open());
+        assert!(observed_a.load(Ordering::Relaxed));
+        assert!(observed_b.load(Ordering::Relaxed));
+        // スレッドは自分用の Arc クローンを握るため、join 後は観測用の1本だけが残る。
+        // ただし、スレッドがたまたま先に終了していれば join 無しでも1になりうる限界はある。
+        assert_eq!(Arc::strong_count(&observed_a), 1);
+        assert_eq!(Arc::strong_count(&observed_b), 1);
+    }
+
+    #[test]
+    fn reopen_succeeds_and_swaps_in_the_new_backend() {
+        use crate::test_backend::{FakeBackendShared, install_scripted_factory, wait_until};
+
+        // 段1→段2→段3の成功を通し、旧 backend の close、新 backend の open、状態と通知の
+        // 差し替えが一つの再オープンとして完了することを固定する。
+        let _lock = crate::test_backend::registry_lock();
+        let first = FakeBackendShared::new(48_000);
+        let replacement = FakeBackendShared::new(0);
+        let third = FakeBackendShared::new(44_100);
+        let _factory = install_scripted_factory(vec![
+            Arc::clone(&first),
+            Arc::clone(&replacement),
+            Arc::clone(&third),
+        ]);
+        let handle = match init() {
+            InitOutcome::Opened(handle) => handle,
+            InitOutcome::AlreadyOpen(_) => panic!("test registry must start empty"),
+            InitOutcome::Failed => panic!("the first fake backend must open"),
+        };
+        with_instance(handle, |instance| {
+            instance.events.drain(64, |_| {});
+            instance.note_stream_error(StreamErrorReason::DeviceUnavailable);
+        });
+        maybe_reopen(handle);
+        assert!(wait_until(
+            || !is_reopen_in_progress(),
+            Duration::from_secs(5)
+        ));
+
+        assert_eq!(first.close_calls(), 1);
+        assert_eq!(third.open_calls(), 1);
+        assert!(third.is_open());
+        assert_eq!(
+            with_instance(handle, |instance| instance.backend_sample_rate()),
+            Some(44_100)
+        );
+        assert_eq!(
+            with_instance(handle, |instance| instance.reopen_diagnostics()),
+            Some((false, 0, false))
+        );
+        let events = with_instance(handle, |instance| {
+            let mut events = Vec::new();
+            instance.events.drain(64, |event| events.push(event));
+            events
+        })
+        .expect("the instance must still be registered");
+        assert!(events.contains(&mw_core::Event::AudioInterruptionEnded { recovered: true }));
+        assert!(matches!(shutdown(handle), ShutdownOutcome::Closed));
+    }
+
+    #[test]
+    fn reopen_failure_is_recorded_and_eventually_gives_up() {
+        use crate::test_backend::{FakeBackendShared, install_scripted_factory, wait_until};
+
+        // 段2の open 失敗を、1回目の記録からバックオフ全消化による諦め・通知まで進め、
+        // 失敗中もサンプルレートのフォールバックが保たれることを固定する。
+        let _lock = crate::test_backend::registry_lock();
+        let first = FakeBackendShared::new(48_000);
+        let replacement = FakeBackendShared::new(0);
+        let third = FakeBackendShared::new(44_100);
+        third.set_open_should_fail(true);
+        let _factory = install_scripted_factory(vec![
+            Arc::clone(&first),
+            Arc::clone(&replacement),
+            Arc::clone(&third),
+        ]);
+        let handle = match init() {
+            InitOutcome::Opened(handle) => handle,
+            InitOutcome::AlreadyOpen(_) => panic!("test registry must start empty"),
+            InitOutcome::Failed => panic!("the first fake backend must open"),
+        };
+        with_instance(handle, |instance| {
+            instance.events.drain(64, |_| {});
+            instance.note_stream_error(StreamErrorReason::DeviceUnavailable);
+        });
+        maybe_reopen(handle);
+        assert!(wait_until(
+            || !is_reopen_in_progress(),
+            Duration::from_secs(5)
+        ));
+
+        assert_eq!(third.open_calls(), 1);
+        assert!(!third.is_open());
+        assert_eq!(
+            with_instance(handle, |instance| instance.reopen_diagnostics()),
+            Some((true, 1, false))
+        );
+        assert_eq!(
+            with_instance(handle, |instance| instance.backend_sample_rate()),
+            Some(48_000)
+        );
+        let events = with_instance(handle, |instance| {
+            let mut events = Vec::new();
+            instance.events.drain(64, |event| events.push(event));
+            events
+        })
+        .expect("the instance must still be registered");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, mw_core::Event::AudioInterruptionEnded { .. }))
+        );
+
+        // バックオフの実時間を待たず、private な段3を直接呼んで通算6回目の失敗まで進める。
+        let now_ns = mw_backend::host_time_ns();
+        for step in 0..5 {
+            finalize_reopen_failure(handle, now_ns + (step + 1) * 10_000_000_000);
+        }
+        let diagnostics = with_instance(handle, |instance| instance.reopen_diagnostics())
+            .expect("the instance must still be registered");
+        assert!(diagnostics.2);
+        let events = with_instance(handle, |instance| {
+            let mut events = Vec::new();
+            instance.events.drain(64, |event| events.push(event));
+            events
+        })
+        .expect("the instance must still be registered");
+        assert!(events.contains(&mw_core::Event::AudioInterruptionEnded { recovered: false }));
+
+        // 🔴 段2が進行中で**ない**まま未オープンのバックエンドを閉じにいく経路は、
+        // `CloseFailed` を正直に返すのが `shutdown` の約束(`self.backend` が本当に
+        // 「開けなかった」状態のままだから)。段2 の割り込みだけを `Closed` へ
+        // 丸める分岐(`reopen_was_in_progress`)と取り違えないよう、ここで固定する。
+        assert!(matches!(shutdown(handle), ShutdownOutcome::CloseFailed));
     }
 }

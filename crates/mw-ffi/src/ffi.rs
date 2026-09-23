@@ -1096,7 +1096,7 @@ pub extern "C" fn mw_bgm_set_loop(handle: u64, begin_frames: u64, end_frames: u6
 /// なることはまず無いため、この特殊値を「たまたま 0ns だった」と取り違える実害は
 /// 無い——`mw_backend::Backend::output_latency_ns` のドキュメント参照)。
 ///
-/// あわせて、`CpalBackend::log_output_latency_once`(1インスタンスにつき1回だけ
+/// あわせて、`Backend::log_output_latency_once`(1インスタンスにつき1回だけ
 /// ログへ残す)をこのゲームスレッド経路から呼ぶ(**コールバック内から呼んでは
 /// いけない**——`mw_log!` はアロケーションとロックを伴うため、初期構築仕様
 /// 『§5.3』のリアルタイム安全性規約に抵触する。`Instance::log_buffer_info_once`
@@ -1148,8 +1148,8 @@ pub unsafe extern "C" fn mw_get_output_latency_ns(handle: u64, out_ns: *mut u64)
 /// `Ok` を返す**ので、鳴らなかったことに気付ける口はここしか無い。
 /// バックエンド由来の上3つと出自が違う理由は [`MwOutputUnderrunStats`] のドキュメント参照。
 ///
-/// あわせて、新たに検知した分があれば[`CpalBackend::log_new_output_underruns`]
-/// (`mw_backend::CpalBackend`)をこのゲームスレッド経路から呼ぶ(**コールバック内
+/// あわせて、新たに検知した分があれば[`Backend::log_new_output_underruns`]
+/// (`mw_backend::Backend`)をこのゲームスレッド経路から呼ぶ(**コールバック内
 /// から呼んではいけない**——`mw_log!` はアロケーションとロックを伴うため、初期構築
 /// 仕様『§5.3』のリアルタイム安全性規約に抵触する。`mw_get_output_latency_ns` と
 /// 同じ配線パターン)。
@@ -1368,6 +1368,7 @@ mod tests {
     /// クラッシュせずエラーコードを返せていることまでを確認する(§4.8)。
     #[test]
     fn init_se_lifecycle_then_shutdown_or_gracefully_reports_no_device() {
+        let _lock = crate::test_backend::registry_lock();
         let mut handle_out: u64 = 0;
         let init_result = unsafe { mw_init(&mut handle_out as *mut u64) };
         match init_result {
