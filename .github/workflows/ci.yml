@@ -24,6 +24,26 @@ jobs:
       - name: Install ALSA dev headers (cpal の Linux ビルドに必要)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
 
+      # 🔴 CI にはオーディオデバイスが無く、`CpalBackend::open()` が即座に失敗する。
+      # すると `mw_init` が `InitOutcome::Failed` を返し、**そこから先のテストが
+      # すべて未到達**になる —— 2026-09-23 の実測で、同じテスト一式が
+      # 実デバイスのあるマシンでは TOTAL 95.84%(handle.rs 83% / ffi.rs 98%)なのに対し、
+      # CI では handle.rs 13% / ffi.rs 49% だった。**テストは書けていて、CI が
+      # 実行できていないだけ**という状態。
+      #
+      # ALSA の `null` PCM を既定の出力先にして、cpal がストリームを開けるようにする。
+      # ⚠️ 音は一切出ない(捨てられる)が、コールバックは回る。
+      # 📌 `$HOME/.asoundrc` だけを書く —— `/etc/asound.conf` を触らず、カーネルモジュールを
+      # ロードせず、デーモンも起動しないので、このジョブの外へ影響しない。
+      - name: Configure ALSA null output (CI にデバイスが無いため)
+        run: |
+          cat > "$HOME/.asoundrc" <<'ASOUNDRC'
+          pcm.!default {
+              type plug
+              slave.pcm "null"
+          }
+          ASOUNDRC
+
       - name: Install Rust
         # `@stable` は rust-toolchain.toml を読まず常に最新 stable を入れてしまい、
         # ローカル(ファイル固定)と CI(常に最新)がズレて事故る(実際に2回発生した)。
