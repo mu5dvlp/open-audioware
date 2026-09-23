@@ -4,6 +4,15 @@
 
 # open-audioware
 
+<p align="center">
+  <a href="https://github.com/mu5dvlp/open-audioware/actions/workflows/ci.yml"><img src="https://github.com/mu5dvlp/open-audioware/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI の状態" /></a>
+  <a href="https://codecov.io/gh/mu5dvlp/open-audioware"><img src="https://codecov.io/gh/mu5dvlp/open-audioware/branch/main/graph/badge.svg" alt="カバレッジ" /></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT--0-blue.svg" alt="ライセンス: MIT-0" /></a>
+  <a href="./rust-toolchain.toml"><img src="https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fmu5dvlp%2Fopen-audioware%2Fmain%2Frust-toolchain.toml&query=%24.toolchain.channel&label=rust&color=orange&logo=rust" alt="Rust のツールチェーン" /></a>
+  <img src="https://img.shields.io/badge/Unity-6-black.svg?logo=unity" alt="Unity 6" />
+  <img src="https://img.shields.io/badge/platform-iOS%20%7C%20Android%20%7C%20macOS-lightgrey.svg" alt="対応プラットフォーム" />
+</p>
+
 **音楽ゲームのための Unity 向けオーディオミドルウェア(Rust 製)。**
 
 OS のローレイテンシ音声 API を直接叩き、**タップ SE の発音遅延**と**音楽クロックの精度**を
