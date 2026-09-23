@@ -169,6 +169,6 @@ make unity-test            # EditMode テストを回す
 |---|---|
 | 実機プロファイル(CPU / 電力) | ⬜ **実機が要る**。M1 の A/B 計測と同じ方式で測る([`measurement-m1.md`](measurement-m1.md)) |
 | 長時間試験 | ⬜ 実機で放置して確認する類のもの |
-| UPM パッケージ名 / 組織 ID | 🔴 **【未定】**(初期構築仕様 MU7)。いまは `com.mu5dvlp.open-audioware`。公開するなら決め直す |
+| UPM パッケージ名 / 組織 ID | ✅ **決定**(MU7。ユーザー判断 2026-09-23「Open Audioware か Open Source Audio Middleware になっていれば大丈夫」)—— `displayName` は **Open Source Audio Middleware**、`name` は `com.mu5dvlp.open-audioware` のまま(load-bearing なのは `name` のほう)|
 | リリース自動化 | ⬜ 未着手。`make package` は現状「必須ファイルの存在確認」まで |
 | 設計 ADR | ⬜ 未着手。⚠️ **初期構築仕様と各クレートの `CLAUDE.md` に既に書かれている決定を ADR へ写すと、正が2つになる。** 何を ADR に切り出すかを決めてから作ること |
