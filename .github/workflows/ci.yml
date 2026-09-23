@@ -31,18 +31,26 @@ jobs:
       # CI では handle.rs 13% / ffi.rs 49% だった。**テストは書けていて、CI が
       # 実行できていないだけ**という状態。
       #
-      # ALSA の `null` PCM を既定の出力先にして、cpal がストリームを開けるようにする。
-      # ⚠️ 音は一切出ない(捨てられる)が、コールバックは回る。
-      # 📌 `$HOME/.asoundrc` だけを書く —— `/etc/asound.conf` を触らず、カーネルモジュールを
-      # ロードせず、デーモンも起動しないので、このジョブの外へ影響しない。
-      - name: Configure ALSA null output (CI にデバイスが無いため)
+      # 🔴 **`snd-dummy`(タイマー駆動の仮想サウンドカード)を使う。**
+      # ⚠️ ALSA の `null` PCM では**駄目だった**(2026-09-23 に実測):
+      # ストリームは開けるが**音声コールバックが回らない**ため、投入した再生コマンドが
+      # 掃かれず `state: Ready / song_frames: 0` のままになり、
+      # `init_se_lifecycle_then_shutdown_or_gracefully_reports_no_device` が落ちた。
+      # `null` は「書き込みを捨てる」だけでクロックを持たない。
+      #
+      # 📌 **失敗しても安全** —— モジュールが入らなければデバイス無しのままで、
+      # 上記テストは名前のとおり "gracefully reports no device" の経路を通って緑になる
+      # (= この変更が壊すものは無い。効けばカバレッジが上がる、というだけ)。
+      - name: Set up a dummy sound card (CI にデバイスが無いため)
         run: |
-          cat > "$HOME/.asoundrc" <<'ASOUNDRC'
-          pcm.!default {
-              type plug
-              slave.pcm "null"
-          }
-          ASOUNDRC
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+          sudo modprobe snd-dummy || true
+          if [ -e /dev/snd/controlC0 ]; then
+            echo "dummy sound card available:"
+            ls -la /dev/snd/ || true
+          else
+            echo "⚠️ dummy sound card NOT available —— デバイス無しのまま続行する"
+          fi
 
       - name: Install Rust
         # `@stable` は rust-toolchain.toml を読まず常に最新 stable を入れてしまい、
