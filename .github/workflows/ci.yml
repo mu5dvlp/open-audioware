@@ -28,28 +28,41 @@ jobs:
       # すると `mw_init` が `InitOutcome::Failed` を返し、**そこから先のテストが
       # すべて未到達**になる —— 2026-09-23 の実測で、同じテスト一式が
       # 実デバイスのあるマシンでは TOTAL 95.84%(handle.rs 83% / ffi.rs 98%)なのに対し、
-      # CI では handle.rs 13% / ffi.rs 49% だった。**テストは書けていて、CI が
-      # 実行できていないだけ**という状態。
+      # CI では handle.rs 13% / ffi.rs 49% だった。
+      # **テストは書けていて、CI が実行できていないだけ**という状態。
       #
-      # 🔴 **`snd-dummy`(タイマー駆動の仮想サウンドカード)を使う。**
-      # ⚠️ ALSA の `null` PCM では**駄目だった**(2026-09-23 に実測):
-      # ストリームは開けるが**音声コールバックが回らない**ため、投入した再生コマンドが
-      # 掃かれず `state: Ready / song_frames: 0` のままになり、
-      # `init_se_lifecycle_then_shutdown_or_gracefully_reports_no_device` が落ちた。
-      # `null` は「書き込みを捨てる」だけでクロックを持たない。
+      # ## 試した順と結果(2026-09-23。⚠️ 同じ道を二度試さないため残す)
       #
-      # 📌 **失敗しても安全** —— モジュールが入らなければデバイス無しのままで、
-      # 上記テストは名前のとおり "gracefully reports no device" の経路を通って緑になる
-      # (= この変更が壊すものは無い。効けばカバレッジが上がる、というだけ)。
+      # 1. ❌ **ALSA の `null` PCM**(`$HOME/.asoundrc` で既定を差し替え)——
+      #    ストリームは開けるが **音声コールバックが回らない**(`null` は書き込みを
+      #    捨てるだけで**クロックを持たない**)。投入した再生コマンドが掃かれず
+      #    `state: Ready / song_frames: 0` のままで、
+      #    `init_se_lifecycle_then_shutdown_or_gracefully_reports_no_device` が落ちた。
+      # 2. ❌ **`snd-dummy` カーネルモジュール** —— GitHub の ubuntu runner では
+      #    `modprobe` できず(`/dev/snd/controlC0` が生えない)。
+      #    `linux-modules-extra-$(uname -r)` も入らない。
+      # 3. ⬜ **PulseAudio の null sink**(いまこれ)—— カーネルモジュールを使わず、
+      #    ユーザ空間のデーモンがタイマーを持つので `null` PCM の問題が起きないはず。
+      #    cpal(ALSA ホスト)からは `libasound2-plugins` の `pulse` PCM 経由で見える。
+      #
+      # 📌 **どれも失敗しても安全** —— デバイスが無ければ上記テストは名前のとおり
+      # "gracefully reports no device" の経路を通って緑になる。
+      # 🔴 **これ以上は追わない。** 3 が駄目ならこのステップごと落として、
+      # 「CI のカバレッジは構造的に低い」と受け入れる(数字ではなく patch を見る運用)。
       - name: Set up a dummy sound card (CI にデバイスが無いため)
         run: |
-          sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
-          sudo modprobe snd-dummy || true
-          if [ -e /dev/snd/controlC0 ]; then
-            echo "dummy sound card available:"
-            ls -la /dev/snd/ || true
+          sudo apt-get install -y pulseaudio pulseaudio-utils libasound2-plugins || true
+          pulseaudio --start --exit-idle-time=-1 --daemonize=true || true
+          pactl load-module module-null-sink sink_name=ci_dummy || true
+          pactl set-default-sink ci_dummy || true
+          cat > "$HOME/.asoundrc" <<'ASOUNDRC'
+          pcm.!default { type pulse }
+          ctl.!default { type pulse }
+          ASOUNDRC
+          if pactl info >/dev/null 2>&1; then
+            echo "✅ PulseAudio available:"; pactl list short sinks || true
           else
-            echo "⚠️ dummy sound card NOT available —— デバイス無しのまま続行する"
+            echo "⚠️ PulseAudio NOT available —— デバイス無しのまま続行する"
           fi
 
       - name: Install Rust
