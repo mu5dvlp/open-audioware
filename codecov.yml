@@ -1,0 +1,30 @@
+# Codecov の設定(2026-09-23 導入。ワークスペース CLAUDE.md「CI はコーヒー基準」)。
+#
+# 🔴 この設定の目的は「数字を上げること」ではなく、**新しく書いた行にテストが付いて
+# いるかを PR ごとに見せること**。このリポジトリは実デバイスが要る経路(cpal の
+# オープン・AAudio の切断復帰)を多く含み、CI にはオーディオデバイスが無いため、
+# 全体のカバレッジ率は構造的に低く出る。
+# ⚠️ **低い total を理由に薄いテストを足さないこと。** 見るのは patch(差分)。
+
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        # 1% 以内の下振れでは落とさない(計装ビルドの揺れで赤くしない)。
+        threshold: 1%
+    patch:
+      default:
+        # 🔴 新しく書いた行だけは厳しく見る —— ここがこの導入の本体。
+        target: 70%
+
+ignore:
+  # 🔴 CI にはオーディオデバイスが無く、`CpalBackend::open` は即座に失敗して終わる。
+  # 除外しないと、ここだけが 0% 近い数字を出し続けて全体を引き下げ、
+  # 「カバレッジが赤いのが常態」になって誰も見なくなる
+  # (`make master-validate` が恒常的に赤くて退行に気付けなくなっていたのと同じ失敗)。
+  - "crates/mw-backend/src/cpal_backend.rs"
+  # iOS の割り込み処理も同じ理由(実機でしか走らない)。
+  - "crates/mw-backend/src/ios_interruption.rs"
+  # ベンチはテスト対象ではない。
+  - "benches/**"

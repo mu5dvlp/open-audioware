@@ -30,7 +30,8 @@ jobs:
         # バージョンはリポジトリ直下の rust-toolchain.toml と手で合わせること。
         uses: dtolnay/rust-toolchain@1.98.0
         with:
-          components: rustfmt, clippy
+          # llvm-tools-preview は cargo-llvm-cov(カバレッジ計測)が要求する。
+          components: rustfmt, clippy, llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
 
@@ -43,17 +44,39 @@ jobs:
       - name: cargo deny check
         uses: EmbarkStudios/cargo-deny-action@v2
 
-      - name: cargo test
-        run: cargo test --workspace
+      # 🔴 **`cargo test` の置き換え**(2026-09-23。Codecov 導入)。
+      # `cargo llvm-cov` は「テストを走らせたうえで計測する」ので、これ1本で
+      # 従来の `cargo test --workspace` と同じ検証になる。
+      # ⚠️ **`cargo test` を別ステップとして残さないこと** —— 同じテストが2回走り、
+      # CLAUDE.md の「CI はコーヒー基準(3〜5分)」を確実に割る。
+      # ⚠️ **`--all-features` は付けない** —— 従来の `cargo test --workspace` と
+      # 検証範囲を変えないため(ゲートの意味を静かに広げない)。
+      # 📌 計装ビルドは `Swatinem/rust-cache` のキャッシュに乗らない(プロファイルが
+      # 違うので別アーティファクトになる)。所要がコーヒー基準を割るようなら、
+      # このジョブを `on: push` から外して schedule(週次)+ workflow_dispatch へ回す。
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: cargo llvm-cov (テスト実行 + カバレッジ計測)
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: true
 
       # 🔴 P3-8: 手書きの C# ラッパ(unity/Runtime/MwNative.cs)を Unity 無しで
       # コンパイルする。ここまでの cargo ステップは Rust 側しか見ておらず、
       # C# 側のフィールド名・型・シグネチャのズレは**一切検出できない**
       # (Unity のテストは CI で回さない方針なので、他に見る場所が無い)。
       #
-      # ⚠️ **cargo test より後に置くこと。** 検査対象の
-      # unity/Runtime/Generated/NativeMethods.g.cs は crates/mw-ffi/build.rs が
+      # ⚠️ **cargo のビルドを伴うステップ(いまは cargo llvm-cov)より後に置くこと。**
+      # 検査対象の unity/Runtime/Generated/NativeMethods.g.cs は crates/mw-ffi/build.rs が
       # 生成する成果物で、リポジトリには入っていない(.gitignore)。
+      # 📌 build.rs の出力先はリポジトリ内の固定パスなので、cargo llvm-cov の
+      # 計装ビルド(target/llvm-cov-target)へ切り替わっても生成されること自体は変わらない。
       # 📌 3秒で終わるのでコーヒー基準を壊さない。Makefile と二重に書かないため
       # `make csharp-check` を呼ぶ(既定分岐と UNITY_IOS 分岐の両方を見る)。
       - name: Setup .NET (C# ラッパのコンパイル検査用)
