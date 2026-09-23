@@ -152,6 +152,17 @@ mod tests {
     }
 
     #[test]
+    fn default_matches_new_for_bgm_state_publisher() {
+        let default = BgmStatePublisher::default();
+        let new = BgmStatePublisher::new();
+        assert_eq!(default.read(), new.read());
+
+        default.write(MusicState::Playing);
+        new.write(MusicState::Playing);
+        assert_eq!(default.read(), new.read());
+    }
+
+    #[test]
     fn bgm_state_publisher_write_is_reflected_in_read() {
         let publisher = BgmStatePublisher::new();
         for state in [

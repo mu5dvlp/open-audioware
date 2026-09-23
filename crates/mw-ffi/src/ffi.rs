@@ -1573,6 +1573,7 @@ mod tests {
 
         run_event_poll_checks(handle);
         run_music_lifecycle(handle);
+        run_music_set_error_paths(handle);
         run_music_preview_style_rapid_switch(handle);
         run_bgm_lifecycle(handle);
         run_reopen_lifecycle(handle);
@@ -1982,6 +1983,58 @@ mod tests {
             MwResult::ErrInvalidSoundId,
             "double release of a BGM id must be rejected, not crash"
         );
+    }
+
+    /// `set_music_track` の実害のある失敗経路を、仮想デバイス上の実ハンドル越しに固定する。
+    ///
+    /// Music モードはロード時にはデコードしないため、壊れた入力はここで初めて検出される。
+    /// `mw_music_set` と `mw_bgm_set` は同じ実体を共有するので、両方がパニックせず
+    /// `DecodeError` を `MwResult::ErrDecodeFailed` へ落とすことも確認する。
+    fn run_music_set_error_paths(handle: u64) {
+        let valid_bytes = make_pcm16_wav(48_000, 2, &[123, -123]);
+        let mut released_id = 0u64;
+        assert_eq!(
+            unsafe {
+                mw_sound_load(
+                    handle,
+                    valid_bytes.as_ptr(),
+                    valid_bytes.len(),
+                    1, // MwSoundMode::Music
+                    &mut released_id as *mut u64,
+                )
+            },
+            MwResult::Ok
+        );
+        assert_eq!(mw_sound_release(handle, released_id), MwResult::Ok);
+        assert_eq!(
+            mw_music_set(handle, released_id),
+            MwResult::ErrInvalidSoundId,
+            "a released music id must not be treated as a loaded track"
+        );
+        assert_eq!(
+            mw_bgm_set(handle, released_id),
+            MwResult::ErrInvalidSoundId,
+            "a released music id must not be treated as a loaded BGM track"
+        );
+
+        let corrupt_bytes = b"not an audio stream";
+        let mut corrupt_id = 0u64;
+        assert_eq!(
+            unsafe {
+                mw_sound_load(
+                    handle,
+                    corrupt_bytes.as_ptr(),
+                    corrupt_bytes.len(),
+                    1, // Music mode deliberately keeps bytes opaque at load time.
+                    &mut corrupt_id as *mut u64,
+                )
+            },
+            MwResult::Ok,
+            "Music mode must defer format validation until set"
+        );
+        assert_eq!(mw_music_set(handle, corrupt_id), MwResult::ErrDecodeFailed);
+        assert_eq!(mw_bgm_set(handle, corrupt_id), MwResult::ErrDecodeFailed);
+        assert_eq!(mw_sound_release(handle, corrupt_id), MwResult::Ok);
     }
 
     /// M3「Android(AAudio)切断復旧」案A の統合テスト(実ハンドル + 実デコードスレッド +

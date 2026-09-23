@@ -367,9 +367,26 @@ mod tests {
     }
 
     #[test]
-    fn stream_error_reason_from_raw_falls_back_to_unknown_for_out_of_range() {
+    fn stream_error_reason_from_raw_maps_all_abi_values_and_unknown_values() {
         assert_eq!(StreamErrorReason::from_raw(0), StreamErrorReason::Unknown);
-        assert_eq!(StreamErrorReason::from_raw(999), StreamErrorReason::Unknown);
+        assert_eq!(
+            StreamErrorReason::from_raw(1),
+            StreamErrorReason::DeviceUnavailable
+        );
+        assert_eq!(
+            StreamErrorReason::from_raw(2),
+            StreamErrorReason::Reconfigured
+        );
+        assert_eq!(
+            StreamErrorReason::from_raw(3),
+            StreamErrorReason::PermissionDenied
+        );
+        assert_eq!(StreamErrorReason::from_raw(4), StreamErrorReason::Backend);
+        assert_eq!(StreamErrorReason::from_raw(5), StreamErrorReason::Unknown);
+        assert_eq!(
+            StreamErrorReason::from_raw(u32::MAX),
+            StreamErrorReason::Unknown
+        );
     }
 
     #[test]

@@ -102,6 +102,23 @@ mod tests {
     }
 
     #[test]
+    fn defaults_match_new_for_bus_and_bus_set_state() {
+        let bus_default = Bus::default();
+        let bus_new = Bus::new();
+        assert_eq!(bus_default.volume.value(), bus_new.volume.value());
+
+        let set_default = BusSet::default();
+        let set_new = BusSet::new();
+        for id in ALL_BUSES {
+            assert_eq!(
+                set_default.get(id).volume.value(),
+                set_new.get(id).volume.value(),
+                "BusSet::default and BusSet::new differ for {id:?}"
+            );
+        }
+    }
+
+    #[test]
     fn from_u8_round_trips_for_valid_ids() {
         for id in ALL_BUSES {
             assert_eq!(BusId::from_u8(id as u8), Some(id));

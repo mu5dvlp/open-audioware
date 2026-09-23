@@ -107,6 +107,59 @@ impl fmt::Display for ResampleError {
 
 impl std::error::Error for ResampleError {}
 
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    /// `ResampleError` にバリアントを追加したときの表示固定をコンパイル時に要求する。
+    fn describe(error: &ResampleError) -> &'static str {
+        match error {
+            ResampleError::Construction(_) => "resampler construction failed",
+            ResampleError::Processing(_) => "resampling failed",
+        }
+    }
+
+    #[test]
+    fn resample_error_display_identifies_every_variant_without_duplicates() {
+        let errors = [
+            ResampleError::Construction("zero rate".into()),
+            ResampleError::Processing("short input".into()),
+        ];
+        let rendered: Vec<String> = errors
+            .iter()
+            .map(|error| {
+                let message = error.to_string();
+                assert!(
+                    message.contains(describe(error)),
+                    "{error:?} must retain its identifying phrase: {message}"
+                );
+                message
+            })
+            .collect();
+
+        assert!(
+            rendered.iter().enumerate().all(|(index, message)| rendered
+                .iter()
+                .enumerate()
+                .all(|(other_index, other)| index == other_index || message != other)),
+            "each ResampleError variant must have a distinct display message: {rendered:?}"
+        );
+        // 引数(内側の詳細メッセージ)が文言に出ていることも見る。
+        // 🔴 添字ではなく `match` で取り出すこと(理由は `wav.rs` の同じ検査のコメント参照)。
+        for error in &errors {
+            let detail = match error {
+                ResampleError::Construction(detail) | ResampleError::Processing(detail) => detail,
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains(detail.as_str()),
+                "{error:?} must print the underlying detail ({detail}) so the device log \
+                 says what was actually wrong: {message}"
+            );
+        }
+    }
+}
+
 /// `from_rate` 基準のフレーム数を `to_rate` 基準へ変換する(四捨五入)。
 ///
 /// `total_frames`・シーク位置の両方でこの1つの関数だけを使うことで、丸め規則を

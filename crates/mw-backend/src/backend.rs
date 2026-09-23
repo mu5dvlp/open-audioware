@@ -162,3 +162,75 @@ pub trait Backend {
     /// ための補助値)。
     fn consecutive_output_underrun_count(&self) -> u32;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `BackendError` にバリアントを追加したとき、ログ文言のテストも必ず更新させる。
+    /// ワイルドカードを使わないことで、文言の固定漏れをコンパイル時に検出する。
+    fn describe(error: &BackendError) -> &'static str {
+        match error {
+            BackendError::NoOutputDevice => "no default output device",
+            BackendError::NoSupportedStreamConfig => "no supported f32 stereo output stream config",
+            BackendError::BuildStreamFailed(_) => "failed to build stream",
+            BackendError::PlayStreamFailed(_) => "failed to start stream",
+            BackendError::AlreadyOpen => "backend is already open",
+            BackendError::NotOpen => "backend is not open",
+        }
+    }
+
+    #[test]
+    fn backend_error_display_identifies_every_variant_without_duplicates() {
+        let errors = [
+            BackendError::NoOutputDevice,
+            BackendError::NoSupportedStreamConfig,
+            BackendError::BuildStreamFailed("build detail".into()),
+            BackendError::PlayStreamFailed("play detail".into()),
+            BackendError::AlreadyOpen,
+            BackendError::NotOpen,
+        ];
+
+        let rendered: Vec<String> = errors
+            .iter()
+            .map(|error| {
+                let message = error.to_string();
+                assert!(
+                    message.contains(describe(error)),
+                    "{error:?} must retain its identifying phrase: {message}"
+                );
+                message
+            })
+            .collect();
+
+        assert!(
+            rendered.iter().enumerate().all(|(index, message)| rendered
+                .iter()
+                .enumerate()
+                .all(|(other_index, other)| index == other_index || message != other)),
+            "each BackendError variant must have a distinct display message: {rendered:?}"
+        );
+        // 引数(cpal から受けた詳細)が文言に出ていることも見る —— ここを落とすと
+        // 実機で「なぜストリームが作れなかったのか」が永久に分からなくなる。
+        // 🔴 添字ではなく `match` で取り出すこと。添字で書くと、上の配列の順番を
+        // 変えたときに**別のバリアントを検査して偶然通る**ようになる。
+        for error in &errors {
+            let detail = match error {
+                BackendError::BuildStreamFailed(detail)
+                | BackendError::PlayStreamFailed(detail) => Some(detail.as_str()),
+                BackendError::NoOutputDevice
+                | BackendError::NoSupportedStreamConfig
+                | BackendError::AlreadyOpen
+                | BackendError::NotOpen => None,
+            };
+            let Some(detail) = detail else {
+                continue;
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains(detail),
+                "{error:?} must print the underlying detail ({detail}): {message}"
+            );
+        }
+    }
+}

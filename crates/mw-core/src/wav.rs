@@ -76,6 +76,106 @@ impl fmt::Display for WavError {
 
 impl std::error::Error for WavError {}
 
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    /// `Resample` 以外の各バリアントのログ識別語を列挙する。
+    /// `Resample` は内側の `ResampleError` へ委譲するため、重複検査から除外する。
+    /// ワイルドカード無しの match により、バリアント追加時はこのテストも更新が必要になる。
+    fn describe(error: &WavError) -> Option<&'static str> {
+        match error {
+            WavError::Truncated => Some("wav data is truncated"),
+            WavError::NotRiff => Some("not a RIFF file"),
+            WavError::NotWave => Some("not a WAVE file"),
+            WavError::MissingFmtChunk => Some("missing the 'fmt ' chunk"),
+            WavError::MissingDataChunk => Some("missing the 'data' chunk"),
+            WavError::UnsupportedFormatTag(_) => Some("unsupported wav format tag"),
+            WavError::UnsupportedBitsPerSample(_) => Some("unsupported bits-per-sample"),
+            WavError::UnsupportedChannelCount(_) => Some("unsupported channel count"),
+            WavError::InvalidSampleRate(_) => Some("invalid sample rate"),
+            WavError::Resample(_) => None,
+        }
+    }
+
+    #[test]
+    fn wav_error_display_identifies_every_outer_variant_without_duplicates() {
+        let errors = [
+            WavError::Truncated,
+            WavError::NotRiff,
+            WavError::NotWave,
+            WavError::MissingFmtChunk,
+            WavError::MissingDataChunk,
+            WavError::UnsupportedFormatTag(3),
+            WavError::UnsupportedBitsPerSample(24),
+            WavError::UnsupportedChannelCount(5),
+            WavError::InvalidSampleRate(0),
+            // This variant delegates its complete message to the inner error.
+            WavError::Resample(ResampleError::Processing("buffer mismatch".into())),
+        ];
+
+        let outer_messages: Vec<String> = errors
+            .iter()
+            .filter_map(|error| {
+                let message = error.to_string();
+                let key = describe(error)?;
+                assert!(
+                    message.contains(key),
+                    "{error:?} must retain its identifying phrase: {message}"
+                );
+                Some(message)
+            })
+            .collect();
+
+        assert!(
+            outer_messages
+                .iter()
+                .enumerate()
+                .all(|(index, message)| outer_messages
+                    .iter()
+                    .enumerate()
+                    .all(|(other_index, other)| index == other_index || message != other)),
+            "each outer WavError variant must have a distinct display message: {outer_messages:?}"
+        );
+        // 引数つきのバリアントは、**引数そのものが文言に出ていること**も見る ——
+        // 出し忘れると実機のログから「何が駄目だったのか」が分からなくなる。
+        // 🔴 添字ではなく `match` で取り出すこと。添字で書くと、上の配列の順番を
+        // 変えたときに**別のバリアントを検査して偶然通る**(数字が他の文言に
+        // たまたま含まれる)ようになり、検査が黙って無意味になる。
+        for error in &errors {
+            let expected_argument = match error {
+                WavError::UnsupportedFormatTag(tag) => Some(tag.to_string()),
+                WavError::UnsupportedBitsPerSample(bits) => Some(bits.to_string()),
+                WavError::UnsupportedChannelCount(channels) => Some(channels.to_string()),
+                WavError::InvalidSampleRate(rate) => Some(rate.to_string()),
+                WavError::Truncated
+                | WavError::NotRiff
+                | WavError::NotWave
+                | WavError::MissingFmtChunk
+                | WavError::MissingDataChunk
+                | WavError::Resample(_) => None,
+            };
+            let Some(argument) = expected_argument else {
+                continue;
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains(&argument),
+                "{error:?} must print its argument ({argument}) so the device log says \
+                 what was actually wrong: {message}"
+            );
+        }
+
+        // 委譲するバリアントは内側のエラーの文言をそのまま出す
+        // (これが上の重複検査から除外してある理由)。
+        assert_eq!(
+            WavError::Resample(ResampleError::Processing("buffer mismatch".into())).to_string(),
+            "resampling failed: buffer mismatch",
+            "WavError::Resample は内側の ResampleError へ丸ごと委譲する"
+        );
+    }
+}
+
 /// モノ→ステレオ展開の等パワー係数(1/sqrt(2))。両chへ同一係数を掛けることで、
 /// 合成パワーが元のモノラル信号のパワーと一致する(初期構築仕様 M12)。
 const EQUAL_POWER_GAIN: f32 = std::f32::consts::FRAC_1_SQRT_2;

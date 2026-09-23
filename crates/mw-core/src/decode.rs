@@ -106,11 +106,120 @@ impl fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    /// `Resample` は内側のエラーへ表示を委譲するため、重複検査から除外する。
+    /// それ以外はワイルドカード無しで列挙し、バリアント追加時に更新を要求する。
+    fn describe(error: &DecodeError) -> Option<&'static str> {
+        match error {
+            DecodeError::Symphonia(_) => Some("symphonia decode error"),
+            DecodeError::NoAudioTrack => Some("no supported audio track"),
+            DecodeError::UnsupportedChannelCount(_) => Some("unsupported channel count"),
+            DecodeError::InvalidSampleRate(_) => Some("invalid source sample rate"),
+            DecodeError::Resample(_) => None,
+            DecodeError::ResetRequired => Some("stream requires a decoder reset"),
+        }
+    }
+
+    #[test]
+    fn decode_error_display_identifies_every_outer_variant_without_duplicates() {
+        let errors = [
+            DecodeError::Symphonia("malformed packet".into()),
+            DecodeError::NoAudioTrack,
+            DecodeError::UnsupportedChannelCount(5),
+            DecodeError::InvalidSampleRate(0),
+            // This variant delegates its complete message to the inner error.
+            DecodeError::Resample(ResampleError::Construction("zero rate".into())),
+            DecodeError::ResetRequired,
+        ];
+
+        let outer_messages: Vec<String> = errors
+            .iter()
+            .filter_map(|error| {
+                let message = error.to_string();
+                let key = describe(error)?;
+                assert!(
+                    message.contains(key),
+                    "{error:?} must retain its identifying phrase: {message}"
+                );
+                Some(message)
+            })
+            .collect();
+
+        assert!(
+            outer_messages
+                .iter()
+                .enumerate()
+                .all(|(index, message)| outer_messages
+                    .iter()
+                    .enumerate()
+                    .all(|(other_index, other)| index == other_index || message != other)),
+            "each outer DecodeError variant must have a distinct display message: {outer_messages:?}"
+        );
+        // 引数つきのバリアントは、**引数そのものが文言に出ていること**も見る。
+        // 🔴 添字ではなく `match` で取り出すこと(理由は `wav.rs` の同じ検査のコメント参照
+        // —— 添字だと配列の順番を変えたときに別のバリアントを検査して偶然通る)。
+        for error in &errors {
+            let expected_argument = match error {
+                DecodeError::Symphonia(message) => Some(message.clone()),
+                DecodeError::UnsupportedChannelCount(channels) => Some(channels.to_string()),
+                DecodeError::InvalidSampleRate(rate) => Some(rate.to_string()),
+                DecodeError::NoAudioTrack
+                | DecodeError::ResetRequired
+                | DecodeError::Resample(_) => None,
+            };
+            let Some(argument) = expected_argument else {
+                continue;
+            };
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains(&argument),
+                "{error:?} must print its argument ({argument}) so the device log says \
+                 what was actually wrong: {rendered}"
+            );
+        }
+
+        // 委譲するバリアントは内側のエラーの文言をそのまま出す
+        // (これが上の重複検査から除外してある理由)。
+        assert_eq!(
+            DecodeError::Resample(ResampleError::Construction("zero rate".into())).to_string(),
+            "resampler construction failed: zero rate",
+            "DecodeError::Resample は内側の ResampleError へ丸ごと委譲する"
+        );
+    }
+}
+
 impl From<SymphoniaError> for DecodeError {
     fn from(err: SymphoniaError) -> Self {
         match err {
             SymphoniaError::ResetRequired => DecodeError::ResetRequired,
             other => DecodeError::Symphonia(other.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod conversion_tests {
+    use super::*;
+
+    #[test]
+    fn symphonia_reset_required_keeps_its_dedicated_error_variant() {
+        assert!(matches!(
+            DecodeError::from(SymphoniaError::ResetRequired),
+            DecodeError::ResetRequired
+        ));
+    }
+
+    #[test]
+    fn other_symphonia_errors_are_retained_as_detailed_messages() {
+        let error = DecodeError::from(SymphoniaError::DecodeError("malformed packet"));
+        match error {
+            DecodeError::Symphonia(message) => {
+                assert!(message.contains("malformed packet"));
+            }
+            other => panic!("non-reset Symphonia errors must be wrapped, got {other:?}"),
         }
     }
 }

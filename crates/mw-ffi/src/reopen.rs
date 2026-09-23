@@ -194,6 +194,16 @@ mod tests {
     }
 
     #[test]
+    fn default_matches_new_initial_policy_state() {
+        let default = ReopenPolicy::default();
+        let new = ReopenPolicy::new();
+
+        assert_eq!(default.is_pending(), new.is_pending());
+        assert_eq!(default.attempts(), new.attempts());
+        assert_eq!(default.is_exhausted(), new.is_exhausted());
+    }
+
+    #[test]
     fn mark_pending_makes_it_immediately_due() {
         let policy = ReopenPolicy::new();
         policy.mark_pending(1_000);
