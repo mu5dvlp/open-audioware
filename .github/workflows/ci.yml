@@ -93,7 +93,7 @@ jobs:
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -112,7 +112,7 @@ jobs:
       # 📌 3秒で終わるのでコーヒー基準を壊さない。Makefile と二重に書かないため
       # `make csharp-check` を呼ぶ(既定分岐と UNITY_IOS 分岐の両方を見る)。
       - name: Setup .NET (C# ラッパのコンパイル検査用)
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: '8.0.x'
 
