@@ -27,6 +27,15 @@
 **エントリを追記するときは、いちばん新しいファイルの先頭へ足し、下の索引にも1行足すこと。**
 1ファイルが 300 行を大きく超えたら、新しい日付レンジのファイルへ分ける。
 
+### [2026-09-25](history/13-2026-09-25.md)
+
+- 🔴 **Dependabot PR#1 の原因を特定** —— `dtolnay/rust-toolchain` のタグは Rust の版そのもので、
+  存在しない `1.120.0` へ上げられ全ジョブが404。`535172e` で checkout/upload-artifact v7 だけを取り込み、
+  rust-toolchain を対象外にした。PR#3 はユーザーがマージ(`cf076fe`)、PR#2は未着手
+- 🆕 **Community Standards を 28% → 100%**(`65a4c0d`) —— Private Vulnerability Reporting を有効化、
+  説明文を設定。README を敬体に(`93fa89a`)
+- 🆕 **ci-workflows**(`3fa2cda`)
+
 ### [2026-09-23](history/12-2026-09-20.md)
 
 - 🆕 **P3-11 のネイティブを利用側へ届けた**(23:25〜23:27。`make build-macos` / `build-ios` /
@@ -150,4 +159,3 @@
 - **2026-08-24**〜25(middleware: M2-7 完了 —— 楽曲制御 API を FFI へ公開)
 - **2026-08-23**(middleware: M1 完了 → M2 着手)
 - **2026-08-23**(middleware: Android M1 計測に着手 —— 不具合3件を修正)
-
