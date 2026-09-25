@@ -15,11 +15,11 @@ crate-type = ["rlib"]
 # 回収キュー(音声→ゲームスレッド、Arc<SoundData> の解放をゲームスレッド側へ戻す)、
 # および楽曲ストリーミングの PCM 供給キュー(§4.7, `stream.rs`)に使う
 # (初期構築仕様 §7.1, §5.2)。
-rtrb = "0.3"
+rtrb = "0.4"
 # 楽曲のストリーミングデコード(初期構築仕様 §4.7, M7)。wav(PCM)/ ogg vorbis のみを
 # 使うため default-features を切り、必要な feature だけを有効化する(依存ツリーを
 # 無用に太らせない。§7.1 の実装方針)。opus 等の将来コーデック追加は MU2 の判断を待つ。
-symphonia = { version = "0.5", default-features = false, features = [
+symphonia = { version = "0.6", default-features = false, features = [
     "wav",
     "ogg",
     "vorbis",
@@ -30,6 +30,6 @@ symphonia = { version = "0.5", default-features = false, features = [
 # 無用に太らせない範囲で、既に必要な feature と一致するため明示的な取捨選択は不要)、
 # SE ロード時一括変換の `SincFixedIn` はどちらも feature フラグ無しで使える。
 # `resample.rs` の選定理由コメントを参照。
-rubato = "0.15"
+rubato = "5.0"
 
 [dev-dependencies]
