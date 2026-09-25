@@ -19,7 +19,7 @@ jobs:
   lint-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install ALSA dev headers (cpal の Linux ビルドに必要)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
@@ -123,7 +123,7 @@ jobs:
   macos-build:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         # `@stable` は rust-toolchain.toml を読まず常に最新 stable を入れてしまい、
@@ -142,7 +142,7 @@ jobs:
         run: make build-ios
 
       - name: Upload build artifacts (デバッグ用。Release 添付ではない)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: macos-ios-native
           path: |
@@ -154,7 +154,7 @@ jobs:
   android-build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         # `@stable` は rust-toolchain.toml を読まず常に最新 stable を入れてしまい、
@@ -181,7 +181,7 @@ jobs:
         run: cargo ndk -t arm64-v8a -P 26 build -p mw-ffi --release
 
       - name: Upload build artifact (デバッグ用。Release 添付ではない)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: android-native
           path: target/aarch64-linux-android/release/libmw_ffi.so
@@ -197,7 +197,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout(履歴全体)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 

@@ -28,6 +28,11 @@ updates:
       github-actions:
         patterns:
           - "*"
+    # 🔴 `dtolnay/rust-toolchain@<版>` は**タグの値がそのまま Rust の版**になる(`1.98.0` は意図した固定)。
+    #    2026-09-11 に Dependabot が `@1.120.0`(存在しない Rust)へ上げて CI が全滅した。
+    #    Rust の版はプロジェクトの判断で上げるので、ここでは追わない。
+    ignore:
+      - dependency-name: "dtolnay/rust-toolchain"
     open-pull-requests-limit: 3
     commit-message:
       prefix: "chore(deps)"
