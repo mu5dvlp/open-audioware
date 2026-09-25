@@ -1,0 +1,90 @@
+name: バグ報告
+description: 再現可能な不具合を報告する
+title: "[バグ] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        脆弱性は公開せず、[SECURITY.md](https://github.com/mu5dvlp/open-audioware/security/policy) の手順で非公開に報告してください。
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: プラットフォーム
+      description: 問題を確認したプラットフォームを選択してください。
+      options:
+        - iOS
+        - Android
+        - macOS
+    validations:
+      required: true
+
+  - type: input
+    id: unity-version
+    attributes:
+      label: Unity バージョン
+      description: Unity 6000.4.1f1 などを記入してください。
+      placeholder: 6000.4.1f1
+    validations:
+      required: true
+
+  - type: input
+    id: package-version
+    attributes:
+      label: crate / パッケージのバージョン
+      description: 使用したタグ、コミット、crate または UPM パッケージのバージョンを記入してください。
+      placeholder: main のコミットまたは 0.1.0
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 再現手順
+      description: 最小の再現手順、コード、音声素材の条件などを記入してください。
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期待する結果
+      description: 本来どうなるべきかを記入してください。
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 実際の結果
+      description: 何が起きたか、発生頻度、再現条件を記入してください。
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: ログ
+      description: 関連するログを貼り付けてください。秘密情報や個人情報は削除してください。
+      render: shell
+
+  - type: textarea
+    id: audio-info
+    attributes:
+      label: オーディオデバイスとバッファ情報
+      description: 出力デバイス名、サンプルレート、バッファ長、接続状態（有線/Bluetooth など）を記入してください。
+      placeholder: |
+        デバイス:
+        サンプルレート:
+        バッファ長:
+        接続状態:
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: 追加情報
+      description: 関連するスクリーンショット、動画、補足などがあれば記入してください。

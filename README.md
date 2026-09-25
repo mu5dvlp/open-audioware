@@ -203,4 +203,7 @@ open-audioware/
 
 ## 貢献について
 
-現在、Issue / PR は受け付けておりません。
+Issue / PR による貢献を受け付けています。初めての方は
+[`CONTRIBUTING.md`](./CONTRIBUTING.md)を読み、行動規範は
+[`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md)、脆弱性の報告は
+[`SECURITY.md`](./SECURITY.md)を確認してください。

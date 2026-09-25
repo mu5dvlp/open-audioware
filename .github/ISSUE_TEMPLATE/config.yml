@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 脆弱性の非公開報告
+    url: https://github.com/mu5dvlp/open-audioware/security/policy
+    about: 脆弱性は公開 Issue にせず、Security タブの Report a vulnerability から報告してください。

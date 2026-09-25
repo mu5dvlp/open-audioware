@@ -1,0 +1,42 @@
+name: 機能リクエスト
+description: 新しい機能や改善を提案する
+title: "[提案] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        実装方針やスコープは、既存の仕様・アーキテクチャとの整合性を確認して検討します。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 解決したい課題
+      description: どのような利用場面や問題があるかを記入してください。
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 提案する機能
+      description: 望ましい動作や API の案を、可能な範囲で具体的に記入してください。
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 検討した代替案
+      description: ほかに検討した方法と、それを採用しなかった理由を記入してください。
+
+  - type: textarea
+    id: platform
+    attributes:
+      label: 対象プラットフォームと環境
+      description: iOS、Android、macOS、Unity バージョン、crate / パッケージのバージョンなど、関係する環境を記入してください。
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: 追加情報
+      description: 参考資料、サンプル、関連 Issue、スクリーンショットなどがあれば記入してください。
