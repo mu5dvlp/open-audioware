@@ -194,12 +194,4 @@ jobs:
   # 🔴 **検査の定義は Makefile 1箇所**(`make gitleaks`)。⚠️ `fetch-depth: 0` が必須
   # (浅いクローンだと「過去にコミットされた鍵」を取りこぼして緑になる)。
   gitleaks:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout(履歴全体)
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: make gitleaks
-        run: make gitleaks
+    uses: mu5dvlp/ci-workflows/.github/workflows/gitleaks.yml@v1

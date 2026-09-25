@@ -1,0 +1,4 @@
+# Rust は rust-toolchain.toml を source of truth とする。mise はそのファイルを読めるため、ここでは重複宣言しない。
+# C# ABI 検査で使う .NET SDK の版だけを宣言する。
+[tools]
+dotnet = "8.0"

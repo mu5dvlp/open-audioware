@@ -12,6 +12,8 @@ make setup
 
 `make setup` は Rust ターゲット、`cargo-ndk`、`cargo-deny`、`ANDROID_NDK_HOME` を確認します。Unity を使うターゲットは、同一マシン上の Unity 起動を直列化する仕組みを内蔵しています。
 
+`.mise.toml` には C# ABI 検査用の .NET SDK 8.0 を宣言しています。Rust の版は重複させず、リポジトリ直下の `rust-toolchain.toml` を source of truth として mise に読ませます。`mise install` で宣言されたツールチェーンを揃えられます。
+
 ## よく使う検査
 
 変更前後に、少なくとも次を実行してください。
