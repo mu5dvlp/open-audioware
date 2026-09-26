@@ -533,12 +533,12 @@ mod tests {
     /// **Android(AAudio)切断の通知経路がまだ生きていることを固定化する回帰テスト。**
     ///
     /// M3「Android の AAudio 切断復旧」調査(2026-08-31、`docs/history/03-2026-08-31.md`
-    /// 参照)で、cpal 0.18.1 の AAudio ホスト実装(`~/.cargo/.../cpal-0.18.1/src/host/
+    /// 参照)で、cpal 0.18.2 の AAudio ホスト実装(`~/.cargo/.../cpal-0.18.2/src/host/
     /// aaudio/mod.rs::build_output_stream` の `error_callback`)と ndk 0.9.0
     /// (`~/.cargo/.../ndk-0.9.0/src/audio.rs` の `AudioStreamBuilder::error_callback` doc)
     /// をソースで確認した結果、AAudio が `AAUDIO_ERROR_DISCONNECTED` を出すと
     /// cpal は `ndk::audio::AudioError::Disconnected` → `cpal::ErrorKind::
-    /// DeviceNotAvailable`(`cpal-0.18.1/src/host/aaudio/convert.rs::impl From<AudioError>
+    /// DeviceNotAvailable`(`cpal-0.18.2/src/host/aaudio/convert.rs::impl From<AudioError>
     /// for Error`)へ変換したうえで、このクレートが `build_output_stream` に渡した
     /// `err_fn` を呼ぶ(iOS のルート変化と同じ経路、M2-6 から存在)。
     ///

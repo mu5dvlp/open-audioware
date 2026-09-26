@@ -20,7 +20,7 @@
 //! 依頼時点での候補を実際に調べた結果:
 //!
 //! 1. **cpal 自身のアンダーラン通知**(`cpal::ErrorKind::Xrun`, `err_fn` 経由)——
-//!    cpal 0.18.1 のソース(`~/.cargo/registry/.../cpal-0.18.1/src/host/`)を全ホスト
+//!    cpal 0.18.2 のソース(`~/.cargo/registry/.../cpal-0.18.2/src/host/`)を全ホスト
 //!    横断で確認したところ、`Xrun` を実際に生成しているのは `pulseaudio`/`alsa`/
 //!    `jack`/`asio` の4ホストのみ。本プロジェクトが実際に使う3プラットフォーム
 //!    (macOS Editor / iOS の `coreaudio` ホスト、Android の `aaudio` ホスト)は

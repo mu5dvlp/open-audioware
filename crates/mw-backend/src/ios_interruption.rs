@@ -5,7 +5,7 @@
 //!
 //! iOS はアプリが(Background Audio 機能を持たないまま)バックグラウンドへ移行すると
 //! `AVAudioSession` を非アクティブ化し、RemoteIO の出力ユニットを止める。ところが
-//! cpal 0.18.1 の iOS 実装(`coreaudio::ios::session_event_manager`。ソースを確認済み)は
+//! cpal 0.18.2 の iOS 実装(`coreaudio::ios::session_event_manager`。ソースを確認済み)は
 //! ルート変化(`AVAudioSessionRouteChangeNotification`)とメディアサービスの喪失/リセット
 //! しか監視しておらず、**`AVAudioSessionInterruptionNotification` を一切監視していない**。
 //! そのため OS がストリームを止めても、ミドルウェア側には何も通知されず、
@@ -14,7 +14,7 @@
 //! ボイスは Unity 自身のセッション管理で生き残る——実機報告「ホームへ戻ると SE だけ
 //! 無音になる」の裏付けと一致する。
 //!
-//! さらに厄介なことに、cpal 0.18.1 の `Stream::play()`(iOS 実装、`coreaudio/ios/mod.rs`
+//! さらに厄介なことに、cpal 0.18.2 の `Stream::play()`(iOS 実装、`coreaudio/ios/mod.rs`
 //! の `StreamTrait::play` を確認済み)は内部の `playing: bool` フラグが既に `true` なら
 //! `AudioOutputUnitStart` を呼ばずに即座に return する。OS が横から出力ユニットを
 //! 止めても cpal 側のこのフラグは追随しない(cpal 自身がそれを検知する経路を
@@ -1159,7 +1159,7 @@ mod imp {
     /// 前進したか**を実測してから成否を判定する。
     ///
     /// `stream.play()` だけでは復帰しない(モジュール doc の「実機バグの原因」参照:
-    /// cpal 0.18.1 の内部 `playing` フラグが OS 主導の停止に追随しないため、まず
+    /// cpal 0.18.2 の内部 `playing` フラグが OS 主導の停止に追随しないため、まず
     /// `pause()` でフラグを倒してから `play()` を呼ぶ)。
     ///
     /// 🔴 **`stream.play()` が `Ok` を返しても実際には無音のままのケースが実機で

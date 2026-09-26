@@ -82,14 +82,14 @@ OS 非依存・デバイス非依存のコア。ミキサ、ボイス管理、�
   絶対に使わない)。
 - `wav`: 16bit PCM / モノラル・ステレオの wav を自前パーサでデコードする。
   モノは等パワー(`1/√2`)で両ch展開。サンプルレートは出力デバイスと一致しなくてよく、
-  一致しない場合は `resample.rs`(rubato `SincFixedIn`)でロード時に一括変換して
+  一致しない場合は `resample.rs`(rubato `Async` sinc)でロード時に一括変換して
   出力レート化する(§4.7, M2)。非対応フォーマットは `WavError` の具体的なバリアントで返す。
   `#[cfg(test)] pub mod golden` にゴールデンテスト用の wav バイト列ビルダを置く
   (バイナリはコミットしない。§8)。
 - `resample`: サンプルレート変換(§4.7, M2)。楽曲ストリーミング用の `StreamResampler`
-  (`rubato::FftFixedInOut`。`decode.rs::SymphoniaDecoder` が1曲につき1個だけ保持し
+  (`rubato::Fft` + `FixedSync::Both`。`decode.rs::SymphoniaDecoder` が1曲につき1個だけ保持し
   `pump()` をまたいで使い回すことでブロック境界の連続性を保つ)と、SE ロード時一括変換の
-  `resample_oneshot`(`rubato::SincFixedIn`、高品質設定)の2系統。レート一致時はどちらも
+  `resample_oneshot`(`rubato::Async` sinc、高品質設定)の2系統。レート一致時はどちらも
   リサンプラを構築せずバイパスする。総フレーム数・シーク位置は常に出力レート基準
   (`convert_frame_count` に一本化)。
 - `voice`: `VoicePool` — 固定容量のボイスプール(既定 64 primary + 64 tail)。

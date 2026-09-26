@@ -113,7 +113,7 @@ pub trait Backend {
     /// cpal の `OutputCallbackInfo::timestamp()` が返す `OutputStreamTimestamp` の
     /// `playback`(このバッファが実際にスピーカー/DAC へ出力されると cpal が予測する
     /// 時刻)と `callback`(このコールバックが呼ばれた時刻)の差、`playback - callback`。
-    /// 両フィールドの意味は cpal 0.18.1 のソース(`timestamp.rs` の
+    /// 両フィールドの意味は cpal 0.18.2 のソース(`timestamp.rs` の
     /// `OutputStreamTimestamp` doc)で確認済み。時計源はホストごとに異なる
     /// (macOS/iOS の CoreAudio は `mach_absolute_time()`、Android の AAudio は
     /// `AAudioStream_getTimestamp(CLOCK_MONOTONIC)` 等)が、`StreamInstant` のdocに

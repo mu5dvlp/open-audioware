@@ -5,26 +5,27 @@
 //! 選んでいる(依頼書の設計判断1)。
 //!
 //! - **楽曲(ストリーミング・固定ブロック)**: [`StreamResampler`] が
-//!   [`rubato::FftFixedInOut`] を使う。入力・出力とも**固定フレーム数**(サンプルレートの
+//!   [`rubato::Fft`] を `FixedSync::Both` で使う。入力・出力とも**固定フレーム数**(サンプルレートの
 //!   比から決まる)で処理できる同期(FFT ベース)リサンプラで、比を実行時に変える必要が
 //!   無い今回の用途(§4.7 は再生速度変更を範囲外としている。MU5 は別機能)に対して
 //!   計算コストが小さい。デコードスレッド上で `pump()` のたびに何度も呼ばれる経路なので、
-//!   `SincFixedIn` の畳み込みよりこちらを優先した。
+//!   非同期 sinc の畳み込みよりこちらを優先した。
 //!   欠点: 内部 FFT サイズは `gcd(source_rate, output_rate)` に依存するため、互いに素に近い
 //!   レート同士(非標準のサンプルレート)だと巨大な FFT になりうる。48kHz/44.1kHz/32kHz/
 //!   22.05kHz/16kHz といった一般的な組み合わせでは gcd が大きく実用上問題にならないが、
 //!   非標準レートの素材を扱うようになった場合はここを見直すこと(判断理由として報告)。
-//! - **SE(ロード時・一括)**: [`resample_oneshot`] が [`rubato::SincFixedIn`] を高品質設定
+//! - **SE(ロード時・一括)**: [`resample_oneshot`] が [`rubato::Async`] を `FixedAsync::Input` と
+//!   高品質な sinc 設定で
 //!   (長いシンク長・高いオーバーサンプリング係数)で使う。ロード時の一度きりのコストなので
-//!   計算量よりも品質(ストップバンド減衰・エイリアシング抑制)を優先する。`SincFixedIn` は
-//!   `FftFixedInOut` と違って比が `gcd` に縛られないため、どんなレートの組でも安全に使える
+//!   計算量よりも品質(ストップバンド減衰・エイリアシング抑制)を優先する。非同期 sinc は
+//!   FFT ベースと違って比が `gcd` に縛られないため、どんなレートの組でも安全に使える
 //!   (SE は楽曲よりゲームプレイに紐づく短い素材が多く、想定外レートの持ち込みも
 //!   起こりやすいため、こちらは頑健さを優先する)。
 //!
 //! # ブロック境界の連続性(依頼書の設計判断2)
 //!
 //! [`StreamResampler`] はストリーム(1曲)につき1個だけ生成し、`pump()` が呼ばれるたびに
-//! **同じインスタンスを使い回す**。`FftFixedInOut` はブロックをまたぐオーバーラップを
+//! **同じインスタンスを使い回す**。`Fft` はブロックをまたぐオーバーラップを
 //! 内部状態(`overlaps`)として保持しており、これが毎回のブロック処理をまたいで
 //! 引き継がれることで継ぎ目の不連続(プチノイズ)を防いでいる。呼び出し側が
 //! ブロックのたびに新しいリサンプラを作ってしまうとこの保証が崩れるため、
@@ -56,9 +57,10 @@
 
 use std::fmt;
 
+use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
 use rubato::{
-    FftFixedInOut, Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType,
-    WindowFunction, calculate_cutoff,
+    Async, Fft, FixedAsync, FixedSync, Indexing, Resampler, SincInterpolationParameters,
+    SincInterpolationType, WindowFunction, calculate_cutoff,
 };
 
 use crate::format::CHANNELS;
@@ -71,7 +73,7 @@ use crate::format::CHANNELS;
 /// (`examples/process_f64.rs`)が使っているデフォルト値と揃えてある。
 const STREAM_CHUNK_TARGET_FRAMES: usize = 1024;
 
-/// SE 一括リサンプル用 `SincFixedIn` の入力チャンク長(フレーム数)。
+/// SE 一括リサンプル用 `Async` sinc の入力チャンク長(フレーム数)。
 /// ロード時の一度きりの処理なので大きめに取って呼び出し回数を減らす。
 const ONESHOT_CHUNK_FRAMES: usize = 4096;
 /// SE 一括リサンプルのシンク長。大きいほど高品質・低速(ロード時のみのコストなので許容)。
@@ -204,12 +206,12 @@ fn append_resampled_output(
     }
 }
 
-/// 楽曲ストリーミング用のリサンプラ(`FftFixedInOut` ベース)。
+/// 楽曲ストリーミング用のリサンプラ(`Fft` + `FixedSync::Both` ベース)。
 ///
 /// `decode.rs::SymphoniaDecoder` が1曲につき1個だけ保持し、`pump()` の呼び出しを
 /// またいで使い回す(モジュール doc「ブロック境界の連続性」)。
 pub struct StreamResampler {
-    inner: FftFixedInOut<f32>,
+    inner: Fft<f32>,
     /// 素材レートの入力を書き込む平面バッファ(固定長 = `inner.input_frames_next()`)。
     chan_in: Vec<Vec<f32>>,
     /// 出力レートの結果を受け取る平面バッファ(固定長 = `inner.output_frames_max()`)。
@@ -222,16 +224,17 @@ impl StreamResampler {
     /// `source_rate != output_rate` のときだけ呼ぶこと(一致する場合は
     /// `decode.rs` 側でバイパスし、このリサンプラ自体を作らない。依頼書の設計判断4)。
     pub fn new(source_rate: u32, output_rate: u32) -> Result<Self, ResampleError> {
-        let inner = FftFixedInOut::<f32>::new(
+        let inner = Fft::<f32>::new(
             source_rate as usize,
             output_rate as usize,
             STREAM_CHUNK_TARGET_FRAMES,
             CHANNELS,
+            FixedSync::Both,
         )
         .map_err(|e| ResampleError::Construction(e.to_string()))?;
 
-        let chan_in = inner.input_buffer_allocate(true);
-        let chan_out = inner.output_buffer_allocate(true);
+        let chan_in = vec![vec![0.0; inner.input_frames_next()]; CHANNELS];
+        let chan_out = vec![vec![0.0; inner.output_frames_max()]; CHANNELS];
         let delay_to_skip = inner.output_delay();
 
         Ok(Self {
@@ -243,7 +246,7 @@ impl StreamResampler {
     }
 
     /// 次の [`Self::process_full_chunk_into`] が要求する、素材レートの入力フレーム数。
-    /// `FftFixedInOut` は固定ブロックなのでストリーム全体を通じて一定の値を返す。
+    /// `Fft` を `FixedSync::Both` で構築しているため、ストリーム全体を通じて一定の値を返す。
     pub fn input_frames_needed(&self) -> usize {
         self.inner.input_frames_next()
     }
@@ -259,9 +262,15 @@ impl StreamResampler {
         debug_assert_eq!(input.len(), need * CHANNELS);
         deinterleave(input, need, &mut self.chan_in);
 
+        let input = SequentialSliceOfVecs::new(&self.chan_in, CHANNELS, need)
+            .map_err(|e| ResampleError::Processing(e.to_string()))?;
+        let output_frames = self.inner.output_frames_max();
+        let mut output =
+            SequentialSliceOfVecs::new_mut(&mut self.chan_out, CHANNELS, output_frames)
+                .map_err(|e| ResampleError::Processing(e.to_string()))?;
         let (_, n_out) = self
             .inner
-            .process_into_buffer(&self.chan_in, &mut self.chan_out, None)
+            .process_into_buffer(&input, &mut output, None)
             .map_err(|e| ResampleError::Processing(e.to_string()))?;
         append_resampled_output(&self.chan_out, n_out, &mut self.delay_to_skip, out);
         Ok(())
@@ -270,33 +279,30 @@ impl StreamResampler {
     /// 素材側が末尾に到達した(`remaining_input` フレームぶんしか残っていない。
     /// 0 フレームでもよい)ときに一度だけ呼ぶ。残りを無音でパディングして最後の
     /// ブロックを変換し、リサンプラの内部に残っていたオーバーラップの尾も
-    /// 一緒に吐き出す(rubato の `process_partial_into_buffer` の契約。モジュール doc 参照)。
+    /// 一緒に吐き出す(rubato 5 の `Indexing::partial_len` の契約。モジュール doc 参照)。
     pub fn flush_into(
         &mut self,
         remaining_input: &[f32],
         out: &mut Vec<f32>,
     ) -> Result<(), ResampleError> {
         let valid_frames = remaining_input.len() / CHANNELS;
-        let (_, n_out) = if valid_frames == 0 {
-            // rubato 0.15 の `process_partial_into_buffer` 既定実装は、`Some` で渡した
-            // チャンネルの有効長が 0 だと(パディング済みのゼロ埋めではなく)そのチャンネルの
-            // バッファを `clear()` してしまい、後続の `process_into_buffer` の
-            // 長さチェックに落ちる(空チャンネル入力を想定していない実装上のクセ)。
-            // 「入力なし」を表す正規のパスである `None` を使えばこの分岐を踏まずに済む
-            // (ドキュメントにも「入力バッファ無しで呼べる」と明記されている)。
-            self.inner
-                .process_partial_into_buffer::<&[f32], _>(None, &mut self.chan_out, None)
-        } else {
+        if valid_frames != 0 {
             deinterleave(remaining_input, valid_frames, &mut self.chan_in);
-            let sliced: Vec<&[f32]> = self
-                .chan_in
-                .iter()
-                .map(|chan| &chan[..valid_frames])
-                .collect();
-            self.inner
-                .process_partial_into_buffer(Some(&sliced), &mut self.chan_out, None)
         }
-        .map_err(|e| ResampleError::Processing(e.to_string()))?;
+        // `partial_len = Some(0)` は rubato 5 の契約で「入力を全て無音として
+        // パディングする」を表す。旧 API の `None` 入力相当であり、空のスライスを
+        // 毎回組み立てる必要がない。
+        let input = SequentialSliceOfVecs::new(&self.chan_in, CHANNELS, self.input_frames_needed())
+            .map_err(|e| ResampleError::Processing(e.to_string()))?;
+        let output_frames = self.inner.output_frames_max();
+        let mut output =
+            SequentialSliceOfVecs::new_mut(&mut self.chan_out, CHANNELS, output_frames)
+                .map_err(|e| ResampleError::Processing(e.to_string()))?;
+        let indexing = Indexing::new().partial_len(valid_frames);
+        let (_, n_out) = self
+            .inner
+            .process_into_buffer(&input, &mut output, Some(&indexing))
+            .map_err(|e| ResampleError::Processing(e.to_string()))?;
         append_resampled_output(&self.chan_out, n_out, &mut self.delay_to_skip, out);
         Ok(())
     }
@@ -310,7 +316,7 @@ impl StreamResampler {
     }
 }
 
-/// SE ロード時の一括リサンプル(`SincFixedIn` ベース、依頼書の設計判断1)。
+/// SE ロード時の一括リサンプル(`Async` sinc ベース、依頼書の設計判断1)。
 ///
 /// `source_rate != output_rate` のときだけ呼ぶこと(一致する場合は `wav.rs` 側で
 /// バイパスする。設計判断4)。戻り値は `(出力レートのインターリーブ PCM, 出力フレーム数)`。
@@ -327,18 +333,25 @@ pub fn resample_oneshot(
     let f_cutoff = calculate_cutoff::<f32>(ONESHOT_SINC_LEN, ONESHOT_WINDOW);
     let params = SincInterpolationParameters {
         sinc_len: ONESHOT_SINC_LEN,
-        f_cutoff,
+        f_cutoff: Some(f_cutoff),
         interpolation: ONESHOT_INTERPOLATION,
         oversampling_factor: ONESHOT_OVERSAMPLING_FACTOR,
         window: ONESHOT_WINDOW,
     };
     // max_relative_ratio: SE ロード時に比を変える機能は無い(MU5 のエディタ再生速度変更は
     // 別機能・別スコープ)ため、構築時の比のまま固定してよい最小値の 1.0 を渡す。
-    let mut resampler = SincFixedIn::<f32>::new(ratio, 1.0, params, ONESHOT_CHUNK_FRAMES, CHANNELS)
-        .map_err(|e| ResampleError::Construction(e.to_string()))?;
+    let mut resampler = Async::<f32>::new_sinc(
+        ratio,
+        1.0,
+        &params,
+        ONESHOT_CHUNK_FRAMES,
+        CHANNELS,
+        FixedAsync::Input,
+    )
+    .map_err(|e| ResampleError::Construction(e.to_string()))?;
 
     let mut chan_in = vec![vec![0.0f32; ONESHOT_CHUNK_FRAMES]; CHANNELS];
-    let mut chan_out = resampler.output_buffer_allocate(true);
+    let mut chan_out = vec![vec![0.0; resampler.output_frames_max()]; CHANNELS];
     let mut delay_to_skip = resampler.output_delay();
     let mut out = Vec::with_capacity(
         convert_frame_count(frames as u64, source_rate, output_rate) as usize * CHANNELS,
@@ -353,31 +366,40 @@ pub fn resample_oneshot(
             ONESHOT_CHUNK_FRAMES,
             &mut chan_in,
         );
+        let input = SequentialSliceOfVecs::new(&chan_in, CHANNELS, ONESHOT_CHUNK_FRAMES)
+            .map_err(|e| ResampleError::Processing(e.to_string()))?;
+        let output_frames = resampler.output_frames_max();
+        let mut output = SequentialSliceOfVecs::new_mut(&mut chan_out, CHANNELS, output_frames)
+            .map_err(|e| ResampleError::Processing(e.to_string()))?;
         let (_, n_out) = resampler
-            .process_into_buffer(&chan_in, &mut chan_out, None)
+            .process_into_buffer(&input, &mut output, None)
             .map_err(|e| ResampleError::Processing(e.to_string()))?;
         append_resampled_output(&chan_out, n_out, &mut delay_to_skip, &mut out);
         pos += ONESHOT_CHUNK_FRAMES;
     }
 
-    // 最後の端数(0 フレームのこともある)。`process_partial_into_buffer` が
-    // 内部で無音パディングしたうえで、リサンプラに残っていた尾も一緒に吐き出す。
-    // `remaining == 0` のときは `Some(空スライス)` ではなく `None` を渡す
-    // (`StreamResampler::flush_into` のコメント参照: rubato 0.15 の既定実装は
-    // 有効長 0 のチャンネル入力をゼロ埋めではなく空バッファへ潰してしまうクセがある)。
+    // 最後の端数(0 フレームのこともある)。`partial_len` が内部で無音パディングした
+    // うえで、リサンプラに残っていた尾も一緒に吐き出す。
     let remaining = frames - pos;
-    let (_, n_out) = if remaining == 0 {
-        resampler.process_partial_into_buffer::<&[f32], _>(None, &mut chan_out, None)
+    let valid_frames = if remaining == 0 {
+        0
     } else {
         deinterleave(
             &input[pos * CHANNELS..frames * CHANNELS],
             remaining,
             &mut chan_in,
         );
-        let sliced: Vec<&[f32]> = chan_in.iter().map(|chan| &chan[..remaining]).collect();
-        resampler.process_partial_into_buffer(Some(&sliced), &mut chan_out, None)
-    }
-    .map_err(|e| ResampleError::Processing(e.to_string()))?;
+        remaining
+    };
+    let input = SequentialSliceOfVecs::new(&chan_in, CHANNELS, ONESHOT_CHUNK_FRAMES)
+        .map_err(|e| ResampleError::Processing(e.to_string()))?;
+    let output_frames = resampler.output_frames_max();
+    let mut output = SequentialSliceOfVecs::new_mut(&mut chan_out, CHANNELS, output_frames)
+        .map_err(|e| ResampleError::Processing(e.to_string()))?;
+    let indexing = Indexing::new().partial_len(valid_frames);
+    let (_, n_out) = resampler
+        .process_into_buffer(&input, &mut output, Some(&indexing))
+        .map_err(|e| ResampleError::Processing(e.to_string()))?;
     append_resampled_output(&chan_out, n_out, &mut delay_to_skip, &mut out);
 
     let target_frames = convert_frame_count(frames as u64, source_rate, output_rate) as usize;

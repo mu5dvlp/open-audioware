@@ -8,7 +8,7 @@
 //! ただし唯一の要件は「デバイスの出力タイムスタンプ(`cpal::OutputCallbackInfo` の
 //! `StreamInstant`)と直接比較できる時計であること」。
 //!
-//! # 調査結果: `cpal::StreamInstant` はどの時計か(cpal 0.18.1)
+//! # 調査結果: `cpal::StreamInstant` はどの時計か(cpal 0.18.2)
 //!
 //! `cpal::StreamInstant` のドキュメント(`timestamp.rs`)にホストごとの時刻源が
 //! 明記されており、実装(`src/host/*`)でも確認した:
@@ -43,7 +43,7 @@
 /// タイムスタンプは、いずれもこの関数と同じ時計を指す(モジュール doc 参照)。
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub fn host_time_ns() -> u64 {
-    // cpal 0.18.1 `src/host/coreaudio/mod.rs::host_time_to_stream_instant` と
+    // cpal 0.18.2 `src/host/coreaudio/mod.rs::host_time_to_stream_instant` と
     // 完全に同じ式(mach_absolute_time の raw tick 数 × timebase の numer/denom → ns)。
     // 同じ式で読む以上、`OutputCallbackInfo::timestamp()` が返す `StreamInstant` と
     // 単位・原点・レートのいずれもずれようがない。
@@ -66,7 +66,7 @@ pub fn host_time_ns() -> u64 {
 
 /// ホスト単調時刻をナノ秒で返す(Android / Linux)。
 ///
-/// cpal 0.18.1 `src/host/aaudio/convert.rs::now_stream_instant` と同じ式
+/// cpal 0.18.2 `src/host/aaudio/convert.rs::now_stream_instant` と同じ式
 /// (`clock_gettime(CLOCK_MONOTONIC)`)。Android 実機ではこれが `OutputCallbackInfo` の
 /// `StreamInstant` と同一時計になる(モジュール doc 参照)。Linux(CI 専用。
 /// 実配布対象ではない)でも同じ syscall が使えるため、ここに含めて

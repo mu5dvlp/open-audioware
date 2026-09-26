@@ -47,7 +47,7 @@
 
 - `host_time::host_time_ns` — ホスト単調時刻を ns で返す(初期構築仕様『§4.4』, M2-5)。
   macOS/iOS/tvOS は `mach_absolute_time` + `mach_timebase_info`、Android(と CI 専用の
-  Linux)は `clock_gettime(CLOCK_MONOTONIC)`。**cpal 0.18.1 の `StreamInstant` を
+  Linux)は `clock_gettime(CLOCK_MONOTONIC)`。**cpal 0.18.2 の `StreamInstant` を
   各ホストがどう生成しているかを実装まで確認したうえで、同じ式をそのまま再現している**
   (調査結果と根拠は `host_time.rs` のモジュール doc に記載済み)。これにより
   `mw_host_time_ns()`(FFI)が返す値と `OutputCallbackInfo` のデバイスタイムスタンプが
@@ -63,7 +63,7 @@
 - `ios_interruption`(M3)— iOS / tvOS の `AVAudioSessionInterruptionNotification` /
   `UIApplicationDidBecomeActiveNotification` を監視し、割り込み終了時・アプリのアクティブ化時に
   セッション再アクティブ化 + ストリーム再始動(`pause()`→`play()`)を試みる。実機報告
-  「バックグラウンドから戻ると SE だけ無音になる」の修正(cpal 0.18.1 の iOS 実装は
+  「バックグラウンドから戻ると SE だけ無音になる」の修正(cpal 0.18.2 の iOS 実装は
   interruption 通知を監視しておらず、`Stream::play()` の内部フラグも OS 主導の停止に
   追随しないため、単純な再呼び出しでは復帰しない——詳細はモジュール doc)。`CpalBackend`
   はストリームを `Arc<cpal::Stream>` として持ち、この監視の復帰ハンドラと共有する。
@@ -91,7 +91,7 @@
   コールバックの間隔が想定より大きく開いたこと(「アンダーラン(の疑い)」)を検知する。
   **`mw_core::Event::Underrun`(楽曲/BGM のデコードリングバッファ枯渇の検知、M2)とは
   別物**——こちらは音声コールバック自体の間隔異常で、OS 側出力バッファの実際の
-  枯渇の兆候を指す。cpal 自身のアンダーラン通知(`ErrorKind::Xrun`)は cpal 0.18.1
+  枯渇の兆候を指す。cpal 自身のアンダーラン通知(`ErrorKind::Xrun`)は cpal 0.18.2
   時点で本プロジェクトが使う3ホスト(macOS/iOS の `coreaudio`、Android の `aaudio`)
   のどれも生成しないため採用できず(調査結果は `underrun.rs` モジュール doc 参照)、
   代わりに `OutputCallbackInfo::timestamp().callback` の間隔を毎コールバック追跡する

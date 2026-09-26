@@ -16,6 +16,12 @@ updates:
       cargo:
         patterns:
           - "*"
+    # 🔴 `mach2` は cpal が依存している版に揃える(mw-backend/Cargo.toml のコメント。
+    #    二重に入ると依存ツリーが増えるうえ、`mach_timebase_info` を cpal と同じ実装で呼ぶ前提が崩れる)。
+    #    2026-09-26 の PR #2 で 0.7 へ上げられたが、cpal 0.18.2 は 0.6 のままなので据え置いた。
+    #    cpal が上げたら手で揃える。
+    ignore:
+      - dependency-name: "mach2"
     open-pull-requests-limit: 5
     commit-message:
       prefix: "chore(deps)"

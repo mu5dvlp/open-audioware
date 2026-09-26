@@ -12,7 +12,7 @@
 //! # リサンプル(初期構築仕様『§4.7』, `resample.rs`)
 //!
 //! 出力(デバイス)サンプルレートと素材のレートが一致しない場合、[`SymphoniaDecoder`] は
-//! `resample.rs::StreamResampler`(rubato `FftFixedInOut` ベース)で自動的に変換する。
+//! `resample.rs::StreamResampler`(rubato `Fft` ベース)で自動的に変換する。
 //! **レートが一致する場合はリサンプラを構築すらしない**(`resampler: Option<_>` が
 //! `None` のままバイパスする。依頼書の設計判断4: 一致時に無用な計算・レイテンシを
 //! 持ち込まない)。
@@ -39,13 +39,13 @@ use std::fmt;
 use std::io::Cursor;
 use std::sync::Arc;
 
-use symphonia::core::audio::{SampleBuffer, SignalSpec};
-use symphonia::core::codecs::{CODEC_TYPE_NULL, Decoder, DecoderOptions};
+use symphonia::core::codecs::CodecParameters;
+use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions, CODEC_ID_NULL_AUDIO};
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 
 use crate::format::CHANNELS;
 use crate::resample::{self, ResampleError, StreamResampler};
@@ -55,8 +55,8 @@ use crate::resample::{self, ResampleError, StreamResampler};
 /// 初期構築仕様 M12)。モジュールを跨いで公開する意味は薄いため、ここでも独立して定義する。
 const EQUAL_POWER_GAIN: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
-/// パケット単位のデコード結果を受け取る `SampleBuffer` の初期容量(フレーム数)。
-/// 実際のパケットがこれより大きければその場で確保し直す([`grow_sample_buf`])ため、
+/// パケット単位のデコード結果を受け取るスクラッチの初期容量(フレーム数)。
+/// 実際のパケットがこれより大きければその場で確保し直すため、
 /// この値は「たいていのケースで再確保が起きない」程度の目安でしかない。
 const INITIAL_SAMPLE_BUF_FRAMES: u64 = 4096;
 
@@ -255,11 +255,11 @@ pub trait MusicDecoder {
 /// 同時借用として認めてくれる)。
 struct NativeReader {
     format: Box<dyn FormatReader>,
-    decoder: Box<dyn Decoder>,
+    decoder: Box<dyn AudioDecoder>,
     track_id: u32,
     /// 直近デコードしたパケットの生サンプル(ネイティブチャンネル数)を一時的に受ける
-    /// スクラッチバッファ。パケットごとに容量不足なら [`grow_sample_buf`] で確保し直す。
-    sample_buf: SampleBuffer<f32>,
+    /// スクラッチバッファ。パケットごとに容量不足なら確保し直す。
+    sample_buf: Vec<f32>,
     /// ステレオ展開済みで、まだ `read` に渡していない残りサンプル(インターリーブ)。
     pending: Vec<f32>,
     /// `pending` の読み出し位置(サンプル単位)。
@@ -279,7 +279,8 @@ impl NativeReader {
     fn decode_next_packet_into_pending(&mut self) -> Result<bool, DecodeError> {
         loop {
             let packet = match self.format.next_packet() {
-                Ok(packet) => packet,
+                Ok(Some(packet)) => packet,
+                Ok(None) => return Ok(false),
                 Err(SymphoniaError::IoError(e))
                     if e.kind() == std::io::ErrorKind::UnexpectedEof =>
                 {
@@ -288,13 +289,13 @@ impl NativeReader {
                 Err(e) => return Err(DecodeError::from(e)),
             };
 
-            if packet.track_id() != self.track_id {
+            if packet.track_id != self.track_id {
                 continue;
             }
 
             match self.decoder.decode(&packet) {
                 Ok(audio_buf) => {
-                    let spec = *audio_buf.spec();
+                    let spec = audio_buf.spec().clone();
                     let frames = audio_buf.frames();
                     if frames == 0 {
                         // 空パケット(理論上稀)。次のパケットへ進む。
@@ -304,10 +305,13 @@ impl NativeReader {
                     // `self.decoder` を借用したままの `audio_buf` が生きている間は
                     // `&mut self` を取るメソッドを呼べない(borrow checker)。
                     // そのため容量確保はフィールド単位の関数呼び出しに留める。
-                    grow_sample_buf(&mut self.sample_buf, frames, spec);
-                    self.sample_buf.copy_interleaved_ref(audio_buf);
-                    let native = self.sample_buf.samples();
-                    let native_channels = spec.channels.count();
+                    let native_channels = spec.channels().count();
+                    let native_samples = frames * native_channels;
+                    if self.sample_buf.len() < native_samples {
+                        self.sample_buf.resize(native_samples, 0.0);
+                    }
+                    audio_buf.copy_to_slice_interleaved(&mut self.sample_buf[..native_samples]);
+                    let native = &self.sample_buf[..native_samples];
 
                     self.pending.clear();
                     self.pending_pos = 0;
@@ -394,8 +398,10 @@ impl NativeReader {
             .format
             .seek(
                 SeekMode::Accurate,
-                SeekTo::TimeStamp {
-                    ts: frame,
+                SeekTo::Timestamp {
+                    ts: symphonia::core::units::Timestamp::new(
+                        i64::try_from(frame).unwrap_or(i64::MAX),
+                    ),
                     track_id: self.track_id,
                 },
             )
@@ -411,22 +417,9 @@ impl NativeReader {
         // Accurate モードでも `actual_ts` は要求位置以下にしかならない(コンテナの
         // パケット境界までしか位置決めできないため。モジュール doc 参照)。差分だけ
         // デコード結果を読み捨てて、常にサンプル境界ちょうどへ合わせ込む。
-        let discard = frame.saturating_sub(seeked.actual_ts);
+        let actual_ts = seeked.actual_ts.get().max(0) as u64;
+        let discard = frame.saturating_sub(actual_ts);
         self.discard_frames(discard)
-    }
-}
-
-/// パケットの実際のフレーム数に合わせて `SampleBuffer` を確保し直す。
-///
-/// `SampleBuffer::copy_interleaved_typed` は容量不足だと panic するため
-/// (Symphonia 側の契約)、コピー前に必ず確認する。フィールド単位の自由関数にしてあるのは
-/// [`NativeReader::decode_next_packet_into_pending`] 内で `self.decoder` を借用したまま
-/// (`AudioBufferRef` がその借用の生存期間を握っている)呼び出す必要があるため
-/// (`&mut self` を取るメソッドにすると借用が衝突する)。
-fn grow_sample_buf(buf: &mut SampleBuffer<f32>, frames: usize, spec: SignalSpec) {
-    let needed = frames * spec.channels.count();
-    if buf.capacity() < needed {
-        *buf = SampleBuffer::<f32>::new(frames as u64, spec);
     }
 }
 
@@ -532,48 +525,49 @@ impl SymphoniaDecoder {
         let format_opts = FormatOptions::default();
         let metadata_opts = MetadataOptions::default();
 
-        let probed = symphonia::default::get_probe()
-            .format(&hint, mss, &format_opts, &metadata_opts)
+        let format = symphonia::default::get_probe()
+            .probe(&hint, mss, format_opts, metadata_opts)
             .map_err(DecodeError::from)?;
-        let format = probed.format;
 
         let track = format
-            .tracks()
-            .iter()
-            .find(|t| {
-                t.codec_params.codec != CODEC_TYPE_NULL
-                    && symphonia::default::get_codecs()
-                        .get_codec(t.codec_params.codec)
-                        .is_some()
+            .first_track_known_codec(TrackType::Audio)
+            .filter(|track| {
+                matches!(
+                    track.codec_params.as_ref(),
+                    Some(CodecParameters::Audio(params))
+                        if params.codec != CODEC_ID_NULL_AUDIO
+                            && symphonia::default::get_codecs()
+                                .get_audio_decoder(params.codec)
+                                .is_some()
+                )
             })
             .ok_or(DecodeError::NoAudioTrack)?;
 
         let track_id = track.id;
-        let source_sample_rate = track
-            .codec_params
-            .sample_rate
-            .ok_or(DecodeError::NoAudioTrack)?;
+        let codec_params = match track.codec_params.as_ref() {
+            Some(CodecParameters::Audio(params)) => params.clone(),
+            _ => return Err(DecodeError::NoAudioTrack),
+        };
+        let source_sample_rate = codec_params.sample_rate.ok_or(DecodeError::NoAudioTrack)?;
         if source_sample_rate == 0 {
             return Err(DecodeError::InvalidSampleRate(source_sample_rate));
         }
-        let channels = track
-            .codec_params
+        let channels = codec_params
             .channels
+            .clone()
             .ok_or(DecodeError::NoAudioTrack)?;
         let source_channels = channels.count();
         if source_channels != 1 && source_channels != 2 {
             return Err(DecodeError::UnsupportedChannelCount(source_channels));
         }
-        let total_frames_source = track.codec_params.n_frames;
-        let codec_params = track.codec_params.clone();
+        let total_frames_source = track.num_frames;
 
-        let dec_opts = DecoderOptions::default();
+        let dec_opts = AudioDecoderOptions::default();
         let decoder = symphonia::default::get_codecs()
-            .make(&codec_params, &dec_opts)
+            .make_audio_decoder(&codec_params, &dec_opts)
             .map_err(DecodeError::from)?;
 
-        let spec = SignalSpec::new(source_sample_rate, channels);
-        let sample_buf = SampleBuffer::<f32>::new(INITIAL_SAMPLE_BUF_FRAMES, spec);
+        let sample_buf = vec![0.0; INITIAL_SAMPLE_BUF_FRAMES as usize * source_channels];
 
         let native = NativeReader {
             format,
@@ -1018,7 +1012,7 @@ mod tests {
         let registry = symphonia::default::get_codecs();
         assert!(
             registry
-                .get_codec(symphonia::core::codecs::CODEC_TYPE_VORBIS)
+                .get_audio_decoder(symphonia::core::codecs::audio::well_known::CODEC_ID_VORBIS,)
                 .is_some(),
             "vorbis codec must be registered (Cargo.toml feature = [\"vorbis\"])"
         );
