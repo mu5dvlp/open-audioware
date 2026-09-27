@@ -1,0 +1,218 @@
+name: Release UPM
+
+# タグ push (と手動実行) だけで動く配布用ワークフロー。push / pull_request では動かさない
+# (CI 本体は ci.yml が担う。ここは「タグを打ったらネイティブライブラリ入りの UPM
+# パッケージを組み立てて upm ブランチへ配る」ことだけをやる)。
+#
+# 流れ:
+#   1. build-ios / build-macos / build-android を並列実行し、各プラットフォームの
+#      ネイティブライブラリ(+ macOS ジョブ側で csbindgen 生成物)を artifact にする
+#   2. publish-upm がそれらを集約し、unity/ の中身(ソース管理済みファイル)に
+#      ダウンロードしたネイティブライブラリを重ねて upm ブランチへコミット・タグ push する
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# upm ブランチへのコミット・タグ push 以外は何もしない。外部の秘密情報は使わない
+# (push 認証は actions/checkout が設定する GITHUB_TOKEN のみ)。
+permissions:
+  contents: write
+
+# 同時に2本の release run が upm ブランチを push しにいく事故を避ける。
+concurrency:
+  group: release-upm
+  cancel-in-progress: false
+
+jobs:
+  # iOS: aarch64-apple-ios の静的ライブラリを xcframework へ包む(要 Xcode → macOS ランナー)。
+  build-ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: aarch64-apple-ios
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: make build-ios
+        run: make build-ios
+
+      - name: Upload xcframework
+        uses: actions/upload-artifact@v7
+        with:
+          name: ios-native
+          path: unity/Runtime/Plugins/iOS/MwFfi.xcframework
+          retention-days: 5
+
+  # macOS: Unity Editor 用の dylib(ホストアーチ)。同じ cargo build がついでに
+  # csbindgen の C# バインディング(NativeMethods.g.cs)も生成するので、あわせて取り出す。
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.98.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: make build-macos
+        run: make build-macos
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-native
+          path: unity/Runtime/Plugins/macOS/libmw_ffi.dylib
+          retention-days: 5
+
+      - name: Upload C# bindings
+        uses: actions/upload-artifact@v7
+        with:
+          name: csharp-bindings
+          path: unity/Runtime/Generated/NativeMethods.g.cs
+          retention-days: 5
+
+  # Android: cargo-ndk で arm64-v8a の .so をビルドする(ABI / API レベルは Makefile と共通)。
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: make build-android
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: make build-android
+
+      - name: Upload .so
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-native
+          path: unity/Runtime/Plugins/Android/libs/arm64-v8a/libmw_ffi.so
+          retention-days: 5
+
+  # 集約: 3プラットフォームのネイティブライブラリ + csbindgen 生成物を、ソース管理済みの
+  # unity/(package.json / .meta / 手書き C# ラッパ)に重ねて upm ブランチへコミットする。
+  publish-upm:
+    needs: [build-ios, build-macos, build-android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: タグと unity/package.json の版が一致することを確認する
+        run: |
+          set -eu
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            echo "::error::tag ref ではない ref (${GITHUB_REF}) から実行されています。手動実行は配布したいタグを選んで実行してください。"
+            exit 1
+          fi
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(python3 -c 'import json; print(json.load(open("unity/package.json"))["version"])')"
+          if [ "${TAG_VERSION}" != "${PKG_VERSION}" ]; then
+            echo "::error::タグ v${TAG_VERSION} と unity/package.json の version (${PKG_VERSION}) が一致しません。unity/package.json の version を揃えてから、そのバージョンでタグを打ち直してください。"
+            exit 1
+          fi
+          echo "VERSION=${TAG_VERSION}" >> "$GITHUB_ENV"
+
+      # 後続でブランチを切り替えて作業ツリーを丸ごと消すため、配布するファイル一式を退避する。
+      - name: unity/ を退避する
+        run: cp -R unity /tmp/unity-src
+
+      - name: ビルド成果物をダウンロードする
+        uses: actions/download-artifact@v7
+        with:
+          path: /tmp/artifacts
+
+      - name: ネイティブライブラリと生成物を配置する
+        run: |
+          set -eu
+          SRC=/tmp/unity-src
+          mkdir -p "$SRC/Runtime/Plugins/macOS"
+          cp /tmp/artifacts/macos-native/libmw_ffi.dylib "$SRC/Runtime/Plugins/macOS/libmw_ffi.dylib"
+
+          mkdir -p "$SRC/Runtime/Plugins/iOS"
+          rm -rf "$SRC/Runtime/Plugins/iOS/MwFfi.xcframework"
+          cp -R /tmp/artifacts/ios-native/MwFfi.xcframework "$SRC/Runtime/Plugins/iOS/MwFfi.xcframework"
+
+          mkdir -p "$SRC/Runtime/Plugins/Android/libs/arm64-v8a"
+          cp /tmp/artifacts/android-native/libmw_ffi.so "$SRC/Runtime/Plugins/Android/libs/arm64-v8a/libmw_ffi.so"
+
+          cp /tmp/artifacts/csharp-bindings/NativeMethods.g.cs "$SRC/Runtime/Generated/NativeMethods.g.cs"
+
+      - name: 必須ファイルが揃っているか確認する
+        run: |
+          set -eu
+          SRC=/tmp/unity-src
+          for f in \
+            "$SRC/package.json" \
+            "$SRC/Runtime/Plugins/macOS/libmw_ffi.dylib" \
+            "$SRC/Runtime/Plugins/macOS/libmw_ffi.dylib.meta" \
+            "$SRC/Runtime/Plugins/iOS/MwFfi.xcframework/Info.plist" \
+            "$SRC/Runtime/Plugins/iOS/MwFfi.xcframework.meta" \
+            "$SRC/Runtime/Plugins/Android/libs/arm64-v8a/libmw_ffi.so" \
+            "$SRC/Runtime/Plugins/Android/libs/arm64-v8a/libmw_ffi.so.meta" \
+            "$SRC/Runtime/Generated/NativeMethods.g.cs" \
+            "$SRC/Runtime/Generated/NativeMethods.g.cs.meta" \
+          ; do
+            [ -e "$f" ] || { echo "::error::配布物に必須ファイルがありません: $f"; exit 1; }
+          done
+
+      - name: git の設定
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      # upm ブランチは main とは別の履歴。既に存在すればその続きへ、無ければ orphan で始める。
+      - name: upm ブランチを用意する
+        run: |
+          set -eu
+          git fetch origin upm --depth 1 || true
+          if git rev-parse --verify --quiet origin/upm >/dev/null; then
+            git checkout -B upm origin/upm
+          else
+            git checkout --orphan upm
+          fi
+          find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+          cp -R /tmp/unity-src ./unity
+
+      - name: コミットしてタグを打つ
+        run: |
+          set -eu
+          git add -A
+          if git diff --cached --quiet; then
+            echo "配布物に前回からの差分がないため、新規コミットは作らず既存の HEAD にタグを打ちます"
+          else
+            git commit -m "release: v${VERSION}"
+          fi
+          git tag "upm/v${VERSION}"
+
+      - name: push する
+        run: |
+          set -eu
+          git push origin upm
+          git push origin "upm/v${VERSION}"

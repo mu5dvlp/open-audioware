@@ -23,7 +23,9 @@ CRI Ware のような商用ミドルウェアの全機能を再現するので�
 - **MIT-0 ライセンス**：著作権表示すら不要。商用利用も無制限 ([詳細](#ライセンス))
 - **一般的なゲーム開発フローへの統合**：Unity からは UPM パッケージとして利用可能
 
-導入手順は [`docs/integration.md`](./docs/integration.md) にあります。
+**使うだけなら** [「UPM での導入方法」](#upm-での導入方法)へ。ワークスペース内で client と
+一緒に Rust 側も改造しながら開発する場合の手順は [`docs/integration.md`](./docs/integration.md)
+にあります。
 
 ## できること
 
@@ -50,6 +52,23 @@ CRI Ware のような商用ミドルウェアの全機能を再現するので�
 | Windows | ❌ 未対応(`Backend` trait 上は追加可能) |
 
 Unity のバージョンは **6000.4.1f1** で検証しています。
+
+## UPM での導入方法
+
+公開リポジトリから直接、**ビルド済みのネイティブライブラリ入りパッケージ**を取得できます。
+`Packages/manifest.json` に1行足すだけです:
+
+```json
+"com.mu5dvlp.open-audioware": "https://github.com/mu5dvlp/open-audioware.git?path=unity#upm/v1.0.0"
+```
+
+- `upm/vX.Y.Z` はビルド済みネイティブライブラリ(iOS: `xcframework` / Android: `.so` /
+  macOS: `.dylib`)を同梱したタグです。**自分でビルドする必要はありません**
+- 版を固定したい場合は末尾の `#upm/v1.0.0` を目的のタグに変えてください。**タグを明示することを
+  推奨します**(省略して `upm` ブランチの先頭を指すと、リリース作業の途中の状態を掴む可能性があります)
+- ⚠️ **ワークスペース内で client と一緒に Rust 側も改造しながら開発する場合はこちらではなく**
+  [`docs/integration.md`](./docs/integration.md) の `file:` 参照(ソースからビルド)を使ってください。
+  この UPM 参照はビルド済みバイナリを取得するだけなので、Rust を直しても届きません
 
 ## 成熟度
 
@@ -177,6 +196,26 @@ Makefile・コードのどちらもアーチ非依存に書いてあります。
 `unity-sample-create` / `unity-test` は Unity をバッチモードで起動します。同一マシン上の
 他プロセスと衝突しないよう `tools/with-unity-lock.sh` がロック(`/tmp/mgct-unity.lock`)を
 取得してから実行します。
+
+## リリース手順(メンテナ向け)
+
+**タグを打つだけです。** ネイティブライブラリのビルドと配布用ブランチへの反映は
+[`.github/workflows/release-upm.yml`](./.github/workflows/release-upm.yml) が行います。
+
+1. `unity/package.json` の `version` を上げてコミットする
+2. そのバージョンに `v` を付けたタグを打って push する
+
+   ```sh
+   git tag v1.0.0
+   git push origin v1.0.0
+   ```
+3. ワークフローが iOS(xcframework)/ macOS(dylib)/ Android(.so)を並列ビルドし、
+   `unity/` の中身(`package.json` / `.meta` / 手書き C# ラッパ)と合わせて **`upm` ブランチ**
+   (main とは別履歴)へコミット、**`upm/v<version>`** タグを打って push する
+
+🔴 **タグの版と `unity/package.json` の `version` が一致していないとワークフローが失敗します**
+(取り違えたバイナリが配布されるのを防ぐための意図的なガード)。
+`workflow_dispatch` で手動実行する場合は、実行対象として配布したいタグを選んでください。
 
 ## リポジトリ構成
 
