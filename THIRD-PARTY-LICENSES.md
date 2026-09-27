@@ -51,7 +51,7 @@ MPL-2.0 はファイル単位のコピーレフトで、改変したそのファ
 | `cfg-if` | 1.0.4 | MIT OR Apache-2.0 |
 | `combine` | 4.6.7 | MIT |
 | `coreaudio-rs` | 0.14.2 | MIT/Apache-2.0 |
-| `cpal` | 0.18.2 | Apache-2.0 |
+| `cpal` | 0.18.1 | Apache-2.0 |
 | `dasp_sample` | 0.11.0 | MIT OR Apache-2.0 |
 | `dispatch2` | 0.3.1 | Zlib OR Apache-2.0 OR MIT |
 | `equivalent` | 1.0.2 | Apache-2.0 OR MIT |
@@ -2916,7 +2916,7 @@ DEALINGS IN THE SOFTWARE.
 
 </details>
 
-### cpal 0.18.2
+### cpal 0.18.1
 
 - SPDX: `Apache-2.0`
 - リポジトリ: https://github.com/RustAudio/cpal

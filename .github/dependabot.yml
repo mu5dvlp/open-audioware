@@ -22,6 +22,9 @@ updates:
     #    cpal が上げたら手で揃える。
     ignore:
       - dependency-name: "mach2"
+      # cpal は 0.18.1 に固定(iOS の playback タイムスタンプの意味が 0.18.2 で変わるため。
+      # crates/mw-backend/Cargo.toml のコメント参照)。上げるときは手で。
+      - dependency-name: "cpal"
     open-pull-requests-limit: 5
     commit-message:
       prefix: "chore(deps)"

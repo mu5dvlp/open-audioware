@@ -11,7 +11,10 @@ crate-type = ["rlib"]
 
 [dependencies]
 mw-core = { path = "../mw-core" }
-cpal = "0.18"
+# 🔴 0.18.1 に固定する。0.18.2 は iOS で「バッファが鳴る時刻」(OutputStreamTimestamp::playback)に
+# AVAudioSession.outputLatency を足すようになり、それを相関点にしている楽曲の再生位置が
+# 出力遅延ぶん(実機で約 65ms)ずれる。出力遅延を補正の仕組みとして扱い直すまでは上げない。
+cpal = "=0.18.1"
 
 # AVAudioSession(カテゴリ・I/O バッファ長)を Rust から設定するために使う。
 # cpal 0.18 が iOS 実装で既に依存しているクレートなので、依存ツリーは増えない。
@@ -63,6 +66,6 @@ ndk-context = "0.1"
 # 無効時はコールバックバッファが大きくなり、端末の FastMixer より遅延が増えるため有効にする
 # (docs/measurement-m1.md §6.2)。
 # 併せて音声コールバックスレッドの優先度も上げる。
-cpal = { version = "0.18", features = ["realtime"] }
+cpal = { version = "=0.18.1", features = ["realtime"] }
 
 [dev-dependencies]
