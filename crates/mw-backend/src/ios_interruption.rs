@@ -11,8 +11,7 @@
 //! そのため OS がストリームを止めても、ミドルウェア側には何も通知されず、
 //! `mw-core::Renderer::render` を呼ぶ主体である `cpal::Stream` は「鳴っているつもり」の
 //! まま固まる。SE はこのストリーム経由なので鳴らなくなり、Unity の `AudioSource` 経由の
-//! ボイスは Unity 自身のセッション管理で生き残る——実機報告「ホームへ戻ると SE だけ
-//! 無音になる」の裏付けと一致する。
+//! ボイスは Unity 自身のセッション管理で生き残る一方、SE はこのストリーム停止の影響を受ける。
 //!
 //! さらに厄介なことに、cpal 0.18.2 の `Stream::play()`(iOS 実装、`coreaudio/ios/mod.rs`
 //! の `StreamTrait::play` を確認済み)は内部の `playing: bool` フラグが既に `true` なら
@@ -35,8 +34,8 @@
 //!    「M0 からの変更点」)。一度ムーブした `Renderer` を後から取り戻す経路が無いため、
 //!    ストリームを閉じて作り直すと Renderer ごと(=全ボイス・バス音量・楽曲の再生位置)
 //!    失われる。これを避けるには `mw-ffi::handle::Instance` 側にも大きな再設計が要る
-//!    (「M3 で必須実装」と初期構築仕様§14のリスク表に書かれている AAudio 再オープンの
-//!    本丸そのもの)。今回のスコープ(実機報告の再現・修正)を超えるため見送った。
+//!    (初期構築仕様§14のリスク表にある AAudio 再オープンの本丸そのもの)。このモジュールの
+//!    責務を超えるため見送った。
 //! 2. **最小の Obj-C シムを xcframework に同梱する**(初期構築仕様§14 が当初想定していた
 //!    経路)。cpal 0.18 は既に `objc2` 系クレート(`objc2-avf-audio`/`objc2-foundation`/
 //!    `block2`)を iOS 実装の依存に持ち込んでいる(`ios_session.rs` が既に同じ理由で
@@ -49,7 +48,7 @@
 //!    ルート変化等で全く同じパターン(ブロックベースの observer 登録)を使っており、
 //!    実績のある手法をそのまま踏襲できる。`Renderer` の所有権を一切動かさないため、
 //!    ボイス・バス音量・楽曲の再生位置はすべて割り込みを跨いで自然に保持される
-//!    (=「実機報告のバグを直す」というスコープに対して最小の変更で済む)。
+//!    (= ストリームと Renderer の所有権を維持したまま、復帰に必要な変更だけで済む)。
 //!
 //! 3 を選んだ。監視する通知は2つ:
 //!
@@ -60,7 +59,7 @@
 //!   App's Audio」で説明されている挙動)。
 //! - `UIApplicationDidBecomeActiveNotification`(安全網)。上記の Began は確実に飛んでくる
 //!   一方、**対応する Ended がバックグラウンド遷移のケースでは確実に飛んでくる保証が無い**
-//!   ——実機報告はまさにこれが疑われる。`objc2-ui-kit` を新規依存に追加せずに済むよう、
+//!   ——バックグラウンド遷移で Ended が届かない場合に備える。`objc2-ui-kit` を新規依存に追加せずに済むよう、
 //!   通知名は `objc2_foundation::ns_string!` で文字列リテラルから直接作る
 //!   (`ios_session.rs` と同じ「依存ツリーを増やさない」方針)。
 //!   **ただし割り込み中(`InterruptionState::Interrupted`/`RecoveryFailed`)でない限り
@@ -69,9 +68,9 @@
 //!   実際には音声セッションを中断しないため、無条件に `pause()`→`play()` すると
 //!   通常プレイ中に不要な音切れを生む(このガードが必要な理由)。
 //!
-//! ## 実機で判明したこと(調査記録は `docs/history/09-2026-09-05.md`)
+//! ## 実機で判明したこと(詳細は `docs/history/` の調査記録)
 //!
-//! 上の実装方針は、その後の実機報告(R12 / R13 / R24 / V14)で**3箇所が否定された**。
+//! 上の実装方針には、実機で判明した複数の例外(R12 / R13 / R24 / V14)がある。
 //! いま実装が満たしている不変条件は次の4つで、**どれも実機でしか確かめられなかった**:
 //!
 //! 1. **`Began` は必ずしも飛んでこない。** バックグラウンド遷移では
@@ -80,14 +79,14 @@
 //!    [`InterruptionState::Backgrounded`] へ倒し、前面復帰で必ず復帰を試みる。
 //! 2. **`NewDeviceAvailable` も復帰を要求する。** 当初は「新しい機器が生えただけなら
 //!    ストリームは止まらない」と判断して除外していたが、Bluetooth 再接続で無音になる
-//!    実機報告(R13)がこれを否定した([`RouteChangeReason::requires_recovery`])。
+//!    実機でこの前提が崩れた([`RouteChangeReason::requires_recovery`])。
 //!    ⚠️ ただし `CategoryChange` は**意図的に除外したまま** —— 復帰処理自身が
 //!    カテゴリ変更を誘発して自己ループする。
 //! 3. **`pause()`→`play()` が `Ok` を返しても、鳴っているとは限らない。**(R24)
 //!    `AudioOutputUnitStart` の成功と音声コールバックの再開は別事象なので、
 //!    **コールバックが実際に前進したかを実測して確認する**
 //!    ([`confirm_recovery_progress`] / `RECOVERY_WAIT_SCHEDULE_MS`)。
-//! 4. 🔴 **通知が1つも来ないまま止まることがある。**(V14、2026-09-10)
+//! 4. 🔴 **通知が1つも来ないまま止まることがある。**(V14)
 //!    実機の診断で「音源のロードも `mw_se_play` も全部成功しているのに無音、アプリを
 //!    再起動すると直る」が確定した。上の1〜3はすべて**OS から通知が来ること**が前提で、
 //!    通知の来ない止まり方には何も反応しない。そこで通知に頼らず、
@@ -95,7 +94,7 @@
 //!    ウォッチドッグを入れた([`OutputStallDetector`] / `spawn_output_stall_watchdog`)。
 //!    📌 **原因を問わない直し方にしたのが要点。** 「なぜ止まったか」を突き止めて拾う
 //!    通知を足すやり方は R12 / R13 で2度やり直しており、通知の網羅は原理的に終わらない。
-//! 5. 🔴 **`recovered: false` は「もうダメ」ではない。**(2026-09-10、実機で初観測)
+//! 5. 🔴 **`recovered: false` は「もうダメ」ではない。**
 //!    [`confirm_recovery_progress`] は最大 370ms しか待たないので、**復帰そのものは効いていて
 //!    確認だけが間に合わなかった**ことがある —— 実機で「`recovered=false` のログが出たあとも
 //!    音は出ていた」が確認された。放置するとホスト側の表示(「音声が無音のままの可能性があります」)が
@@ -104,9 +103,9 @@
 //!    改めて `AudioInterruptionEnded { recovered: true }` を上げ直す。
 //!
 //! 🔴 **どこまで疑って何が否定されたかの全記録は
-//! [`docs/history/09-2026-09-05.md`](../../../docs/history/09-2026-09-05.md) にある。**
+//! `docs/history/` の調査記録にある。**
 //! 同じ症状が再発したらそこから読むこと(**このモジュール doc には積み増さない**——
-//! 400行まで膨らんで実装本体に匹敵していたのを 2026-09-05 に移した)。
+//! 400行まで膨らんで実装本体に匹敵したため、詳細は調査記録へ分離している)。
 //!
 //! 📌 **本ファイル中の「…」による節参照は、すべてその調査記録の節を指す**
 //! (「ルート変化」/「`DidBecomeActive` 安全網の前提が崩れていたケース」/
@@ -153,7 +152,7 @@
 //! 妥当性(20msで足りるか、370ms待っても復帰しない実機ケースがあるか)は次の実機
 //! テストで確認する。
 //!
-//! **6つ目(P0-6, 2026-09-03): 復帰確認をワーカースレッドへ委譲したことでメインスレッドの
+//! **6つ目(P0-6): 復帰確認をワーカースレッドへ委譲したことでメインスレッドの
 //! ブロックが実際に解消したか。** `attempt_recovery` が `confirm_recovery_progress` の
 //! 呼び出しを `std::thread::spawn` した専用スレッドへ委譲するようになったこと自体は
 //! コードの構造として自動テストで確認できない(`imp` モジュールは iOS/tvOS 専用の
@@ -168,7 +167,7 @@
 //! ハンドラ内に370ms級のブロックが見えていたはず——是正後はそれが消えていることを
 //! 確認する)。
 //!
-//! **7つ目(V14, 2026-09-10): 出力停止ウォッチドッグの判定([`OutputStallDetector`])。**
+//! **7つ目(V14): 出力停止ウォッチドッグの判定([`OutputStallDetector`])。**
 //! 他の3つと同じく OS 非依存の値型として切り出したので、「進み続けている間は黙っている」
 //! 「連続して止まっていたら要求する」「1回では要求しない」「要求後はクールダウンする」
 //! 「止まっているのが正常な状態(`Interrupted`/`Backgrounded`/`RecoveryPending`)では
@@ -338,13 +337,11 @@ impl Default for InterruptionState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteChangeReason {
     /// 直前まで使っていたデバイスが無くなった(例: Bluetooth 切断・イヤホン抜け)。
-    /// 実機報告「Bluetooth を解除すると SE が鳴らなくなる」に対応する reason。
+    /// Bluetooth 切断やイヤホン抜けで出力が失われた場合の復帰に使う reason。
     OldDeviceUnavailable,
     /// 新しいデバイスが使えるようになった(例: Bluetooth 接続・イヤホン挿し込み)。
-    /// 実機報告「Bluetooth を再接続すると SE が鳴らなくなる」(R13)に対応する reason
-    /// ——当初は「音が途切れず自動的に継続するのが通例」としてここに反応しない判断
-    /// だったが、実機で否定された(調査記録「Bluetooth 再接続で無音になる
-    /// ケース」参照)。
+    /// Bluetooth 再接続やイヤホン挿し込み後に出力を再開するための reason。
+    /// 再接続後もコールバックが再開しない場合があるため、復帰対象に含める。
     NewDeviceAvailable,
     /// オーディオカテゴリが変わった。`ios_session::configure()` 自身が
     /// `setCategory_error` 経由で引き起こしうる。
@@ -359,14 +356,10 @@ pub enum RouteChangeReason {
 impl RouteChangeReason {
     /// この reason で復帰(セッション再アクティブ化 + `pause()`→`play()`)を試みるべきか。
     ///
-    /// **`OldDeviceUnavailable` と `NewDeviceAvailable` が `true`。** 判断根拠は調査記録
-    /// 「ルート変化」および「Bluetooth 再接続で無音になるケース」に詳述——
-    /// 要約すると、当初は `OldDeviceUnavailable` だけが Apple のドキュメント上「直前まで
-    /// 使えていたものが無くなった」ことを意味すると判断していたが、`NewDeviceAvailable`
-    /// (Bluetooth 再接続等)でも音が自動的には継続せず無音になることが実機報告(R13)で
-    /// 確認され、対象に追加した。`CategoryChange` は `ios_session::configure()` 自身が
-    /// 引き起こしうる自己誘発ループの懸念があるため引き続き除外し、`Override`/`Other`
-    /// は実機報告が無いため据え置いている。
+    /// **`OldDeviceUnavailable` と `NewDeviceAvailable` が `true`。** デバイス切断・再接続後は
+    /// 出力が自動復帰しない場合があるため、両方を対象にする。`CategoryChange` は
+    /// `ios_session::configure()` 自身が引き起こしうる自己誘発ループの懸念があるため除外し、
+    /// `Override`/`Other` は復帰対象にしない。
     pub fn requires_recovery(self) -> bool {
         matches!(self, Self::OldDeviceUnavailable | Self::NewDeviceAvailable)
     }
@@ -382,7 +375,7 @@ impl RouteChangeReason {
 /// index 0(20ms)は追加の呼び出し無し——呼び出し側が既に済ませた1回目の
 /// `pause()`→`play()` の結果を確認するだけなので、1回目で復帰していれば追加の
 /// コストは20ms待つだけで済む。全部空振りした場合の合計待機時間は
-/// 20+50+100+200 = 370ms(依頼書の「合計 400ms 程度を上限に」の範囲)。
+/// 20+50+100+200 = 370ms(合計待機時間を 400ms 程度に収める上限の範囲)。
 pub const RECOVERY_WAIT_SCHEDULE_MS: [u64; 4] = [20, 50, 100, 200];
 
 /// [`RECOVERY_WAIT_SCHEDULE_MS`] を1ステップずつ辿りながら、音声コールバックが実際に
@@ -450,7 +443,7 @@ pub const WATCHDOG_COOLDOWN_SAMPLES: u32 = 8;
 
 /// 音声コールバックが止まったままになっていないかを見張る、純粋な検知器。
 ///
-/// ## なぜ要るか(実機報告 V14、2026-09-10)
+/// ## なぜ要るか
 ///
 /// 実機の診断レポートで「**音源のロードも `mw_se_play` も全部成功しているのに無音**、
 /// アプリを再起動すると直る」という状態が確定した(SE 発音16/待ち0/失敗0/委譲0、
@@ -801,7 +794,7 @@ mod imp {
                 }
             }
 
-            // 出力停止ウォッチドッグ(実機報告 V14。`OutputStallDetector` のクラス doc)。
+            // 出力停止ウォッチドッグ(V14。`OutputStallDetector` のクラス doc)。
             // observer の登録がすべて済んだ後に起こす —— 先に起こすと、まだ observer が
             // 揃っていない状態で復帰を試みることになりうる。
             let watchdog_shutdown = Arc::new(AtomicBool::new(false));
@@ -900,7 +893,7 @@ mod imp {
              attempt recovery on next activation"
         );
 
-        // 🔴 <b>出力を手放す</b>(ユーザー決定 2026-09-09。D6「バックグラウンド時に解放して」)。
+        // 🔴 <b>出力を手放す</b>。バックグラウンド時に他アプリの音を再開できるようにする。
         //    カテゴリ Playback は他アプリの音を止めるので、非アクティブ化して
         //    「もう鳴らさない」ことを OS へ伝えないと、<b>止めた相手の音楽が再開しない</b>
         //    (`ios_session::deactivate` の doc が理由の正)。
@@ -1037,14 +1030,14 @@ mod imp {
         /// ここへ来ない)。
         #[allow(dead_code)]
         RouteChange { reason: RouteChangeReason },
-        /// 🆕 出力停止ウォッチドッグ(実機報告 V14、2026-09-10)。**OS からの通知は何も
+        /// 🆕 出力停止ウォッチドッグ(V14)。**OS からの通知は何も
         /// 来ていない** —— 音声コールバックが進まなくなったことを実測だけで検知した経路。
         /// `stalled_ms` は「進んでいない」と判定するまでに実際に経過した時間。
         #[allow(dead_code)]
         OutputStalled { stalled_ms: u64 },
     }
 
-    /// 出力停止ウォッチドッグのスレッドを起こす(実機報告 V14。判定そのものは
+    /// 出力停止ウォッチドッグのスレッドを起こす(V14。判定そのものは
     /// [`OutputStallDetector`]、なぜ要るかもそちらのクラス doc が正)。
     ///
     /// ⚠️ **ゲームスレッドでも音声スレッドでもない専用スレッド**で回す。
@@ -1074,7 +1067,7 @@ mod imp {
                     previous_ticks = ticks;
 
                     // 🔴 <b>「復帰できなかった」で終わった話を、そのまま放置しない</b>
-                    // (実機報告 2026-09-10)。`confirm_recovery_progress` は最大 370ms しか
+                    // `confirm_recovery_progress` は最大 370ms しか
                     // 待たないので、**復帰そのものは効いていて確認だけが間に合わなかった**ことがある
                     // ——実機で実際に「recovered=false のログが出たあとも音は出ていた」が観測された。
                     //
@@ -1173,7 +1166,7 @@ mod imp {
     /// `pause()`→`play()` を呼び直しながら段階的に(`RECOVERY_WAIT_SCHEDULE_MS`)
     /// 再確認する。
     ///
-    /// **待機は `std::thread::sleep`(ブロッキング)。** ただし P0-6(2026-09-03 是正)の
+    /// **待機は `std::thread::sleep`(ブロッキング)。** ただし P0-6 の
     /// 対応として、待機を伴う確認・再試行(`confirm_recovery_progress` とその結果に基づく
     /// 状態更新・イベント発火)は**この関数自身のスレッドでは実行せず、専用のワーカー
     /// スレッドへ丸ごと委譲する**(下記実装参照)。この関数(＝通知ハンドラから同期的に
@@ -1188,7 +1181,7 @@ mod imp {
     /// `std::thread::sleep`)が同期的に含まれており、`UIApplicationDidBecomeActiveNotification`
     /// 経由(=メインスレッド)で呼ばれた場合に限り、メインスレッドを最大370ms
     /// ブロックしていた**(調査記録「`pause()`→`play()` が Ok を返しても無音のままだった
-    /// ケース」の「待機は `std::thread::sleep` を使う」パラグラフ参照。P0-6, 2026-09-03 是正)。ワーカースレッドへの委譲により
+    /// ケース」の「待機は `std::thread::sleep` を使う」パラグラフ参照)。ワーカースレッドへの委譲により
     /// この問題は解消した——ただし実機での体感(ヒッチが本当に消えたか)は自動テストでは
     /// 確認できない(本ファイル末尾「自動テストで守れる範囲・守れない範囲」参照)。
     ///
@@ -1339,7 +1332,7 @@ mod tests {
         WATCHDOG_COOLDOWN_SAMPLES, WATCHDOG_STALL_SAMPLES, confirm_recovery_progress,
     };
 
-    /// 依頼書が明示した最小シナリオ:「停止した → 再開要求 → 再開した」。
+    /// 停止後に再開要求を出し、復帰できる最小シナリオ。
     #[test]
     fn interruption_began_then_ended_with_resume_then_recovery_succeeds() {
         let state = InterruptionState::new();
@@ -1378,7 +1371,7 @@ mod tests {
 
     #[test]
     fn app_became_active_recovers_the_exact_reported_bug_scenario() {
-        // 実機報告: バックグラウンドへ行くと Began は飛ぶが(cpal がストリームを
+        // バックグラウンドへ行くと Began は飛ぶが(cpal がストリームを
         // 「鳴っているつもり」のままにする)、Ended が確実に飛んでくる保証は無い。
         // その場合でも DidBecomeActive が安全網として復帰を要求できること。
         let state = InterruptionState::new().on_interruption_began();
@@ -1388,8 +1381,7 @@ mod tests {
         assert_eq!(state, InterruptionState::RecoveryPending);
     }
 
-    /// 依頼書が明示した最小シナリオそのもの:実機バグ R12「iOS でホームに戻って復帰すると
-    /// 音が出ない」の原因——`AVAudioSessionInterruptionNotification` の Began が
+    /// バックグラウンド遷移で音が出ない場合の最小シナリオ——`AVAudioSessionInterruptionNotification` の Began が
     /// (何らかの理由で)一度も飛んでこないままバックグラウンドへ行くと、`Running` のまま
     /// 変わらず、`on_app_became_active` の当初のガード(`Interrupted`/`RecoveryFailed`
     /// のみ復帰)には引っかからなかった。`UIApplicationDidEnterBackgroundNotification` を
@@ -1507,7 +1499,7 @@ mod tests {
         assert_eq!(InterruptionState::default(), InterruptionState::Running);
     }
 
-    /// 実機報告その2の最小シナリオ:「Bluetooth を切断すると SE が鳴らなくなる」——
+    /// Bluetooth 切断後に SE の復帰を要求する最小シナリオ——
     /// `OldDeviceUnavailable` はどの状態からでも復帰要求(`RecoveryPending`)へ遷移する。
     #[test]
     fn route_changed_with_old_device_unavailable_requests_recovery_from_any_state() {
@@ -1526,10 +1518,9 @@ mod tests {
         }
     }
 
-    /// 依頼書の警告どおり:正常なルート切替(カテゴリ変更・オーバーライド等)では状態を
+    /// 正常なルート切替(カテゴリ変更・オーバーライド等)では状態を
     /// 一切変えない——毎回 `pause()`→`play()` すると通常プレイ中に不要な音切れを生むため。
-    /// `NewDeviceAvailable`(BT 接続・イヤホン挿し込み)はここに含めない——実機報告 R13で
-    /// 復帰が要ることが判明したため
+    /// `NewDeviceAvailable`(BT 接続・イヤホン挿し込み)はここに含めない——復帰が要るため、
     /// ([`route_changed_with_new_device_available_requests_recovery_from_any_state`] 参照)。
     #[test]
     fn route_changed_with_benign_reasons_does_not_change_state() {
@@ -1555,11 +1546,7 @@ mod tests {
         }
     }
 
-    /// 旧名 `only_old_device_unavailable_requires_recovery`。実機報告 R13(Bluetooth
-    /// 再接続で無音になる)を受けて `NewDeviceAvailable` も復帰対象に加わったため、
-    /// 「old device unavailable だけ」という名前のままでは実態と食い違う。名前を
-    /// 実態に合わせて変更した(調査記録「Bluetooth 再接続で無音になる
-    /// ケース」参照)。
+    /// `NewDeviceAvailable` も復帰対象に含めるため、古い関数名では対象範囲と一致しない。
     #[test]
     fn old_device_unavailable_and_new_device_available_require_recovery_other_reasons_do_not() {
         assert!(RouteChangeReason::OldDeviceUnavailable.requires_recovery());
@@ -1569,7 +1556,7 @@ mod tests {
         assert!(!RouteChangeReason::Other.requires_recovery());
     }
 
-    /// 実機報告 R13 の最小シナリオ:「Bluetooth を再接続すると SE が鳴らなくなる」——
+    /// Bluetooth 再接続後に SE の復帰を要求する最小シナリオ——
     /// `NewDeviceAvailable` はどの状態からでも復帰要求(`RecoveryPending`)へ遷移する
     /// (`route_changed_with_old_device_unavailable_requests_recovery_from_any_state` と
     /// 同じ形。調査記録「Bluetooth 再接続で無音になるケース」参照)。
@@ -1635,7 +1622,7 @@ mod tests {
     // すら使わずクロージャだけで実機の「カウンタが進む/進まない」を模擬できる
     // (`InterruptionState`/`RouteChangeReason` のテストと同じ設計思想)。
 
-    /// 依頼書が明示した最小シナリオ1つ目:「成功が1回目に来る」——1回目の
+    /// 最初の確認で成功するシナリオ——1回目の
     /// `pause()`→`play()`(呼び出し側が既に済ませている前提)の結果が、最初の待機
     /// (`RECOVERY_WAIT_SCHEDULE_MS[0]` = 20ms)の直後に確認できるケース。
     /// 追加の `retry` は一度も呼ばれないこと(=通常時のコストが20ms待つだけで
@@ -1661,7 +1648,7 @@ mod tests {
         assert_eq!(waits, vec![RECOVERY_WAIT_SCHEDULE_MS[0]]);
     }
 
-    /// 依頼書が明示した最小シナリオ2つ目:「成功が途中(最後より前)に来る」——
+    /// 途中の確認で成功するシナリオ——
     /// 最初の2ステップは空振りし、3回目の再試行後にようやくカウンタが進むケース。
     /// 累計待機時間・`retry` の呼び出し回数(2回)も合わせて固定化する。
     #[test]
@@ -1695,7 +1682,7 @@ mod tests {
         );
     }
 
-    /// 依頼書が明示した最小シナリオ3つ目:「最後まで確認できない」——実機 R24 の
+    /// 最後まで確認できないシナリオ——実機 R24 の
     /// ログのうち、もし2回目の `AppBecameActive` 経由の再試行も効かなかったら、
     /// という想定シナリオに対応する。スケジュールを最後まで使い切り、`None` を返し、
     /// 呼び出し側が `InterruptionState::RecoveryFailed` として扱えるようにする。
@@ -1727,7 +1714,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 出力停止ウォッチドッグ(実機報告 V14、2026-09-10)。
+    // 出力停止ウォッチドッグ(V14)。
     // OutputStallDetector のクラス doc「なぜ要るか」参照。
     // ------------------------------------------------------------------
 

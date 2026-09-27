@@ -634,8 +634,7 @@ pub extern "C" fn mw_bus_fade(handle: u64, bus: i32, target: f32, ms: f32) -> Mw
     )
 }
 
-/// バスの直近設定音量を取得する(R38「ツールバー連打で無音化」調査用に追加、
-/// 2026-08-31)。
+/// バスの直近設定音量を取得する。ツールバー操作で意図せず無音化していないかを診断する。
 ///
 /// `mw_bus_set_volume`/`mw_bus_fade` に渡した最後の目標値をそのまま返す
 /// (`Instance::bus_volume` 参照)。音声スレッドのランプがまだ収束していなくても、
@@ -1221,7 +1220,7 @@ pub unsafe extern "C" fn mw_get_output_underrun_stats(
 /// この関数の最後で [`handle_registry::maybe_reopen`] を呼んで(バックオフの都合が
 /// 良ければ)実際に試みる——**この関数自体が「ゲームスレッドから毎フレーム呼ばれる」
 /// 関数であることを利用しており、専用のポンプ・監視スレッドは新設していない**
-/// (依頼書「⚠️ 再オープンはゲームスレッド側でやること」)。
+/// (再オープンはゲームスレッド側で行う)。
 ///
 /// 🔴 **iOS/tvOS では次の呼び出しが丸ごとコンパイルから除かれる**(`cfg`)。
 /// iOS には実機で確認済みの既存の復帰経路(`mw-backend::ios_interruption`)が別途
@@ -1703,9 +1702,8 @@ mod tests {
         // 出力コールバックのアンダーラン(の疑い)統計。
         //
         // 🔴 **アンダーランの「件数が 0 であること」を assert しないこと。**
-        // 2026-09-23 に CI(PulseAudio の null sink を用意して初めてここまで到達した)で
-        // `count == 1` を引いて落ちた —— **仮想シンクの上や負荷のかかった VM では
-        // アンダーランは普通に起きる**。静かなマシンでたまたま 0 だっただけで、
+        // CI の仮想シンクや負荷のかかった VM では `count == 1` を引くことがある ——
+        // **アンダーランは普通に起きる**。静かなマシンでたまたま 0 だっただけで、
         // これは環境依存の決めつけだった(潜在的な flaky を CI が暴いた形)。
         //
         // ⚠️ このブロックが本当に確かめたいのは「**全フィールドが書き込まれること**」
@@ -1754,7 +1752,7 @@ mod tests {
         assert_eq!(underrun_stats.se_schedule_overflow_count, 0);
 
         // 楽曲バイト列を release しても SE 側は無事(ID 空間分離が効いていることの
-        // 実ハンドル越しの確認、依頼書のテスト要件)。
+        // 実ハンドル越しの確認、テスト要件)。
         assert_eq!(mw_sound_release(handle, music_id), MwResult::Ok);
         assert_eq!(
             mw_sound_release(handle, music_id),
@@ -1856,7 +1854,7 @@ mod tests {
         );
 
         // ここが本題: ユーザーが即座に B → C と連打で切り替える。B の Ready を
-        // 一度も待たない(依頼書の「ロード中に切り替えたらどうなるか」そのもの)。
+        // 一度も待たない(ロード中に切り替えた場合の動作を検証する)。
         assert_eq!(mw_music_set(handle, id_b), MwResult::Ok);
         assert_eq!(mw_music_set(handle, id_c), MwResult::Ok);
 
@@ -2040,8 +2038,8 @@ mod tests {
     /// M3「Android(AAudio)切断復旧」案A の統合テスト(実ハンドル + 実デコードスレッド +
     /// 実 `CpalBackend` 越し)。
     ///
-    /// **実デバイスを本当に切断する手段がこの環境には無い**(`docs/history/
-    /// 03-2026-08-31.md`「実機でしか確認できない範囲」参照)。このテストが実行されて
+    /// **実デバイスを本当に切断する手段がこの環境には無い**(`docs/history/` の
+    /// 実機検証に関する記録を参照)。このテストが実行されて
     /// いる時点で `mw_init` は既に成功している(呼び出し元
     /// `init_se_lifecycle_then_shutdown_or_gracefully_reports_no_device` が
     /// `MwResult::Ok` を確認済み)ので、実デバイスは存在する。ここでは
@@ -2086,7 +2084,7 @@ mod tests {
         );
 
         // 楽曲を準備し、Ready を待ってからループ・バス音量を設定して再生する
-        // (依頼書「復元すべき状態」を一通り成立させてから切断をシミュレートする)。
+        // 復元対象の状態を一通り成立させてから切断をシミュレートする。
         assert_eq!(mw_music_set(handle, music_id), MwResult::Ok);
         let mut state = -1i32;
         assert!(
@@ -2285,8 +2283,7 @@ mod tests {
             "must resume playing automatically since it was Playing before the disconnect"
         );
 
-        // 2) generation が bump されている(不連続の通知。依頼書「🔴 generation を
-        //    必ず bump すること」)。
+        // 2) generation が bump されている(不連続の通知)。
         assert_ne!(
             position_after.generation, generation_before,
             "generation must change across an internal reopen so the client can detect \
@@ -2340,7 +2337,7 @@ mod tests {
     /// 実際の発生源(音声コールバック・cpal のエラー通知経路)からの配線は
     /// `mw-core`/`mw-backend` 側のテストで検証済み。ここでは FFI 境界そのもの
     /// (`Instance::events` への直接注入 → `mw_poll_events` での取り出し)が
-    /// 依頼書のテスト要件2〜4を満たすことを確認する。
+    /// テスト要件2〜4を満たすことを確認する。
     fn run_event_poll_checks(handle: u64) {
         // 前提: 空の状態から始める(0件、破棄数0)。
         let mut buf = [MwEvent {
@@ -2352,7 +2349,7 @@ mod tests {
         assert_eq!(n, 0, "queue must start out empty");
         assert_eq!(dropped, 0);
 
-        // 依頼書のテスト要件3: ポーリングでキューが空になる/2回目は0件。
+        // テスト要件3: ポーリングでキューが空になる/2回目は0件。
         //
         // `reason` にあえて `DeviceUnavailable` 以外(`Backend`)を選んでいる:
         // `DeviceUnavailable` を注入すると `mw_poll_events` のドレイン中に
@@ -2395,7 +2392,7 @@ mod tests {
         assert_eq!(n2, 0, "the queue must be empty after being fully drained");
         assert_eq!(dropped, 0);
 
-        // 依頼書のテスト要件4: 呼び出し側バッファが積まれた件数より小さいとき、
+        // テスト要件4: 呼び出し側バッファが積まれた件数より小さいとき、
         // 残りが次回のポーリングで取れる(取りこぼさない)。
         handle_registry::with_instance(handle, |instance| {
             for i in 0..5u32 {

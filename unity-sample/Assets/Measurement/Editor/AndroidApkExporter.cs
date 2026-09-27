@@ -34,8 +34,8 @@ namespace Measurement.EditorTools
         /// <c>.so</c> はビルド成果物なのでコミットしない(CLAUDE.md)。そのため
         /// <c>.meta</c> にインポータ設定が入っておらず、そのままでは Unity が
         /// 「どのプラットフォーム向けのプラグインか」を判断できず apk に同梱されない
-        /// (2026-08-22 に実際に踏んだ: <c>lib/arm64-v8a/</c> に libmw_ffi.so が入らず、
-        /// B が動かない apk ができた)。毎ビルド冪等に設定し直して再発を防ぐ。
+        /// <c>lib/arm64-v8a/</c> に libmw_ffi.so が入らないと B が動かない apk になるため、
+        /// 毎ビルド冪等に設定し直して再発を防ぐ。
         /// </para>
         /// </summary>
         private static bool ConfigureNativePluginImporter()

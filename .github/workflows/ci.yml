@@ -24,7 +24,7 @@ jobs:
       - name: Install ALSA dev headers (cpal の Linux ビルドに必要)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
 
-      # 🔴🔴 **CI にオーディオデバイスを用意するのは諦めた(2026-09-23)。同じ道を掘り直さないこと。**
+      # 🔴🔴 **CI ではオーディオデバイスを用意しない。**
       #
       # 動機: 同じテスト一式が**実デバイスのあるマシンでは TOTAL 95.84%**
       # (handle.rs 83.04% / ffi.rs 98.15%)なのに、**CI では handle.rs 13% / ffi.rs 49%**。
@@ -76,7 +76,7 @@ jobs:
       - name: cargo deny check
         uses: EmbarkStudios/cargo-deny-action@v2
 
-      # 🔴 **`cargo test` の置き換え**(2026-09-23。Codecov 導入)。
+      # 🔴 **`cargo test` の置き換え**(Codecov 導入)。
       # `cargo llvm-cov` は「テストを走らせたうえで計測する」ので、これ1本で
       # 従来の `cargo test --workspace` と同じ検証になる。
       # ⚠️ **`cargo test` を別ステップとして残さないこと** —— 同じテストが2回走り、
@@ -187,7 +187,7 @@ jobs:
           path: target/aarch64-linux-android/release/libmw_ffi.so
           retention-days: 7
 
-  # 秘密情報のコミット検知(2026-09-10 追加)。
+  # 秘密情報のコミット検知。
   # 🔴 private リポジトリでは GitHub の secret scanning は GitHub Advanced Security(有料)が
   # 要るため無料では効かない。⚠️ このリポジトリは**将来 UPM パッケージとして配布する**予定で、
   # 履歴ごと配られる —— 入ってしまった鍵は消せない。

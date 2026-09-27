@@ -1,4 +1,4 @@
-# Dependabot(依存更新の見張り)。2026-09-11 導入。
+# Dependabot(依存更新の見張り)。
 #
 # 🔴 **これは設定ファイルであってワークフローではない。** GitHub 側で動くので
 # Actions の実行時間を消費しない。
@@ -18,7 +18,7 @@ updates:
           - "*"
     # 🔴 `mach2` は cpal が依存している版に揃える(mw-backend/Cargo.toml のコメント。
     #    二重に入ると依存ツリーが増えるうえ、`mach_timebase_info` を cpal と同じ実装で呼ぶ前提が崩れる)。
-    #    2026-09-26 の PR #2 で 0.7 へ上げられたが、cpal 0.18.2 は 0.6 のままなので据え置いた。
+    #    cpal 0.18.2 が 0.6 のままなので、mach2 も 0.6 に据え置く。
     #    cpal が上げたら手で揃える。
     ignore:
       - dependency-name: "mach2"
@@ -35,7 +35,7 @@ updates:
         patterns:
           - "*"
     # 🔴 `dtolnay/rust-toolchain@<版>` は**タグの値がそのまま Rust の版**になる(`1.98.0` は意図した固定)。
-    #    2026-09-11 に Dependabot が `@1.120.0`(存在しない Rust)へ上げて CI が全滅した。
+    #    `@stable` や存在しない Rust のタグへ自動更新すると CI が壊れるため、ここでは追わない。
     #    Rust の版はプロジェクトの判断で上げるので、ここでは追わない。
     ignore:
       - dependency-name: "dtolnay/rust-toolchain"

@@ -14,13 +14,13 @@
 //! 出力(デバイス)サンプルレートと素材のレートが一致しない場合、[`SymphoniaDecoder`] は
 //! `resample.rs::StreamResampler`(rubato `Fft` ベース)で自動的に変換する。
 //! **レートが一致する場合はリサンプラを構築すらしない**(`resampler: Option<_>` が
-//! `None` のままバイパスする。依頼書の設計判断4: 一致時に無用な計算・レイテンシを
+//! `None` のままバイパスする。レート一致時に無用な計算・レイテンシを
 //! 持ち込まない)。
 //!
 //! この変換は [`MusicDecoder`] トレイトの内側で完結しており、`stream.rs`(`pump()`)・
 //! `music.rs`(`MusicVoice`)はどちらも一切関知しない。両モジュールにとって
 //! `read`/`seek`/`total_frames` の「フレーム」は常に**出力レート基準**になる
-//! (依頼書の設計判断3)。素材レートとの変換は [`resample::convert_frame_count`] に
+//! 素材レートとの変換は [`resample::convert_frame_count`] に
 //! 一本化してあり、総フレーム数もシーク位置もこの1つの関数だけで換算する。
 //!
 //! # シークとサンプル精度
@@ -439,7 +439,7 @@ pub struct SymphoniaDecoder {
     /// 出力レート換算の総フレーム数([`resample::convert_frame_count`] で変換済み)。
     total_frames: Option<u64>,
     /// `source_sample_rate != output_sample_rate` のときだけ `Some`
-    /// (依頼書の設計判断4: 一致時はリサンプラを構築すらせずバイパスする)。
+    /// (レート一致時はリサンプラを構築すらせずバイパスする)。
     resampler: Option<StreamResampler>,
     /// リサンプラへ供給するための、素材レートの読み出しスクラッチ(固定長・再利用)。
     resample_scratch_in: Vec<f32>,
@@ -780,7 +780,7 @@ mod tests {
         make_pcm16_wav(sample_rate, 2, &samples)
     }
 
-    /// ゼロ交差の数から推定周波数を求める(依頼書『テスト』1: 「周波数が保たれること」)。
+    /// ゼロ交差の数から推定周波数を求める(周波数が保たれることの検証用)。
     /// 前後の縁(リサンプラの端の影響が出やすい)を除いてから数える。
     fn estimate_frequency_hz(left_channel: &[f32], sample_rate: u32) -> f32 {
         let margin = left_channel.len() / 20; // 前後5%ずつ除く
@@ -990,7 +990,7 @@ mod tests {
         //
         // 判断: ogg vorbis の完全なラウンドトリップ(pump → read でのデコード検証)は
         // wav でのみ行い、ogg は「対応コーデックとして組み込まれていること」の
-        // 最小限の証跡に留める(依頼書のとおり、この判断を報告する)。
+        // 最小限の証跡に留める(対応コーデックの組み込みだけを検証する)。
         let mut bytes = vec![0u8; 64];
         bytes[0..4].copy_from_slice(b"OggS");
         let err = match SymphoniaDecoder::open(bytes, SAMPLE_RATE) {
@@ -1018,11 +1018,11 @@ mod tests {
         );
     }
 
-    // --- ここから先はリサンプル(初期構築仕様『§4.7』, 依頼書『テスト』1〜5)の検証 ---
+    // --- ここから先はリサンプル(初期構築仕様『§4.7』)の検証 -------------------------
 
     #[test]
     fn resample_preserves_frequency_when_upsampling_44_1k_to_48k() {
-        // 依頼書『テスト』1: 「周波数が保たれること」。
+        // 周波数が保たれること。
         const SOURCE_RATE: u32 = 44_100;
         const OUTPUT_RATE: u32 = 48_000;
         const FREQ_HZ: f32 = 1_000.0;
@@ -1041,7 +1041,7 @@ mod tests {
 
     #[test]
     fn resample_produces_the_expected_output_length() {
-        // 依頼書『テスト』2: 「長さが正しいこと」。総フレーム数・実際に読み出せる
+        // 長さが正しいこと。総フレーム数・実際に読み出せる
         // フレーム数の両方が `convert_frame_count` の換算式ちょうどに一致することを見る
         // (§4.7 設計判断3: 端数超過分は `total_frames` で切り詰める設計にしてある)。
         const SOURCE_RATE: u32 = 44_100;
@@ -1060,7 +1060,7 @@ mod tests {
 
     #[test]
     fn resample_block_boundaries_are_seamless() {
-        // 依頼書『テスト』3: 「ブロック境界の連続性」。細切れに read() したときと、
+        // ブロック境界の連続性。細切れに read() したときと、
         // 一括に近い大きさで read() したときとで、リサンプル結果が完全一致することを見る
         // (`StreamResampler` を `pump` 相当の呼び出しをまたいで使い回すことで、
         // 内部オーバーラップ状態が保たれ継ぎ目にプチノイズが出ない設計。`resample.rs` 参照)。
@@ -1088,7 +1088,7 @@ mod tests {
 
     #[test]
     fn resample_bypasses_when_rates_match() {
-        // 依頼書『テスト』4: 「レート一致時のバイパス」。一致時は素材の PCM が
+        // レート一致時のバイパス。一致時は素材の PCM が
         // そのまま(丸め誤差の入り込む余地なく)出てくることを見る。
         let samples: Vec<i16> = vec![0, 0, 16384, -16384, -16384, 16384, 32767, -32768];
         let bytes = make_pcm16_wav(48_000, 2, &samples);
@@ -1106,7 +1106,7 @@ mod tests {
 
     #[test]
     fn seek_after_resample_matches_a_fresh_decoder_seeked_to_the_same_position() {
-        // 依頼書『テスト』5相当の拡張: リサンプル併用時のシーク調停。
+        // リサンプル併用時のシーク調停。
         // 「途中まで読んでからシークした場合」と「開いた直後にシークした場合」とで、
         // シーク後の出力が完全一致することを見る(`StreamResampler::reset` が
         // オーバーラップ状態を正しく破棄できているかの検証。混ざっていれば食い違う)。
@@ -1138,7 +1138,7 @@ mod tests {
 
     #[test]
     fn end_to_end_resamples_a_44_1k_wav_through_pump_and_read_without_error() {
-        // 依頼書『テスト』6相当(`stream.rs` の pump/read 経路)は `stream.rs` 側の
+        // `stream.rs` の pump/read 経路は `stream.rs` 側の
         // end-to-end テストで直接カバーする。ここでは decode.rs 単体として、
         // レート不一致の素材がエラーにならず最後まで読み切れることだけ最小限に確認する。
         const SOURCE_RATE: u32 = 44_100;

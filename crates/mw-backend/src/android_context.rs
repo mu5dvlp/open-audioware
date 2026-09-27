@@ -5,7 +5,7 @@
 //! `ndk-glue` や `android-activity` を使うアプリでは自動的に初期化されるが、
 //! **Unity のようなホストアプリのプロセスでは誰も初期化しない**。未初期化のまま cpal を呼ぶと
 //! `android context was not initialized` で panic し、`mw_init` が `ErrPanic` を返して
-//! ミドルウェアが一切動かない(2026-08-23 に実機で確認。docs/measurement-m1.md §6.2)。
+//! ミドルウェアが一切動かない(docs/measurement-m1.md §6.2)。
 //!
 //! そこで:
 //!

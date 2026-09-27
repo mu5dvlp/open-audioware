@@ -119,8 +119,8 @@ pub enum Event {
     /// OS 主導のオーディオ割り込みが始まった(M3)。iOS の
     /// `AVAudioSessionInterruptionNotification`(`AVAudioSessionInterruptionTypeBegan`)
     /// 相当——電話着信・Siri・他アプリの音声に加え、Background Audio 機能を持たない
-    /// アプリがバックグラウンドへ遷移した場合もここに含まれる(実機報告「ホームに
-    /// 戻ると SE だけ無音になる」の原因。`crates/mw-backend/src/ios_interruption.rs`
+    /// アプリがバックグラウンドへ遷移した場合もここに含まれる。SE の出力停止を
+    /// `crates/mw-backend/src/ios_interruption.rs`
     /// のモジュール doc 参照)。この時点で出力ストリームは(OS 側の都合で)鳴らなく
     /// なっている可能性が高い。
     AudioInterruptionBegan,
@@ -403,7 +403,7 @@ mod tests {
         assert_eq!(dropped, 0);
     }
 
-    /// 依頼書のテスト要件3: ポーリングでキューが空になること、2回目のポーリングで
+    /// ポーリングでキューが空になること、2回目のポーリングで
     /// 0件が返ること。
     #[test]
     fn second_poll_after_full_drain_returns_nothing() {
@@ -418,7 +418,7 @@ mod tests {
         assert_eq!(dropped, 0);
     }
 
-    /// 依頼書のテスト要件2: 溢れたときに古いものから捨てられ、破棄数が正しく報告されること。
+    /// 溢れたときに古いものから捨てられ、破棄数が正しく報告されること。
     #[test]
     fn overflow_drops_oldest_first_and_reports_dropped_count() {
         let capacity = 4;
@@ -445,7 +445,7 @@ mod tests {
         );
     }
 
-    /// 依頼書のテスト要件4: 呼び出し側バッファの容量が積まれた件数より少ないとき、
+    /// 呼び出し側バッファの容量が積まれた件数より少ないとき、
     /// 残りが次回のポーリングで取れること(取りこぼさない)。
     #[test]
     fn partial_drain_leaves_remainder_for_the_next_poll() {

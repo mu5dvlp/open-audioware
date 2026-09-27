@@ -14,7 +14,7 @@
 //! これらは「生成コードの `internal` 型をパッケージ外へ漏らさない」ために手で
 //! コピーされた値であり、Rust 側の判別子が変わっても C# 側は**自動的には**
 //! 追従しない。実際に `AudioInterruptionBegan`/`AudioInterruptionEnded`
-//! (値 6/7)が M3 以降ずっと C# 側に欠けていた(`docs/history/05-2026-08-31.md`)。
+//! (値 6/7)が C# 側に欠けていた(`docs/history/` の調査記録参照)。
 //!
 //! `StreamErrorReason` はさらに事情が違う: 定義そのものが `mw_core`(`mw-ffi` の
 //! csbindgen 入力に含まれないクレート)にあり、`extern "C"` 関数のシグネチャにも
@@ -251,7 +251,7 @@ const ALL_MW_MUSIC_STATE: [MwMusicState; 4] = [
 /// `MwEventKind` の全判別子。ワイルドカード無し `match`(理由は上記参照)。
 ///
 /// **背景の再発防止テスト**: `AudioInterruptionBegan`/`AudioInterruptionEnded` が
-/// C# 側に欠けていた実際のバグ(`docs/history/05-2026-08-31.md`)は、ここに
+/// C# 側に欠けていたバグ(`docs/history/` の調査記録参照)は、ここに
 /// ワイルドカード無し `match` があれば「Rust に足したのに C# 側を触っていない」
 /// 段階で `mw-ffi` のコンパイルが失敗し検出できていたはずのケース。
 fn describe_mw_event_kind(v: MwEventKind) -> &'static str {
@@ -341,7 +341,7 @@ mod tests {
     }
 
     /// 直接の再発防止テスト: `AudioInterruptionBegan`/`AudioInterruptionEnded` が
-    /// C# 側に欠けていたバグ(`docs/history/05-2026-08-31.md`)を、Unity を起動せず
+    /// C# 側に欠けていたバグを、Unity を起動せず
     /// `cargo test` だけで検出できることを固定化する。
     #[test]
     fn mw_event_kind_matches_csharp_event_kind() {

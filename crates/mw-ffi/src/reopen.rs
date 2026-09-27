@@ -4,7 +4,7 @@
 //!
 //! ## 経緯・設計調査
 //!
-//! `docs/history/03-2026-08-31.md`「M3 最後の残り」で調査済み: cpal の AAudio ホストは
+//! `docs/history/` の調査記録で確認済み: cpal の AAudio ホストは
 //! 切断を `err_fn` 経由で `Event::StreamError { reason: DeviceUnavailable }` として
 //! 既に通知できている(`crates/mw-backend/src/cpal_backend.rs::classify_stream_error`)。
 //! 足りなかったのは、それを受けて実際に内部で再オープンする処理そのもの——本モジュールは
@@ -16,7 +16,7 @@
 //! 一切含まない純粋な値**として判定ロジックを切り出し、副作用を伴わずに単体テストで
 //! 固定化する。
 //!
-//! ## 無限リトライを禁止する(依頼書「再オープンに失敗したときどうするか」)
+//! ## 無限リトライを禁止する
 //!
 //! [`REOPEN_BACKOFF_SCHEDULE_MS`] を使い切るまでは指数的に間隔を伸ばしながら再試行し、
 //! 使い切ったら諦める([`ReopenPolicy::is_exhausted`])。**無限に試行し続けることは
@@ -34,13 +34,13 @@
 //! 再試行」で数十〜数百msのタイミング差の問題だが、こちらは「デバイスの列挙・
 //! ストリーム構築が現実に間に合うようになるまで」を待つ必要があり、
 //! `default_output_device()` が切断直後すぐに新しいデバイスを返す保証が無い
-//! (依頼書の指摘、実機でしか確認できない)ため、より長い時間軸を許容する。
+//! (実機でしか確認できない制約がある)ため、より長い時間軸を許容する。
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// 再オープン試行の待機スケジュール(ミリ秒)。**【仮】**——実機(Android/AAudio)の
 /// 「切断してから再接続可能になるまで」の実測分布を見ずに決めた値
-/// (`docs/history/04-2026-08-31.md`「判断に迷い、勝手に確定させなかった点」参照。
+/// (`docs/history/` の調査記録参照。
 /// 長すぎる/短すぎるかは実機でしか判断できない)。[`ReopenPolicy`] が
 /// [`ios_interruption::RECOVERY_WAIT_SCHEDULE_MS`](../../mw-backend/src/ios_interruption.rs)
 /// と同じ「定数1箇所に集約」方針で、これを使い切ったら [`ReopenPolicy::is_exhausted`] が
@@ -252,7 +252,7 @@ mod tests {
         assert!(!policy.is_exhausted());
     }
 
-    /// 依頼書「無限リトライは禁止」——バックオフを使い切ったら自動では二度と試みない。
+    /// 無限リトライは禁止——バックオフを使い切ったら自動では二度と試みない。
     ///
     /// [`REOPEN_BACKOFF_SCHEDULE_MS`] の `N` 要素は「連続する `N+1` 回の試行」の間に
     /// 挟まる待機時間を表す(1回目の失敗直後に1つ目の待機、……、`N` 回目の失敗直後に

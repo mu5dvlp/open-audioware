@@ -296,7 +296,7 @@ impl Backend for CpalBackend {
 /// 最大レート」を無条件に採っていたが、cpal 0.18 の Android(AAudio)実装は
 /// 5512Hz のような低いレートから列挙してくるため、`sample_rate=5512` でストリームを
 /// 開こうとして AAudio が `InvalidRate` を返し、**`mw_init` が失敗して B が一度も
-/// 鳴らない**状態になっていた(2026-08-23 に実機で確認。docs/measurement-m1.md §6.2)。
+/// 鳴らない**状態になる(docs/measurement-m1.md §6.2)。
 /// 既定の構成はそのデバイスが実際に回している構成なので、これを先に見る。
 fn find_f32_stereo_config(device: &cpal::Device) -> Option<SupportedStreamConfig> {
     let default_config = default_output_config(device);
@@ -350,8 +350,8 @@ fn find_f32_stereo_config(device: &cpal::Device) -> Option<SupportedStreamConfig
 /// `ndk_context`(JavaVM + Android Context)が初期化済みであることを前提にしており、
 /// 未初期化のプロセスでは `android context was not initialized` で **panic** する。
 /// Unity のようなホストアプリのプロセスでは誰もそれを初期化しないため、実機で
-/// `mw_init` が `ErrPanic` を返して**ミドルウェアが一切動かない**状態になっていた
-/// (2026-08-23。docs/measurement-m1.md §6.2)。
+/// `mw_init` が `ErrPanic` を返して**ミドルウェアが一切動かない**状態になる
+/// (docs/measurement-m1.md §6.2)。
 ///
 /// ここで畳んでおけば、既定構成が取れる OS(macOS / iOS)では従来どおり最優先で使い、
 /// Android では列挙からの選択へ素直に落ちる。
@@ -532,8 +532,8 @@ mod tests {
 
     /// **Android(AAudio)切断の通知経路がまだ生きていることを固定化する回帰テスト。**
     ///
-    /// M3「Android の AAudio 切断復旧」調査(2026-08-31、`docs/history/03-2026-08-31.md`
-    /// 参照)で、cpal 0.18.2 の AAudio ホスト実装(`~/.cargo/.../cpal-0.18.2/src/host/
+    /// M3「Android の AAudio 切断復旧」調査(`docs/history/` 参照)で、cpal 0.18.2 の
+    /// AAudio ホスト実装(`~/.cargo/.../cpal-0.18.2/src/host/
     /// aaudio/mod.rs::build_output_stream` の `error_callback`)と ndk 0.9.0
     /// (`~/.cargo/.../ndk-0.9.0/src/audio.rs` の `AudioStreamBuilder::error_callback` doc)
     /// をソースで確認した結果、AAudio が `AAUDIO_ERROR_DISCONNECTED` を出すと

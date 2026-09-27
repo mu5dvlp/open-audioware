@@ -6,7 +6,7 @@
 //! `resample.rs::resample_oneshot`(rubato `Async` sinc)へ通して出力レート化する
 //! (初期構築仕様『§4.7』: 「SE はロード時に全デコード + 必要ならロード時に
 //! リサンプルして出力レート化(再生時コストゼロ)」)。一致する場合はリサンプラを
-//! 構築すらしない(依頼書の設計判断4。無用な計算を持ち込まない)。
+//! 構築すらしない(レート一致時に無用な計算を持ち込まない)。
 //!
 //! パーサは自前実装(外部クレートへ依存しない。§1 の実装方針: 「パーサは自前実装か、
 //! 依存を足すなら deny.toml のライセンス allow と整合させること」)。
@@ -279,7 +279,7 @@ pub fn decode(bytes: &[u8], output_sample_rate: u32) -> Result<SoundData, WavErr
         }
     }
 
-    // レートが一致する場合はリサンプラを構築すらしない(依頼書の設計判断4)。
+    // レートが一致する場合はリサンプラを構築すらしない。
     if sample_rate == output_sample_rate {
         return Ok(SoundData {
             sample_rate,
@@ -523,7 +523,7 @@ mod tests {
         assert_eq!(sound.frames, 2);
     }
 
-    // --- ここから先はリサンプル(初期構築仕様『§4.7』, 依頼書『テスト』6)の検証 ---
+    // --- ここから先はリサンプル(初期構築仕様『§4.7』)の検証 -------------------------
 
     /// 指定周波数の正弦波(両ch同一)を PCM16 wav として合成する。
     fn make_sine_wave_wav(
@@ -558,8 +558,8 @@ mod tests {
 
     #[test]
     fn decodes_a_non_48k_wav_by_resampling_to_the_output_rate() {
-        // 依頼書『テスト』6: 「SE 側(wav.rs)も 48kHz 以外の wav が読めるようになること」。
-        // あわせて『テスト』1・2(周波数が保たれること・長さが正しいこと)も見る。
+        // SE 側(wav.rs)も 48kHz 以外の wav が読めること。
+        // あわせて周波数が保たれること・長さが正しいことも見る。
         const SOURCE_RATE: u32 = 44_100;
         const OUTPUT_RATE: u32 = 48_000;
         const FREQ_HZ: f32 = 1_000.0;
@@ -587,7 +587,7 @@ mod tests {
 
     #[test]
     fn bypasses_resampling_when_rates_already_match() {
-        // 依頼書『テスト』4: 「レート一致時のバイパス」。SE 側でも一致時は
+        // レート一致時のバイパス。SE 側でも一致時は
         // リサンプラの丸め誤差を持ち込まず、素材の PCM がそのまま出てくることを見る。
         let samples: Vec<i16> = vec![0, 0, 16384, -16384, 32767, -32768];
         let bytes = make_pcm16_wav(48_000, 2, &samples);

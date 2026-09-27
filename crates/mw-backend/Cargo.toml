@@ -60,8 +60,8 @@ ndk-context = "0.1"
 
 # cpal の `realtime` フィーチャは Android では **AAudio の performance mode を LowLatency に
 # する**唯一のスイッチ(既定では設定されず、AAudio が大きめのバッファを選ぶ)。
-# 2026-08-23 の実機計測で、無効時のコールバックバッファが 886 frames = 18.5ms だったのに対し、
-# 端末の FastMixer は 192 frames = 4.0ms で回っていた(docs/measurement-m1.md §6.2)。
+# 無効時はコールバックバッファが大きくなり、端末の FastMixer より遅延が増えるため有効にする
+# (docs/measurement-m1.md §6.2)。
 # 併せて音声コールバックスレッドの優先度も上げる。
 cpal = { version = "0.18", features = ["realtime"] }
 

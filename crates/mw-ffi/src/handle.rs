@@ -209,7 +209,7 @@ pub struct Instance {
     /// のドキュメント参照)。
     reopen: ReopenPolicy,
 
-    // --- P3-11(2026-09-23)「段2」の間だけ有効な補助フィールド ---------------------
+    // --- P3-11: 「段2」の間だけ有効な補助フィールド -------------------------------
     /// 直近に実際にネゴシエートできていた出力サンプルレート(`Backend::open` が
     /// 成功するたびに書き込む。`init()`/段3 `finalize_reopen_success` 参照)。
     ///
@@ -230,7 +230,7 @@ impl Instance {
     /// (初期構築仕様『§4.7』: 「SE はロード時に全デコード + 必要ならロード時に
     /// リサンプルして出力レート化」)。
     ///
-    /// 🔴 P3-11(2026-09-23): 内部再オープンの「段2」の間(`self.backend` がまだ
+    /// 🔴 P3-11: 内部再オープンの「段2」の間(`self.backend` がまだ
     /// 新品の未オープンバックエンドに差し替わっているだけの状態)は
     /// `self.backend.sample_rate()` が 0 になる——このときは代わりに
     /// 直近に実際にオープンできていたときの値([`Instance::last_known_sample_rate`])
@@ -330,7 +330,7 @@ impl Instance {
     ///
     /// 再生中の楽曲を release した場合の挙動: 拒否せず即座に解放を受け付ける。
     ///
-    /// 🔴 **P3-13(2026-09-15)で理由が変わった。** それまでは `mw_music_set` が
+    /// 🔴 **共有ストレージを使う理由。** `mw_music_set` は
     /// `SymphoniaDecoder::open` へバイト列の**複製**を渡していた(`Vec<u8>` を値で
     /// 要求するため)ので「そもそも別々のメモリ」だった。いまは
     /// `SymphoniaDecoder::open_shared` に `Arc<Vec<u8>>` をそのまま渡しており、
@@ -525,7 +525,7 @@ impl Instance {
     /// (`Reconfigured`/`PermissionDenied`/`Backend`)はここでは何もしない**——
     /// `Reconfigured`(iOS のルート変化)は `mw-backend::ios_interruption` が既に
     /// 独自の経路(`pause()`→`play()`)で扱っており、ここで反応すると二重処理になる
-    /// (依頼書「🔴 iOS を壊さないこと」)。
+    /// (iOS の復帰経路を二重処理しないため)。
     pub fn note_stream_error(&self, reason: StreamErrorReason) {
         if reason == StreamErrorReason::DeviceUnavailable {
             self.reopen.mark_pending(mw_backend::host_time_ns());
@@ -545,7 +545,7 @@ impl Instance {
     }
 
     /// 直近の `mw_bus_set_volume`/`mw_bus_fade` が設定した目標音量を読む
-    /// (`mw_bus_get_volume` の実体。R38 調査用に追加、2026-08-31)。
+    /// (`mw_bus_get_volume` の実体。無音化の診断に使う)。
     ///
     /// <b>ここで返るのは「最後に指定された目標値」であり、音声スレッドのランプが
     /// 実際に収束済みの瞬間値ではない</b>(`note_bus_volume` のドキュメント参照。
@@ -572,7 +572,7 @@ impl Instance {
     /// (元は `shutdown` 内に直接書かれていたが、下記 `Instance::begin_reopen` の
     /// 「段1」相当の処理が同じ手順を必要としていたためここへ切り出した経緯がある)。
     ///
-    /// 🔴 P3-11(2026-09-23)以降、再オープン(`begin_reopen`)自身はこのメソッドを
+    /// 🔴 P3-11 以降、再オープン(`begin_reopen`)自身はこのメソッドを
     /// 呼ばない——停止・join はロックを手放した「段2」(`crate::handle::
     /// run_reopen_worker`)がワーカースレッド上で直接行う(レジストリの `Mutex` を
     /// 握ったまま `join`(待ち時間に上限が無い)を行わないため)。`begin_reopen` は
@@ -596,7 +596,7 @@ impl Instance {
     /// その「段1」(`crate::handle::maybe_reopen` がレジストリの `Mutex` を握ったまま
     /// 呼ぶ)。
     ///
-    /// 🔴 **P3-11(2026-09-23)で3段構成へ分割した設計の入口。** 元の `attempt_reopen`
+    /// 🔴 **P3-11 で3段構成へ分割した設計の入口。** 元の `attempt_reopen`
     /// は「close → デコードスレッド2本 join(待ち時間に上限無し)→
     /// `Renderer::build_with_events` → `backend.open`(cpal のデバイスオープン。
     /// 数百 ms かかりうる)→ `SymphoniaDecoder::open_shared`(デコード probe)」を
@@ -672,7 +672,7 @@ impl Instance {
     ///   なので、無条件に有効なまま残る——追加の復元処理は不要。
     /// - **ループ設定**: `last_music_loop`/`last_bgm_loop` キャッシュから
     ///   `MusicSetLoop`/`BgmSetLoop` を再送する。
-    /// - **効果音の発音**: 復元しない(依頼書「捨ててよい」)。`VoicePool` は
+    /// - **効果音の発音**: 復元しない。`VoicePool` は
     ///   `Renderer::build_with_events` によって丸ごと新規生成されるため、鳴っていた
     ///   SE ボイスは失われる。理由: 発音は短命(初期構築仕様『§4.2』)で、かつ
     ///   「何が鳴っていたか」を再現するには発音時刻・残り再生位置まで追跡する
@@ -704,8 +704,7 @@ impl Instance {
     /// 状態のままになる(`self.backend` は単に「開いていない」状態、既存の
     /// `mw_get_output_latency_ns` 等は 0/既定値を返すだけでパニックしない)。
     ///
-    /// ## 結果の C# への通知(`docs/history/04-2026-08-31.md`「再オープンを諦めたことを
-    /// C# 側へ通知できるようにする」)
+    /// ## 結果の C# への通知(再オープンを諦めたことを C# 側へ通知する)
     ///
     /// 成功時・「諦めた」時のどちらも [`Instance::notify_reopen_outcome`] が
     /// `Event::AudioInterruptionEnded { recovered }`(既存のイベント種別を転用。
@@ -911,7 +910,7 @@ impl Instance {
     }
 }
 
-// --- P3-11(2026-09-23): 3段構成の再オープン ------------------------------------
+// --- P3-11: 3段構成の再オープン -----------------------------------------------
 //
 // `Instance::begin_reopen`(段1)/`run_reopen_worker`(段2)/`finalize_reopen_success`・
 // `finalize_reopen_failure`(段3)の3つに分割した経緯・全体設計は
@@ -1049,7 +1048,7 @@ fn run_reopen_worker(detached: ReopenDetached) {
 
     // 1) 現在のセッションを畳む。AAudio の切断は API 契約上すでに終端的
     //    (`ndk::audio::AudioError::Disconnected` のドキュメント。
-    //    `docs/history/03-2026-08-31.md` 参照)なので、明示的に close しなくても
+    //    `docs/history/` の調査記録参照)なので、明示的に close しなくても
     //    もう鳴っていない——ここでの close は状態を明示的に確定させる後始末に
     //    過ぎない。失敗してもベストエフォートで続行する。
     if let Err(err) = old_backend.close() {
@@ -1237,7 +1236,7 @@ fn finalize_reopen_failure(handle: u64, now_ns: u64) {
 
     instance.reopen.record_result(false, now_ns);
     if instance.reopen.is_exhausted() {
-        // 依頼書「無限リトライは禁止」: バックオフを使い切ったので、新しい切断
+        // 無限リトライは禁止: バックオフを使い切ったので、新しい切断
         // イベント(`note_stream_error`)が届くまで自動での再試行を止める
         // (`crate::reopen` モジュール doc 参照)。
         mw_backend::mw_log!(
@@ -1459,7 +1458,7 @@ pub fn shutdown(handle: u64) -> ShutdownOutcome {
             // 粒度の対象外とみなす(既存の `backend.close()` も内部でストリームの
             // 停止を同期的に待つ設計になっている)。
             //
-            // 🔴 P3-11(2026-09-23): 段2 の間にここへ来た場合、`decode_thread`/
+            // 🔴 P3-11: 段2 の間にここへ来た場合、`decode_thread`/
             // `bgm_decode_thread` は既に段1(`Instance::begin_reopen`)が `take()`
             // 済みで `None` なので、この呼び出し自体は(`Option::take` が no-op に
             // なるだけで)安全——旧デコードスレッドの実際の停止・join は段2
@@ -1482,7 +1481,7 @@ pub fn shutdown(handle: u64) -> ShutdownOutcome {
                 // 「再オープンに失敗したとき」参照)。
                 // 📌 この「失敗後は `CloseFailed`」は
                 // `tests::reopen_failure_is_recorded_and_eventually_gives_up` が
-                // 固定化している(2026-09-23。それまで未検証だった)。
+                // 固定化している。
                 Err(BackendError::NotOpen) if reopen_was_in_progress => ShutdownOutcome::Closed,
                 Err(_) => ShutdownOutcome::CloseFailed,
             }
@@ -1500,7 +1499,7 @@ pub fn shutdown(handle: u64) -> ShutdownOutcome {
 /// `instance.handle != handle`(無効ハンドル)・インスタンス未初期化の場合も静かに
 /// 何もしない(`with_instance`/`shutdown` と同じ「クラッシュしない」方針)。
 ///
-/// 🔴 **P3-11(2026-09-23): ここでレジストリの `Mutex` を握るのは「段1」の間だけ**
+/// 🔴 **P3-11: ここでレジストリの `Mutex` を握るのは「段1」の間だけ**
 /// (`Instance::begin_reopen` のドキュメント参照)。実際に重い処理(close→join→
 /// `Renderer::build_with_events`→`open`)を行う「段2」はロックを手放した後、
 /// 専用のワーカースレッド(`run_reopen_worker`)上で行う——この関数自身は段2の
@@ -1522,8 +1521,7 @@ pub fn shutdown(handle: u64) -> ShutdownOutcome {
 /// (`mw-backend::ios_interruption`、割り込み・ルート変化からの `pause()`→`play()`)が
 /// 既にあり、両者が同じ `Event::StreamError { reason: DeviceUnavailable }` に対して
 /// 競合しないようにするため。「どちらの経路を通るか」はこの `cfg` 1箇所だけで
-/// コンパイル時に決まる(実行時のヒューリスティックには一切頼らない——依頼書
-/// 「⚠️『どちらの経路を通るか』の判定を曖昧にしないこと」への回答)。
+/// コンパイル時に決まる(実行時のヒューリスティックには一切頼らない)。
 pub fn maybe_reopen(handle: u64) {
     // 安価な事前チェック(ロック不要)。既に段2が進行中なら、レジストリの
     // ロックすら取りに行かずに戻る(定常状態のコストを増やさないため)。
@@ -1589,7 +1587,7 @@ mod tests {
         assert!(with_instance(u64::MAX, |_| ()).is_none());
     }
 
-    // --- P3-11(2026-09-23): 内部再オープンの非同期化 -------------------------------
+    // --- P3-11: 内部再オープンの非同期化 ----------------------------------------
     //
     // ⚠️ ここに無いもの(実機が要る/この環境では検証できない):
     // - 段2(`run_reopen_worker`)が実際に走っている間、他の FFI 呼び出しが

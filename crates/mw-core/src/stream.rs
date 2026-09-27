@@ -577,7 +577,7 @@ mod tests {
 
     #[test]
     fn seek_does_not_leak_stale_pcm_even_when_the_ring_buffer_was_already_full() {
-        // 依頼書 §テスト 5 の核心: 「リングバッファに古いデータが溜まった状態でシークしても
+        // リングバッファに古いデータが溜まった状態でシークしても
         // 漏れない」ことを明示的に検証する。
         let (mut producer, mut source) = channel(small_config(5.0), TEST_SAMPLE_RATE);
         let mut decoder = FakeDecoder::new(None);
@@ -663,8 +663,7 @@ mod tests {
     }
 
     /// wav の実デコード(`SymphoniaDecoder`)と本モジュールを繋いだ end-to-end テスト
-    /// (依頼書のテスト要件1: 「wav をストリーミングデコードして、pump → read で
-    /// 元の PCM が順序どおり取り出せる」)。
+    /// wav をストリーミングデコードして、pump → read で元の PCM が順序どおり取り出せること。
     #[test]
     fn end_to_end_streams_a_real_wav_through_pump_and_read_in_order() {
         const SAMPLE_RATE: u32 = 48_000;
@@ -707,8 +706,8 @@ mod tests {
         }
     }
 
-    /// 依頼書のテスト要件5: 「既存の end-to-end(pump() → read())がレート不一致の
-    /// 素材でも通ること」。素材(44.1kHz)と出力(48kHz)のレートが異なっていても、
+    /// 既存の end-to-end(pump() → read())がレート不一致の素材でも通ること。素材(44.1kHz)
+    /// と出力(48kHz)のレートが異なっていても、
     /// `SymphoniaDecoder` 内部のリサンプル(`decode.rs`/`resample.rs`)が
     /// `pump`/`read` から見て完全に透明であることを確認する
     /// (`stream.rs` 自身はレート変換を一切知らない設計。モジュール doc 参照)。

@@ -114,8 +114,8 @@ impl MusicSchedule {
     /// 保留中の予約を無条件に破棄する(`Command::MusicPause`/`Command::MusicStop` から
     /// 呼ぶ)。
     ///
-    /// **ユーザー実機報告(2026-09-01)「ポーズしてすぐホームに行って、アプリに戻ると
-    /// 音が鳴り出した」の直接の修正。** 真因: リードイン中(予約済み・未再生)の
+    /// **リードイン中にポーズ・停止しても予約が残って発音される不具合の修正。** 真因:
+    /// リードイン中(予約済み・未再生)の
     /// 楽曲ボイスは `MusicState::Ready` のままであり、`MusicVoice::pause`/`stop` は
     /// `Playing` からの呼び出ししか受け付けない(`music.rs` 参照)ため、`Ready` 中に
     /// ポーズ/停止しても `MusicVoice` 側は無条件で no-op になる。予約(この構造体)は
@@ -421,8 +421,7 @@ impl Mixer {
             Command::StopVoice { voice_serial } => {
                 self.voices.stop(voice_serial, default_ramp);
                 // 既に発火して `voices` へ移った分はこれで止まるが、まだ発火していない
-                // 予約(`se_schedule`)は `voices` の外にあるため別途取り消す(依頼書
-                // 「症状」参照——キャリブレーション画面のキャンセルでメトロノームが
+                // 予約(`se_schedule`)は `voices` の外にあるため別途取り消す——キャリブレーション画面のキャンセルでメトロノームが
                 // 鳴り続ける退行の直接原因)。取り除いた `Arc<SoundData>` はここで
                 // drop せず回収キューへ回す(§5.3、`ScheduleQueue::remove_where` 参照)。
                 let reclaim = &mut self.reclaim;
@@ -446,7 +445,7 @@ impl Mixer {
             Command::StopVoicesUsingSound { sound_id } => {
                 self.voices.stop_all_using_sound(sound_id, default_ramp);
                 // `voices` 側だけでは不十分: `se_schedule` に残る同じ音源への未発火予約は
-                // 解放済み `SoundData` を後から鳴らそうとしてしまう(依頼書参照)。
+                // 解放済み `SoundData` を後から鳴らそうとしてしまう。
                 // ここでも取り除いた分は回収キュー経由でのみ解放する。
                 let reclaim = &mut self.reclaim;
                 self.se_schedule.remove_where(
@@ -488,8 +487,7 @@ impl Mixer {
                 // 生きたままの予約(`MusicSchedule`)を先に破棄してから `pause` する。
                 // `Ready`(予約済み・未再生)中の `pause` は `MusicVoice` 側では
                 // no-op になるため、予約を消さないと予約時刻到来時に無断で
-                // 鳴り出してしまう(`MusicSchedule::cancel` のドキュメント参照。
-                // ユーザー実機報告2026-09-01の直接の修正)。
+                // 鳴り出してしまう(`MusicSchedule::cancel` のドキュメント参照)。
                 self.music_schedule.cancel();
                 self.music_voice.pause();
             }
@@ -634,7 +632,7 @@ impl Mixer {
 
         // --- イベント通知(初期構築仕様『§4.6』, M2-6) ---
         // `MusicRenderOutcome` は M2-5 までに既に実装済みの戻り値をそのまま使う
-        // (新たな検知ロジックは作らない。依頼書のとおり)。
+        // (新たな検知ロジックは作らず、既存の戻り値とカウンタを使う)。
         if music_outcome.ended {
             self.events.push_realtime(Event::MusicEnded);
         }
@@ -924,7 +922,7 @@ mod tests {
 
     /// `Command::SetVoiceLoop` がコマンドキュー経由で `VoicePool::set_loop` まで正しく
     /// 配線されており、ループ境界をまたいで正しくサンプルが出ることを end-to-end で確認する
-    /// (依頼書のテスト要件。ボイスプール単体の検証は `voice.rs` を参照)。
+    /// (ボイスプール単体の検証は `voice.rs` を参照)。
     #[test]
     fn set_voice_loop_command_wraps_playback_at_the_loop_boundary() {
         let (mut mixer, sender, _reclaim, _music_producer, _music_clock, _events, _bgm) =
@@ -1285,7 +1283,7 @@ mod tests {
         }
     }
 
-    /// 依頼書のテスト要件2: 予約時刻を1サンプルずつずらしたとき、発音位置も1サンプルずつ
+    /// テスト要件2: 予約時刻を1サンプルずつずらしたとき、発音位置も1サンプルずつ
     /// ずれること(バッファ境界への丸めが起きていないことの直接証拠)。
     #[test]
     fn se_schedule_offset_advances_by_exactly_one_sample_per_sample_shift() {
@@ -1309,7 +1307,7 @@ mod tests {
         }
     }
 
-    /// 依頼書のテスト要件3: 過去の時刻を予約した場合は破棄せず、発見可能な最速の
+    /// テスト要件3: 過去の時刻を予約した場合は破棄せず、発見可能な最速の
     /// サンプル(このバッファの先頭)で即座に発音する(`schedule.rs` モジュール doc の
     /// 丸め方針と同じ判断: 「指定時刻以降で最短距離」を優先し、取りこぼさない)。
     #[test]
@@ -1366,7 +1364,7 @@ mod tests {
     // (キャリブレーション画面キャンセル後もメトロノームが鳴り続ける退行の修正)
     // =====================================================================
 
-    /// 依頼書のテスト要件1: 予約した SE を発火前に `StopVoice` すると鳴らない。
+    /// テスト要件1: 予約した SE を発火前に `StopVoice` すると鳴らない。
     #[test]
     fn stop_voice_cancels_an_unfired_scheduled_se() {
         let (mut mixer, sender, _reclaim, _mp, _mc, _events, _bgm) =
@@ -1391,7 +1389,7 @@ mod tests {
         );
     }
 
-    /// 依頼書のテスト要件2: 別の voice の予約は巻き添えで消えない。
+    /// テスト要件2: 別の voice の予約は巻き添えで消えない。
     #[test]
     fn stop_voice_does_not_cancel_a_different_voices_unfired_schedule() {
         let (mut mixer, sender, _reclaim, _mp, _mc, _events, _bgm) =
@@ -1416,7 +1414,7 @@ mod tests {
         );
     }
 
-    /// 依頼書のテスト要件3: 既に発火済みの voice への `StopVoice` が従来どおり効く
+    /// テスト要件3: 既に発火済みの voice への `StopVoice` が従来どおり効く
     /// (退行が無いこと——`se_schedule` 側の新しい削除ロジックが `voices.stop()` の
     /// 既存経路を壊していないことの直接確認)。
     #[test]
@@ -1446,7 +1444,7 @@ mod tests {
         );
     }
 
-    /// 依頼書のテスト要件4: `StopVoicesUsingSound` で、その音源の未発火予約も消える
+    /// テスト要件4: `StopVoicesUsingSound` で、その音源の未発火予約も消える
     /// (`mw_sound_release` が解放済み音源を後から鳴らしてしまう退行の修正)。
     #[test]
     fn stop_voices_using_sound_cancels_unfired_schedules_referencing_that_sound() {
@@ -1489,7 +1487,7 @@ mod tests {
         assert_eq!(mixer.se_schedule_len(), 0);
     }
 
-    /// 依頼書のテスト要件5: 削除後も昇順の不変条件が保たれ、`fire_due_se` の
+    /// テスト要件5: 削除後も昇順の不変条件が保たれ、`fire_due_se` の
     /// 「先頭が未来なら打ち切る」最適化が引き続き正しく動く(生き残った予約が
     /// 正しい順序・正しいオフセットで発火する)。
     #[test]
@@ -1674,8 +1672,7 @@ mod tests {
         );
     }
 
-    /// ユーザー実機報告(2026-09-01)「ポーズしてすぐホームに行って、アプリに戻ると
-    /// 音が鳴り出しました」の回帰テスト。
+    /// リードイン中にポーズしても予約発音が残らないことの回帰テスト。
     ///
     /// 実機ログでは `[MusicControl] Pause` が `songTime=-1.34`(リードイン中、曲は
     /// まだ始まっていない)の時点で発行されており、その後 `[MusicControl] Resume` は
@@ -1801,7 +1798,7 @@ mod tests {
     }
 
     /// `MusicPause` と同じ穴が `stop` 側にもないかの回帰テスト
-    /// (依頼書「stop() でも予約が残らないこと」)。`MusicVoice::stop` も `Ready`/
+    /// (停止しても予約が残らないこと)。`MusicVoice::stop` も `Ready`/
     /// `Loading` からは no-op(`music.rs` 参照)なので、`MusicSchedule::cancel` を
     /// 呼ばなければ `pause` と全く同じ経路で誤発火しうる。
     #[test]
@@ -1915,7 +1912,7 @@ mod tests {
     //
     // 破棄数・溢れ・部分ポーリングといった `EventQueue` 自体の汎用的な振る舞いは
     // `event.rs` のユニットテストで検証済み。ここでは「発生源から正しく積まれること」
-    // (依頼書のテスト要件1)——`Mixer::render` が既存の戻り値・カウンタから
+    // `Mixer::render` が既存の戻り値・カウンタから
     // 正しい種別・付随データでイベントを積んでいることに絞って検証する。
 
     fn drain_events(events: &EventQueue, max: usize) -> (Vec<Event>, u32) {
@@ -2374,7 +2371,7 @@ mod tests {
         );
     }
 
-    /// 依頼書のテスト要件4: `mw_music_state()` の実体になるクロックスナップショットが
+    /// テスト要件4: `mw_music_state()` の実体になるクロックスナップショットが
     /// Loading → Ready → Playing → Paused の4状態すべてを正しく反映すること。
     #[test]
     fn music_clock_snapshot_reflects_all_four_states_through_the_playback_lifecycle() {
@@ -2421,7 +2418,7 @@ mod tests {
         assert!(!snap_paused.is_playing);
     }
 
-    /// 依頼書のテスト要件5: seek だけでなく resume_at でも世代カウンタが進むこと
+    /// テスト要件5: seek だけでなく resume_at でも世代カウンタが進むこと
     /// (`render_bumps_generation_exactly_once_on_seek_discontinuity` の resume_at 版)。
     #[test]
     fn render_bumps_generation_on_resume_at_discontinuity() {
