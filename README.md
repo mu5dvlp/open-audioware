@@ -197,6 +197,58 @@ Makefile・コードのどちらもアーチ非依存に書いてあります。
 他プロセスと衝突しないよう `tools/with-unity-lock.sh` がロック(`/tmp/mgct-unity.lock`)を
 取得してから実行します。
 
+## ツール一覧
+
+このリポジトリが実際に使っているツール・ライブラリの一覧です。
+
+### 言語・ランタイム
+
+| ツール名 | 概要 |
+|---|---|
+| Rust | ミドルウェア本体の実装言語(edition 2024。`rust-toolchain.toml` で stable 1.98.0 に固定) |
+| Unity | UPM パッケージとしての利用側。`unity-sample/` での統合検証に 6000.4.1f1 を使用 |
+| .NET SDK | 生成バインディング(`NativeMethods.g.cs`)と手書き C# ラッパのコンパイル検査(`make csharp-check`)に使用。版は `.mise.toml` で管理 |
+
+### 主要クレート
+
+| ツール名 | 概要 |
+|---|---|
+| cpal | 出力デバイス抽象(`Backend` trait)の実装。OS のローレイテンシ音声 API を直接叩く |
+| symphonia | 楽曲ストリーミングのデコード(wav / ogg / vorbis) |
+| rubato | サンプルレート変換(リサンプリング) |
+| rtrb | ロックフリー SPSC リングバッファ。音声スレッドとのコマンド/回収/PCM 供給キューに使用 |
+| objc2 / objc2-avf-audio / objc2-foundation / block2 | iOS の AVAudioSession 設定と割り込み・バックグラウンド復帰の監視 |
+| mach2 | macOS / iOS / tvOS での高精度ホスト時刻取得 |
+| libc | Android / Linux での `CLOCK_MONOTONIC` 取得 |
+| jni / ndk-context | Android の AAudio(AudioManager)連携 |
+| csbindgen | Rust の FFI 境界から C# バインディング(`NativeMethods.g.cs`)を自動生成 |
+
+### ビルド・配布
+
+| ツール名 | 概要 |
+|---|---|
+| cargo-ndk | Android 向けクロスビルド(`arm64-v8a` の `.so` を生成) |
+| xcodebuild | iOS 向け `xcframework` の作成 |
+
+### 品質・テスト
+
+| ツール名 | 概要 |
+|---|---|
+| rustfmt / clippy | フォーマット・静的解析(`make lint`) |
+| cargo-deny | 依存ライセンス・脆弱性の検査(`deny.toml`) |
+| cargo-llvm-cov | テスト実行とカバレッジ計測を兼ねる(CI) |
+| Codecov | カバレッジレポートのアップロード・可視化 |
+
+### CI・自動化
+
+| ツール名 | 概要 |
+|---|---|
+| GitHub Actions | CI(fmt / clippy / deny / test / 各プラットフォームのビルド検証)と `release-upm`(タグ契機の UPM 配布)を実行 |
+| Swatinem/rust-cache | CI での cargo ビルドキャッシュ |
+| Dependabot | cargo / github-actions の依存更新監視(月次) |
+| gitleaks | 秘密情報のコミット検知(`mu5dvlp/ci-workflows` の共有ワークフロー経由) |
+| mise | .NET SDK 等、Rust 以外の開発ツールチェーンのバージョン管理(`.mise.toml`) |
+
 ## リリース手順(メンテナ向け)
 
 **タグを打つだけです。** ネイティブライブラリのビルドと配布用ブランチへの反映は
