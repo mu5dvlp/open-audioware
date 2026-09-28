@@ -12,15 +12,7 @@ crate-type = ["rlib"]
 
 [dependencies]
 # SPSC ロックフリーリングバッファは `mw-core::ring_buffer` に実装する。
-# 楽曲のストリーミングデコード(初期構築仕様 §4.7, M7)。wav(PCM)/ ogg vorbis のみを
-# 使うため default-features を切り、必要な feature だけを有効化する(依存ツリーを
-# 無用に太らせない。§7.1 の実装方針)。opus 等の将来コーデック追加は MU2 の判断を待つ。
-symphonia = { version = "0.6", default-features = false, features = [
-    "wav",
-    "ogg",
-    "vorbis",
-    "pcm",
-] }
+# 楽曲は `wav.rs` の自前 PCM パーサでストリーミングデコードする。
 # サンプルレート変換(初期構築仕様 §4.7, M2)。既定 feature(`fft_resampler` のみ)を
 # そのまま使う: 楽曲ストリーミングの `Fft` + `FixedSync::Both`(§7.1 の実装方針どおり依存を
 # 無用に太らせない範囲で、既に必要な feature と一致するため明示的な取捨選択は不要)、

@@ -14,6 +14,7 @@
 //! 呼ばれない — ここでのアロケーション(出力 PCM バッファ、リサンプル)は許容される。
 
 use std::fmt;
+use std::sync::Arc;
 
 use crate::format::CHANNELS;
 use crate::resample::{self, ResampleError};
@@ -185,111 +186,27 @@ const EQUAL_POWER_GAIN: f32 = std::f32::consts::FRAC_1_SQRT_2;
 /// `output_sample_rate` は出力(デバイス)側のサンプルレート。wav のサンプルレートと
 /// 一致しない場合はロード時に一括でリサンプルする(モジュール doc)。
 pub fn decode(bytes: &[u8], output_sample_rate: u32) -> Result<SoundData, WavError> {
-    let mut cursor = Cursor::new(bytes);
-
-    if cursor.remaining() < 12 {
-        return Err(WavError::Truncated);
-    }
-    let riff_magic = cursor.take(4).ok_or(WavError::Truncated)?;
-    if riff_magic != b"RIFF" {
-        return Err(WavError::NotRiff);
-    }
-    let _riff_size = cursor.read_u32_le().ok_or(WavError::Truncated)?;
-    let wave_magic = cursor.take(4).ok_or(WavError::Truncated)?;
-    if wave_magic != b"WAVE" {
-        return Err(WavError::NotWave);
-    }
-
-    let mut format_tag: Option<u16> = None;
-    let mut channels: Option<u16> = None;
-    let mut sample_rate: Option<u32> = None;
-    let mut bits_per_sample: Option<u16> = None;
-    let mut data: Option<&[u8]> = None;
-
-    // チャンクを順に走査する。未知のチャンクはサイズぶんスキップする
-    // (RIFF はチャンクを word(偶数バイト)境界に揃えるため、奇数サイズは 1 バイトのパディングを読み飛ばす)。
-    while cursor.remaining() >= 8 {
-        let chunk_id = cursor.take(4).ok_or(WavError::Truncated)?;
-        let chunk_size = cursor.read_u32_le().ok_or(WavError::Truncated)? as usize;
-        let chunk_body = cursor.take(chunk_size).ok_or(WavError::Truncated)?;
-
-        match chunk_id {
-            b"fmt " => {
-                let mut fmt_cursor = Cursor::new(chunk_body);
-                format_tag = Some(fmt_cursor.read_u16_le().ok_or(WavError::MissingFmtChunk)?);
-                channels = Some(fmt_cursor.read_u16_le().ok_or(WavError::MissingFmtChunk)?);
-                sample_rate = Some(fmt_cursor.read_u32_le().ok_or(WavError::MissingFmtChunk)?);
-                let _byte_rate = fmt_cursor.read_u32_le().ok_or(WavError::MissingFmtChunk)?;
-                let _block_align = fmt_cursor.read_u16_le().ok_or(WavError::MissingFmtChunk)?;
-                bits_per_sample = Some(fmt_cursor.read_u16_le().ok_or(WavError::MissingFmtChunk)?);
-            }
-            b"data" => {
-                data = Some(chunk_body);
-            }
-            _ => {
-                // 既知でないチャンク(LIST/fact 等)は読み飛ばす。
-            }
-        }
-
-        // word 境界パディング。
-        if chunk_size % 2 == 1 {
-            let _ = cursor.take(1);
-        }
-    }
-
-    let format_tag = format_tag.ok_or(WavError::MissingFmtChunk)?;
-    let channels = channels.ok_or(WavError::MissingFmtChunk)?;
-    let sample_rate = sample_rate.ok_or(WavError::MissingFmtChunk)?;
-    let bits_per_sample = bits_per_sample.ok_or(WavError::MissingFmtChunk)?;
-    let data = data.ok_or(WavError::MissingDataChunk)?;
-
-    // WAVE_FORMAT_PCM = 1 のみ対応。拡張フォーマット(0xFFFE 等)は M1 非対応。
-    if format_tag != 1 {
-        return Err(WavError::UnsupportedFormatTag(format_tag));
-    }
-    if bits_per_sample != 16 {
-        return Err(WavError::UnsupportedBitsPerSample(bits_per_sample));
-    }
-    if channels != 1 && channels != 2 {
-        return Err(WavError::UnsupportedChannelCount(channels));
-    }
-    if sample_rate == 0 {
-        return Err(WavError::InvalidSampleRate(sample_rate));
-    }
-
-    let bytes_per_sample = 2usize; // 16bit
-    let frame_size = bytes_per_sample * channels as usize;
-    // channels は上で 1/2 に検証済みのため frame_size は 0 にならないが、
-    // ゼロ除算の可能性を型の上でも消しておく(パニック経路禁止の規約 §5.3 とも整合)
-    let frames = data.len().checked_div(frame_size).unwrap_or(0);
-
-    let mut interleaved = Vec::with_capacity(frames * CHANNELS);
-    for frame_index in 0..frames {
-        let base = frame_index * frame_size;
-        if channels == 2 {
-            let l = read_i16_le(data, base).ok_or(WavError::Truncated)?;
-            let r = read_i16_le(data, base + bytes_per_sample).ok_or(WavError::Truncated)?;
-            interleaved.push(i16_to_f32(l));
-            interleaved.push(i16_to_f32(r));
-        } else {
-            let m = read_i16_le(data, base).ok_or(WavError::Truncated)?;
-            let sample = i16_to_f32(m) * EQUAL_POWER_GAIN;
-            interleaved.push(sample);
-            interleaved.push(sample);
-        }
-    }
+    let mut reader = WavStreamReader::open(bytes.to_vec())?;
+    let frames = reader.total_frames() as usize;
+    let mut interleaved = vec![0.0; frames * CHANNELS];
+    let decoded_frames = reader.read(&mut interleaved);
+    interleaved.truncate(decoded_frames * CHANNELS);
 
     // レートが一致する場合はリサンプラを構築すらしない。
-    if sample_rate == output_sample_rate {
+    if reader.sample_rate() == output_sample_rate {
         return Ok(SoundData {
-            sample_rate,
-            frames,
+            sample_rate: reader.sample_rate(),
+            frames: decoded_frames,
             interleaved,
         });
     }
-    let (resampled, resampled_frames) =
-        resample::resample_oneshot(&interleaved, frames, sample_rate, output_sample_rate)
-            .map_err(WavError::Resample)?;
+    let (resampled, resampled_frames) = resample::resample_oneshot(
+        &interleaved,
+        decoded_frames,
+        reader.sample_rate(),
+        output_sample_rate,
+    )
+    .map_err(WavError::Resample)?;
     Ok(SoundData {
         sample_rate: output_sample_rate,
         frames: resampled_frames,
@@ -307,6 +224,181 @@ fn read_i16_le(bytes: &[u8], offset: usize) -> Option<i16> {
     Some(i16::from_le_bytes([a, b]))
 }
 
+/// ヘッダ解析後の WAV 形式情報と data チャンクの位置。
+#[derive(Clone, Copy)]
+struct WavHeader {
+    channels: u16,
+    sample_rate: u32,
+    data_offset: usize,
+    data_len: usize,
+}
+
+/// WAV のヘッダを解析し、データ本体をコピーせずに位置だけを返す。
+fn parse_header(bytes: &[u8]) -> Result<WavHeader, WavError> {
+    let mut cursor = Cursor::new(bytes);
+
+    if cursor.remaining() < 12 {
+        return Err(WavError::Truncated);
+    }
+    if cursor.take(4).ok_or(WavError::Truncated)? != b"RIFF" {
+        return Err(WavError::NotRiff);
+    }
+    let _riff_size = cursor.read_u32_le().ok_or(WavError::Truncated)?;
+    if cursor.take(4).ok_or(WavError::Truncated)? != b"WAVE" {
+        return Err(WavError::NotWave);
+    }
+
+    let mut format_tag: Option<u16> = None;
+    let mut channels: Option<u16> = None;
+    let mut sample_rate: Option<u32> = None;
+    let mut bits_per_sample: Option<u16> = None;
+    let mut data: Option<(usize, usize)> = None;
+
+    // チャンクを順に走査する。未知のチャンクはサイズぶんスキップする
+    // (RIFF はチャンクを word(偶数バイト)境界に揃えるため、奇数サイズは 1 バイトの
+    // パディングを読み飛ばす)。
+    while cursor.remaining() >= 8 {
+        let chunk_id = cursor.take(4).ok_or(WavError::Truncated)?;
+        let chunk_size = cursor.read_u32_le().ok_or(WavError::Truncated)? as usize;
+        let chunk_offset = cursor.position();
+        let chunk_body = cursor.take(chunk_size).ok_or(WavError::Truncated)?;
+
+        match chunk_id {
+            b"fmt " => {
+                let mut fmt_cursor = Cursor::new(chunk_body);
+                format_tag = Some(fmt_cursor.read_u16_le().ok_or(WavError::MissingFmtChunk)?);
+                channels = Some(fmt_cursor.read_u16_le().ok_or(WavError::MissingFmtChunk)?);
+                sample_rate = Some(fmt_cursor.read_u32_le().ok_or(WavError::MissingFmtChunk)?);
+                let _byte_rate = fmt_cursor.read_u32_le().ok_or(WavError::MissingFmtChunk)?;
+                let _block_align = fmt_cursor.read_u16_le().ok_or(WavError::MissingFmtChunk)?;
+                bits_per_sample = Some(fmt_cursor.read_u16_le().ok_or(WavError::MissingFmtChunk)?);
+            }
+            b"data" => data = Some((chunk_offset, chunk_size)),
+            _ => {
+                // 既知でないチャンク(LIST/fact 等)は読み飛ばす。
+            }
+        }
+
+        if chunk_size % 2 == 1 {
+            let _ = cursor.take(1);
+        }
+    }
+
+    let format_tag = format_tag.ok_or(WavError::MissingFmtChunk)?;
+    let channels = channels.ok_or(WavError::MissingFmtChunk)?;
+    let sample_rate = sample_rate.ok_or(WavError::MissingFmtChunk)?;
+    let bits_per_sample = bits_per_sample.ok_or(WavError::MissingFmtChunk)?;
+    let (data_offset, data_len) = data.ok_or(WavError::MissingDataChunk)?;
+
+    // WAVE_FORMAT_PCM = 1 のみ対応。拡張フォーマット(0xFFFE 等)は M1 非対応。
+    if format_tag != 1 {
+        return Err(WavError::UnsupportedFormatTag(format_tag));
+    }
+    if bits_per_sample != 16 {
+        return Err(WavError::UnsupportedBitsPerSample(bits_per_sample));
+    }
+    if channels != 1 && channels != 2 {
+        return Err(WavError::UnsupportedChannelCount(channels));
+    }
+    if sample_rate == 0 {
+        return Err(WavError::InvalidSampleRate(sample_rate));
+    }
+
+    Ok(WavHeader {
+        channels,
+        sample_rate,
+        data_offset,
+        data_len,
+    })
+}
+
+/// ヘッダ解析済みの WAV ストリーミングリーダー。
+///
+/// バイト列を所有するが、data チャンクの PCM 全体を f32 へ展開することはせず、
+/// `read` の要求範囲だけを変換する。SE の一括ロードもこのリーダーを最後まで読む
+/// ことで同じヘッダ解析・サンプル変換を共有する。
+pub(crate) struct WavStreamReader {
+    bytes: Arc<Vec<u8>>,
+    channels: u16,
+    sample_rate: u32,
+    data_offset: usize,
+    frame_size: usize,
+    total_frames: u64,
+    position: u64,
+}
+
+impl WavStreamReader {
+    pub(crate) fn open(bytes: Vec<u8>) -> Result<Self, WavError> {
+        Self::open_shared(Arc::new(bytes))
+    }
+
+    pub(crate) fn open_shared(bytes: Arc<Vec<u8>>) -> Result<Self, WavError> {
+        let header = parse_header(&bytes)?;
+        let bytes_per_sample = 2usize;
+        let frame_size = bytes_per_sample * header.channels as usize;
+        let frames = header.data_len.checked_div(frame_size).unwrap_or(0);
+        Ok(Self {
+            bytes,
+            channels: header.channels,
+            sample_rate: header.sample_rate,
+            data_offset: header.data_offset,
+            frame_size,
+            total_frames: frames as u64,
+            position: 0,
+        })
+    }
+
+    pub(crate) fn read(&mut self, out: &mut [f32]) -> usize {
+        let want_frames = out.len() / CHANNELS;
+        let remaining = self.total_frames.saturating_sub(self.position) as usize;
+        let frames = want_frames.min(remaining);
+        let data = self.bytes.as_slice();
+        let mut decoded_frames = 0;
+
+        for frame in 0..frames {
+            let Some(frame_offset) = (self.position as usize)
+                .checked_add(frame)
+                .and_then(|index| index.checked_mul(self.frame_size))
+                .and_then(|offset| self.data_offset.checked_add(offset))
+            else {
+                break;
+            };
+            if self.channels == 2 {
+                let Some(left) = read_i16_le(data, frame_offset) else {
+                    break;
+                };
+                let Some(right) = read_i16_le(data, frame_offset + 2) else {
+                    break;
+                };
+                out[frame * CHANNELS] = i16_to_f32(left);
+                out[frame * CHANNELS + 1] = i16_to_f32(right);
+            } else {
+                let Some(mono) = read_i16_le(data, frame_offset) else {
+                    break;
+                };
+                let sample = i16_to_f32(mono) * EQUAL_POWER_GAIN;
+                out[frame * CHANNELS] = sample;
+                out[frame * CHANNELS + 1] = sample;
+            }
+            decoded_frames += 1;
+        }
+        self.position += decoded_frames as u64;
+        decoded_frames
+    }
+
+    pub(crate) fn seek(&mut self, frame: u64) {
+        self.position = frame.min(self.total_frames);
+    }
+
+    pub(crate) fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    pub(crate) fn total_frames(&self) -> u64 {
+        self.total_frames
+    }
+}
+
 /// 極小のバイトカーソル(自前実装。外部クレート非依存)。
 struct Cursor<'a> {
     bytes: &'a [u8],
@@ -322,12 +414,17 @@ impl<'a> Cursor<'a> {
         self.bytes.len().saturating_sub(self.pos)
     }
 
+    fn position(&self) -> usize {
+        self.pos
+    }
+
     fn take(&mut self, len: usize) -> Option<&'a [u8]> {
         if self.remaining() < len {
             return None;
         }
-        let slice = self.bytes.get(self.pos..self.pos + len)?;
-        self.pos += len;
+        let end = self.pos.checked_add(len)?;
+        let slice = self.bytes.get(self.pos..end)?;
+        self.pos = end;
         Some(slice)
     }
 

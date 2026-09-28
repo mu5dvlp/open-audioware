@@ -49,7 +49,7 @@ pub enum MwResult {
 
 // --- P1-6: `mw_core` のデコードエラー型からの変換 ----------------------------------
 //
-// `mw_core::wav::decode`(SE ロード, `load_se`)と `mw_core::SymphoniaDecoder::open`
+// `mw_core::wav::decode`(SE ロード, `load_se`)と `mw_core::WavDecoder::open`
 // (楽曲/BGM ロード, `mw_music_set`/`mw_bgm_set` の共有実体 `set_music_track`)は
 // エラーの種類こそ違う型(`WavError`/`DecodeError`)だが、どちらも「同じ理由付けで
 // 数個の `MwResult` エラーコードへ落とし込むだけ」の match だった(呼び出し側3箇所で
@@ -78,10 +78,9 @@ impl From<mw_core::DecodeError> for MwResult {
         match err {
             mw_core::DecodeError::InvalidSampleRate(_) => MwResult::ErrUnsupportedSampleRate,
             mw_core::DecodeError::UnsupportedChannelCount(_) => MwResult::ErrUnsupportedFormat,
-            mw_core::DecodeError::Symphonia(_)
+            mw_core::DecodeError::Wav(_)
             | mw_core::DecodeError::NoAudioTrack
-            | mw_core::DecodeError::Resample(_)
-            | mw_core::DecodeError::ResetRequired => MwResult::ErrDecodeFailed,
+            | mw_core::DecodeError::Resample(_) => MwResult::ErrDecodeFailed,
         }
     }
 }
@@ -166,7 +165,7 @@ mod tests {
 
     #[test]
     fn decode_error_maps_to_the_documented_result_code() {
-        let cases: [(mw_core::DecodeError, MwResult); 6] = [
+        let cases: [(mw_core::DecodeError, MwResult); 5] = [
             (
                 mw_core::DecodeError::InvalidSampleRate(0),
                 MwResult::ErrUnsupportedSampleRate,
@@ -176,7 +175,7 @@ mod tests {
                 MwResult::ErrUnsupportedFormat,
             ),
             (
-                mw_core::DecodeError::Symphonia("x".into()),
+                mw_core::DecodeError::Wav(mw_core::WavError::NotRiff),
                 MwResult::ErrDecodeFailed,
             ),
             (
@@ -185,10 +184,6 @@ mod tests {
             ),
             (
                 mw_core::DecodeError::Resample(mw_core::ResampleError::Processing("x".into())),
-                MwResult::ErrDecodeFailed,
-            ),
-            (
-                mw_core::DecodeError::ResetRequired,
                 MwResult::ErrDecodeFailed,
             ),
         ];

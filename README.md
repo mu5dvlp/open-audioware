@@ -119,8 +119,9 @@ OSI が承認した正式なオープンソースライセンスです。**表�
 [`THIRD-PARTY-LICENSES.md`](./THIRD-PARTY-LICENSES.md) を自動生成してあるので、
 **これをそのままゲームのライセンス表示画面に載せれば足ります。**
 
-- 依存クレート **107 件**。ほとんどは MIT / Apache-2.0 / BSD 系で、**表記のみ**
-- うち **9 件は MPL-2.0**(音声デコーダの `symphonia` 一族と `audio_thread_priority`)。
+- 配布対象3ターゲットの実行時依存 **47 件**。うち **39 件が表記要**で、ほとんどは MIT /
+  Apache-2.0 / BSD 系です。
+- うち **1 件は MPL-2.0**(`audio_thread_priority`)。
   こちらは**表記に加えてソースの入手方法の告知**が必要です。生成物には URL 一覧が入っています。
 - 🔴 **MPL-2.0 でも、あなたのゲームのソースを公開する義務は生じません。**
   ファイル単位のコピーレフトで、**MPL のファイルそのものを改変したとき**にだけ、
@@ -214,7 +215,7 @@ Makefile・コードのどちらもアーチ非依存に書いてあります。
 | ツール名 | 概要 |
 |---|---|
 | cpal | 出力デバイス抽象(`Backend` trait)の実装。OS のローレイテンシ音声 API を直接叩く |
-| symphonia | 楽曲ストリーミングのデコード(wav / ogg / vorbis) |
+| mw-core 内製 WAV デコーダ | 楽曲ストリーミングのデコード(wav PCM) |
 | rubato | サンプルレート変換(リサンプリング) |
 | mw-core 内製 ring_buffer | ロックフリー SPSC リングバッファ。音声スレッドとのコマンド/回収/PCM 供給キューに使用 |
 | objc2 / objc2-avf-audio / objc2-foundation / block2 | iOS の AVAudioSession 設定と割り込み・バックグラウンド復帰の監視 |

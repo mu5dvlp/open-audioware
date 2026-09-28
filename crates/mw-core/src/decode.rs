@@ -1,6 +1,6 @@
 //! 楽曲のストリーミングデコード(初期構築仕様『§4.7 デコードとリサンプリング』, M7/M2)。
 //!
-//! Symphonia を使い、メモリ上のバイト列(wav / ogg vorbis)を同期的にデコードする。
+//! メモリ上の WAV バイト列を同期的にストリーミングデコードする。
 //! **ファイル IO は一切持ち込まない**(入力は常にメモリ上のバイト列)。出力は
 //! `crate::format::CHANNELS` に固定した f32 インターリーブ・ステレオで、モノラル素材は
 //! `wav.rs` と同じ等パワー(`1/√2`)で両ch展開する。
@@ -11,7 +11,7 @@
 //!
 //! # リサンプル(初期構築仕様『§4.7』, `resample.rs`)
 //!
-//! 出力(デバイス)サンプルレートと素材のレートが一致しない場合、[`SymphoniaDecoder`] は
+//! 出力(デバイス)サンプルレートと素材のレートが一致しない場合、[`WavDecoder`] は
 //! `resample.rs::StreamResampler`(rubato `Fft` ベース)で自動的に変換する。
 //! **レートが一致する場合はリサンプラを構築すらしない**(`resampler: Option<_>` が
 //! `None` のままバイパスする。レート一致時に無用な計算・レイテンシを
@@ -25,48 +25,24 @@
 //!
 //! # シークとサンプル精度
 //!
-//! Symphonia の `FormatReader::seek` はコンテナのパケット境界までしか位置決めできない
-//! (初期構築仕様『§4.7』: 「ogg のシークはサンプル精度でない」)。wav の PCM は
-//! パケット境界がバイト精度と一致するため実質サンプル精度になるが、ogg vorbis は
-//! パケット(vorbis のオーディオパケット)境界までしか戻せないことがある。
-//! [`NativeReader::seek`] はシーク後に `actual_ts`(実際に着地した位置)と要求位置の差分だけ
-//! デコード結果を読み捨て、常にサンプル境界ちょうどへ合わせ込む。この読み捨てはコーデックに
-//! よらず同じコードパスを通るため、wav でも常に検証できる(テストでこの精度を固定化する)。
-//! `SymphoniaDecoder::seek` が受け取るのは出力レート基準のフレームなので、素材レートへ
+//! WAV の PCM はフレームがバイト境界と一致するため、[`NativeReader::seek`] は
+//! データオフセットをフレーム単位で直接変更し、サンプル精度で着地する。
+//! `WavDecoder::seek` が受け取るのは出力レート基準のフレームなので、素材レートへ
 //! 変換してから `NativeReader::seek` に渡す。
 
 use std::fmt;
-use std::io::Cursor;
 use std::sync::Arc;
-
-use symphonia::core::codecs::CodecParameters;
-use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions, CODEC_ID_NULL_AUDIO};
-use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::probe::Hint;
-use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
-use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::MetadataOptions;
 
 use crate::format::CHANNELS;
 use crate::resample::{self, ResampleError, StreamResampler};
-
-/// モノ→ステレオ展開の等パワー係数(1/√2)。`wav.rs` の `EQUAL_POWER_GAIN` と同じ根拠
-/// (両chへ同一係数を掛けることで合成パワーが元のモノラル信号のパワーと一致する。
-/// 初期構築仕様 M12)。モジュールを跨いで公開する意味は薄いため、ここでも独立して定義する。
-const EQUAL_POWER_GAIN: f32 = std::f32::consts::FRAC_1_SQRT_2;
-
-/// パケット単位のデコード結果を受け取るスクラッチの初期容量(フレーム数)。
-/// 実際のパケットがこれより大きければその場で確保し直すため、
-/// この値は「たいていのケースで再確保が起きない」程度の目安でしかない。
-const INITIAL_SAMPLE_BUF_FRAMES: u64 = 4096;
+use crate::wav::{WavError, WavStreamReader};
 
 /// デコードで発生しうるエラー(`wav.rs::WavError` と同じ設計方針: 具体的なバリアントで返す)。
 #[derive(Debug)]
 pub enum DecodeError {
-    /// フォーマット検出・デコーダ生成・パケット読み出し等、Symphonia 内部で発生したエラー。
-    /// Symphonia のエラー型はそのままでは `Clone`/`PartialEq` にできないため文字列化して保持する。
-    Symphonia(String),
-    /// 対応コーデック(wav / ogg vorbis)の音声トラックが見つからなかった。
+    /// WAV ヘッダ解析またはデータ読み出しで発生したエラー。
+    Wav(WavError),
+    /// 音声トラックを持たない入力。ストリーミング供給側のエラー契約を維持する。
     NoAudioTrack,
     /// モノラル・ステレオ以外のチャンネル数。
     UnsupportedChannelCount(usize),
@@ -75,18 +51,13 @@ pub enum DecodeError {
     /// リサンプラの構築・変換処理そのものが失敗した(`resample.rs` 参照。
     /// 通常のサンプルレートの組み合わせでは起こらない異常系)。
     Resample(ResampleError),
-    /// トラック構成の再検出が必要になるケース(chained ogg 物理ストリーム等)。
-    /// 初期構築仕様『§4.7』のスコープ外のため非対応として扱う。
-    ResetRequired,
 }
 
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DecodeError::Symphonia(msg) => write!(f, "symphonia decode error: {msg}"),
-            DecodeError::NoAudioTrack => {
-                write!(f, "no supported audio track found (wav / ogg vorbis only)")
-            }
+            DecodeError::Wav(err) => write!(f, "wav decode error: {err}"),
+            DecodeError::NoAudioTrack => write!(f, "no audio track found"),
             DecodeError::UnsupportedChannelCount(channels) => write!(
                 f,
                 "unsupported channel count {channels} (only mono or stereo is supported)"
@@ -95,11 +66,6 @@ impl fmt::Display for DecodeError {
                 write!(f, "invalid source sample rate {rate} Hz (must be > 0)")
             }
             DecodeError::Resample(err) => write!(f, "{err}"),
-            DecodeError::ResetRequired => write!(
-                f,
-                "stream requires a decoder reset (e.g. chained ogg physical streams), \
-                 which is not supported yet"
-            ),
         }
     }
 }
@@ -114,25 +80,23 @@ mod display_tests {
     /// それ以外はワイルドカード無しで列挙し、バリアント追加時に更新を要求する。
     fn describe(error: &DecodeError) -> Option<&'static str> {
         match error {
-            DecodeError::Symphonia(_) => Some("symphonia decode error"),
-            DecodeError::NoAudioTrack => Some("no supported audio track"),
+            DecodeError::Wav(_) => Some("wav decode error"),
+            DecodeError::NoAudioTrack => Some("no audio track"),
             DecodeError::UnsupportedChannelCount(_) => Some("unsupported channel count"),
             DecodeError::InvalidSampleRate(_) => Some("invalid source sample rate"),
             DecodeError::Resample(_) => None,
-            DecodeError::ResetRequired => Some("stream requires a decoder reset"),
         }
     }
 
     #[test]
     fn decode_error_display_identifies_every_outer_variant_without_duplicates() {
         let errors = [
-            DecodeError::Symphonia("malformed packet".into()),
+            DecodeError::Wav(WavError::NotRiff),
             DecodeError::NoAudioTrack,
             DecodeError::UnsupportedChannelCount(5),
             DecodeError::InvalidSampleRate(0),
             // This variant delegates its complete message to the inner error.
             DecodeError::Resample(ResampleError::Construction("zero rate".into())),
-            DecodeError::ResetRequired,
         ];
 
         let outer_messages: Vec<String> = errors
@@ -163,12 +127,11 @@ mod display_tests {
         // —— 添字だと配列の順番を変えたときに別のバリアントを検査して偶然通る)。
         for error in &errors {
             let expected_argument = match error {
-                DecodeError::Symphonia(message) => Some(message.clone()),
+                DecodeError::Wav(_) => None,
+                DecodeError::NoAudioTrack => None,
                 DecodeError::UnsupportedChannelCount(channels) => Some(channels.to_string()),
                 DecodeError::InvalidSampleRate(rate) => Some(rate.to_string()),
-                DecodeError::NoAudioTrack
-                | DecodeError::ResetRequired
-                | DecodeError::Resample(_) => None,
+                DecodeError::Resample(_) => None,
             };
             let Some(argument) = expected_argument else {
                 continue;
@@ -191,48 +154,28 @@ mod display_tests {
     }
 }
 
-impl From<SymphoniaError> for DecodeError {
-    fn from(err: SymphoniaError) -> Self {
+impl From<WavError> for DecodeError {
+    fn from(err: WavError) -> Self {
         match err {
-            SymphoniaError::ResetRequired => DecodeError::ResetRequired,
-            other => DecodeError::Symphonia(other.to_string()),
-        }
-    }
-}
-
-#[cfg(test)]
-mod conversion_tests {
-    use super::*;
-
-    #[test]
-    fn symphonia_reset_required_keeps_its_dedicated_error_variant() {
-        assert!(matches!(
-            DecodeError::from(SymphoniaError::ResetRequired),
-            DecodeError::ResetRequired
-        ));
-    }
-
-    #[test]
-    fn other_symphonia_errors_are_retained_as_detailed_messages() {
-        let error = DecodeError::from(SymphoniaError::DecodeError("malformed packet"));
-        match error {
-            DecodeError::Symphonia(message) => {
-                assert!(message.contains("malformed packet"));
+            WavError::InvalidSampleRate(rate) => DecodeError::InvalidSampleRate(rate),
+            WavError::UnsupportedChannelCount(channels) => {
+                DecodeError::UnsupportedChannelCount(channels as usize)
             }
-            other => panic!("non-reset Symphonia errors must be wrapped, got {other:?}"),
+            WavError::Resample(err) => DecodeError::Resample(err),
+            other => DecodeError::Wav(other),
         }
     }
 }
 
 /// `stream.rs::MusicStreamProducer::pump` に渡す、同期デコーダの最小契約。
 ///
-/// 本番実装は [`SymphoniaDecoder`]。テストではこの trait を満たすフェイクを使うことで、
+/// 本番実装は [`WavDecoder`]。テストではこの trait を満たすフェイクを使うことで、
 /// リングバッファ・エポック調停のロジックを実デコードから切り離して検証できる
 /// (`music.rs::tests::FakeSource` と同じ考え方)。
 ///
 /// **フレーム単位は常に出力レート基準**(初期構築仕様『§4.7』設計判断3)。
 /// 実装がレート変換を行う場合、`read`/`seek`/`total_frames` の外側にそれを一切見せない
-/// こと(`SymphoniaDecoder` 参照)。
+/// こと(`WavDecoder` 参照)。
 pub trait MusicDecoder {
     /// インターリーブ f32 ステレオへ書けるだけ書いて、実際に書いたフレーム数を返す。
     /// 要求より少ない値(0 を含む)は EOF を意味する。デコードエラーは `Err` で返す。
@@ -244,186 +187,31 @@ pub trait MusicDecoder {
     fn total_frames(&self) -> Option<u64>;
 }
 
-/// Symphonia の生デコード結果(素材ネイティブレート)だけを扱う内部リーダー。
+/// WAV の生デコード結果(素材ネイティブレート)だけを扱う内部リーダー。
 ///
-/// [`SymphoniaDecoder`] とフィールドを分けてあるのは、`SymphoniaDecoder::refill_resampled_pending`
+/// [`WavDecoder`] とフィールドを分けてあるのは、`WavDecoder::refill_resampled_pending`
 /// が「素材レートで読み出す(`self.native.read(..)`)」のと「リサンプル結果を積む
 /// (`self.resampled_pending`)」のを同じ呼び出しの中で行う必要があり、両方とも
-/// `SymphoniaDecoder` の別フィールドとして持たせないと借用が衝突するため
+/// `WavDecoder` の別フィールドとして持たせないと借用が衝突するため
 /// ([`grow_sample_buf`] を自由関数にしてある理由と同じ。`self.native.read(&mut self.scratch)`
 /// のように**別フィールド越しの呼び出し**にすれば、借用チェッカーは互いに素なフィールドの
 /// 同時借用として認めてくれる)。
 struct NativeReader {
-    format: Box<dyn FormatReader>,
-    decoder: Box<dyn AudioDecoder>,
-    track_id: u32,
-    /// 直近デコードしたパケットの生サンプル(ネイティブチャンネル数)を一時的に受ける
-    /// スクラッチバッファ。パケットごとに容量不足なら確保し直す。
-    sample_buf: Vec<f32>,
-    /// ステレオ展開済みで、まだ `read` に渡していない残りサンプル(インターリーブ)。
-    pending: Vec<f32>,
-    /// `pending` の読み出し位置(サンプル単位)。
-    pending_pos: usize,
-    /// デコーダがコンテナ末尾に達したか。`seek` でクリアされる。
-    eof: bool,
+    wav: WavStreamReader,
 }
 
 impl NativeReader {
-    /// `pending` に残っているフレーム数。
-    fn pending_frames(&self) -> usize {
-        (self.pending.len() - self.pending_pos) / CHANNELS
-    }
-
-    /// 次のパケットをデコードし、ステレオ展開して `pending` へ積む。
-    /// `Ok(true)`: 新しいデータを積んだ。`Ok(false)`: コンテナ末尾(EOF)。
-    fn decode_next_packet_into_pending(&mut self) -> Result<bool, DecodeError> {
-        loop {
-            let packet = match self.format.next_packet() {
-                Ok(Some(packet)) => packet,
-                Ok(None) => return Ok(false),
-                Err(SymphoniaError::IoError(e))
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-                {
-                    return Ok(false);
-                }
-                Err(e) => return Err(DecodeError::from(e)),
-            };
-
-            if packet.track_id != self.track_id {
-                continue;
-            }
-
-            match self.decoder.decode(&packet) {
-                Ok(audio_buf) => {
-                    let spec = audio_buf.spec().clone();
-                    let frames = audio_buf.frames();
-                    if frames == 0 {
-                        // 空パケット(理論上稀)。次のパケットへ進む。
-                        continue;
-                    }
-
-                    // `self.decoder` を借用したままの `audio_buf` が生きている間は
-                    // `&mut self` を取るメソッドを呼べない(borrow checker)。
-                    // そのため容量確保はフィールド単位の関数呼び出しに留める。
-                    let native_channels = spec.channels().count();
-                    let native_samples = frames * native_channels;
-                    if self.sample_buf.len() < native_samples {
-                        self.sample_buf.resize(native_samples, 0.0);
-                    }
-                    audio_buf.copy_to_slice_interleaved(&mut self.sample_buf[..native_samples]);
-                    let native = &self.sample_buf[..native_samples];
-
-                    self.pending.clear();
-                    self.pending_pos = 0;
-                    match native_channels {
-                        1 => {
-                            self.pending.reserve(frames * CHANNELS);
-                            for &s in native {
-                                let v = s * EQUAL_POWER_GAIN;
-                                self.pending.push(v);
-                                self.pending.push(v);
-                            }
-                        }
-                        2 => {
-                            self.pending.extend_from_slice(native);
-                        }
-                        other => return Err(DecodeError::UnsupportedChannelCount(other)),
-                    }
-                    return Ok(true);
-                }
-                // getting-started.rs の例に準拠: パケット単位の回復可能なエラーはスキップする。
-                Err(SymphoniaError::IoError(_)) | Err(SymphoniaError::DecodeError(_)) => {
-                    continue;
-                }
-                Err(e) => return Err(DecodeError::from(e)),
-            }
-        }
-    }
-
-    /// `n` フレームぶんデコード結果を読み捨てる(シーク後のサンプル境界合わせ込み用)。
-    fn discard_frames(&mut self, mut n: u64) -> Result<(), DecodeError> {
-        while n > 0 {
-            let avail = self.pending_frames() as u64;
-            if avail > 0 {
-                let take = avail.min(n);
-                self.pending_pos += (take as usize) * CHANNELS;
-                n -= take;
-                continue;
-            }
-            if self.eof {
-                break;
-            }
-            if !self.decode_next_packet_into_pending()? {
-                self.eof = true;
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    /// 素材ネイティブレートで `out` へ書けるだけ書く。要求より少なければ EOF を意味する。
     fn read(&mut self, out: &mut [f32]) -> Result<usize, DecodeError> {
-        let want_frames = out.len() / CHANNELS;
-        let mut frames_written = 0usize;
-
-        while frames_written < want_frames {
-            let avail = self.pending_frames();
-            if avail > 0 {
-                let take = avail.min(want_frames - frames_written);
-                let src_start = self.pending_pos;
-                let src_end = src_start + take * CHANNELS;
-                let dst_start = frames_written * CHANNELS;
-                let dst_end = dst_start + take * CHANNELS;
-                out[dst_start..dst_end].copy_from_slice(&self.pending[src_start..src_end]);
-                self.pending_pos = src_end;
-                frames_written += take;
-                continue;
-            }
-
-            if self.eof {
-                break;
-            }
-            if !self.decode_next_packet_into_pending()? {
-                self.eof = true;
-                break;
-            }
-        }
-
-        Ok(frames_written)
+        Ok(self.wav.read(out))
     }
 
-    /// 素材ネイティブレート基準のフレームへシークする。
     fn seek(&mut self, frame: u64) -> Result<(), DecodeError> {
-        let seeked = self
-            .format
-            .seek(
-                SeekMode::Accurate,
-                SeekTo::Timestamp {
-                    ts: symphonia::core::units::Timestamp::new(
-                        i64::try_from(frame).unwrap_or(i64::MAX),
-                    ),
-                    track_id: self.track_id,
-                },
-            )
-            .map_err(DecodeError::from)?;
-
-        // シークするとデコーダの内部状態(前後のパケットに依存する予測等)が無効になるため、
-        // Symphonia の契約どおりリセットする(`Decoder::reset` のドキュメント参照)。
-        self.decoder.reset();
-        self.pending.clear();
-        self.pending_pos = 0;
-        self.eof = false;
-
-        // Accurate モードでも `actual_ts` は要求位置以下にしかならない(コンテナの
-        // パケット境界までしか位置決めできないため。モジュール doc 参照)。差分だけ
-        // デコード結果を読み捨てて、常にサンプル境界ちょうどへ合わせ込む。
-        let actual_ts = seeked.actual_ts.get().max(0) as u64;
-        let discard = frame.saturating_sub(actual_ts);
-        self.discard_frames(discard)
+        self.wav.seek(frame);
+        Ok(())
     }
 }
 
-/// Symphonia ベースの同期デコーダ(wav / ogg vorbis)。
+/// WAV ベースの同期デコーダ。
 ///
 /// 入力はメモリ上のバイト列(`Vec<u8>`)を所有する形で受け取る(実行時のファイル IO を
 /// 持ち込まない。初期構築仕様『§4.7』)。スレッドや `pump` の概念はここでは扱わない
@@ -432,7 +220,7 @@ impl NativeReader {
 /// 素材レートと `output_sample_rate` が一致しない場合は `resampler` を通してから
 /// [`MusicDecoder::read`] が返す(モジュール doc 参照)。**トレイト境界の外(`read`/`seek`/
 /// `total_frames`)では常に出力レート基準のフレーム数**として振る舞う。
-pub struct SymphoniaDecoder {
+pub struct WavDecoder {
     native: NativeReader,
     source_sample_rate: u32,
     output_sample_rate: u32,
@@ -457,18 +245,10 @@ pub struct SymphoniaDecoder {
     position_frames: u64,
 }
 
-/// `Arc<Vec<u8>>` を Symphonia の `MediaSource`(= `Cursor<T> where T: AsRef<[u8]>`)へ
-/// そのまま載せるための薄いラッパ。
+/// `Arc<Vec<u8>>` をデコーダと共有するための薄いラッパ。
 ///
-/// 🔴 **これが無いと、曲を切り替えるたびに圧縮バイト列を丸ごと複製することになる。**
-/// `Arc<T>` が実装しているのは `AsRef<T>`(= `AsRef<Vec<u8>>`)であって `AsRef<[u8]>` では
-/// ないため、`Cursor<Arc<Vec<u8>>>` は `MediaSource` を満たさない。newtype を1枚挟んで
-/// `AsRef<[u8]>` を自分で実装するのが、余分なコピーを増やさない唯一の方法
-/// (`Arc<[u8]>` へ持ち替える案もあるが、`Vec<u8>` → `Arc<[u8]>` の変換自体が1回コピーで、
-/// 呼び出し側〔`mw-ffi` の音源ストレージ〕の型も一緒に変える必要がある)。
-///
-/// 実害の規模: 数十MB の ogg を持つ曲で、切り替えのたびにゲームスレッドで
-/// 数十MB の `memcpy` + ピークメモリ倍(REFACTOR-PLAN P3-13)。
+/// 曲を切り替えるたびに音源バイト列を複製しないため、デコーダはこの共有所有権を
+/// そのまま保持する。
 #[derive(Debug, Clone)]
 pub struct SharedBytes(Arc<Vec<u8>>);
 
@@ -497,87 +277,29 @@ impl From<Vec<u8>> for SharedBytes {
     }
 }
 
-impl SymphoniaDecoder {
+impl WavDecoder {
     /// メモリ上のバイト列を開き、デコード可能かを確認する。
     ///
     /// `output_sample_rate` は出力(デバイス)側のサンプルレート。素材のレートと一致しない
     /// 場合は内部でリサンプラ(`resample.rs::StreamResampler`)を構築する(モジュール doc)。
     ///
-    /// 📌 **既に `Arc<Vec<u8>>` を持っているなら [`SymphoniaDecoder::open_shared`] を使うこと**
+    /// 📌 **既に `Arc<Vec<u8>>` を持っているなら [`WavDecoder::open_shared`] を使うこと**
     /// —— こちらは `Vec<u8>` を受け取るので、呼び出し側が複製を作る羽目になる
     /// (`mw-ffi` が実際にそうなっていた。P3-13)。
     pub fn open(bytes: Vec<u8>, output_sample_rate: u32) -> Result<Self, DecodeError> {
         Self::open_shared(Arc::new(bytes), output_sample_rate)
     }
 
-    /// [`SymphoniaDecoder::open`] と同じだが、**共有された**バイト列を複製せずに開く。
+    /// [`WavDecoder::open`] と同じだが、**共有された**バイト列を複製せずに開く。
     ///
     /// 🔴 曲の切り替え(`mw_music_set`)と再オープン後の復元は、音源ストレージが持つ
-    /// `Arc<Vec<u8>>` をそのまま渡せる。数十MB の ogg でゲームスレッドが `memcpy` に
+    /// `Arc<Vec<u8>>` をそのまま渡せる。数十MB の WAV でゲームスレッドが `memcpy` に
     /// 費やしていた時間と、ピークメモリの倍増が無くなる(P3-13)。
     pub fn open_shared(bytes: Arc<Vec<u8>>, output_sample_rate: u32) -> Result<Self, DecodeError> {
-        let cursor = Cursor::new(SharedBytes::new(bytes));
-        let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
-
-        // 拡張子等のヒントは持たない(入力はメモリ上のバイト列のみ。§4.7)。
-        // マジックバイトのみでの自動判別に委ねる。
-        let hint = Hint::new();
-        let format_opts = FormatOptions::default();
-        let metadata_opts = MetadataOptions::default();
-
-        let format = symphonia::default::get_probe()
-            .probe(&hint, mss, format_opts, metadata_opts)
-            .map_err(DecodeError::from)?;
-
-        let track = format
-            .first_track_known_codec(TrackType::Audio)
-            .filter(|track| {
-                matches!(
-                    track.codec_params.as_ref(),
-                    Some(CodecParameters::Audio(params))
-                        if params.codec != CODEC_ID_NULL_AUDIO
-                            && symphonia::default::get_codecs()
-                                .get_audio_decoder(params.codec)
-                                .is_some()
-                )
-            })
-            .ok_or(DecodeError::NoAudioTrack)?;
-
-        let track_id = track.id;
-        let codec_params = match track.codec_params.as_ref() {
-            Some(CodecParameters::Audio(params)) => params.clone(),
-            _ => return Err(DecodeError::NoAudioTrack),
-        };
-        let source_sample_rate = codec_params.sample_rate.ok_or(DecodeError::NoAudioTrack)?;
-        if source_sample_rate == 0 {
-            return Err(DecodeError::InvalidSampleRate(source_sample_rate));
-        }
-        let channels = codec_params
-            .channels
-            .clone()
-            .ok_or(DecodeError::NoAudioTrack)?;
-        let source_channels = channels.count();
-        if source_channels != 1 && source_channels != 2 {
-            return Err(DecodeError::UnsupportedChannelCount(source_channels));
-        }
-        let total_frames_source = track.num_frames;
-
-        let dec_opts = AudioDecoderOptions::default();
-        let decoder = symphonia::default::get_codecs()
-            .make_audio_decoder(&codec_params, &dec_opts)
-            .map_err(DecodeError::from)?;
-
-        let sample_buf = vec![0.0; INITIAL_SAMPLE_BUF_FRAMES as usize * source_channels];
-
-        let native = NativeReader {
-            format,
-            decoder,
-            track_id,
-            sample_buf,
-            pending: Vec::new(),
-            pending_pos: 0,
-            eof: false,
-        };
+        let wav = WavStreamReader::open_shared(Arc::clone(&bytes)).map_err(DecodeError::from)?;
+        let source_sample_rate = wav.sample_rate();
+        let total_frames_source = wav.total_frames();
+        let native = NativeReader { wav };
 
         // レートが一致する場合はリサンプラを構築しない(設計判断4: 無用な計算・
         // レイテンシを持ち込まない)。`convert_frame_count` はレート一致時に恒等変換になる
@@ -590,8 +312,11 @@ impl SymphoniaDecoder {
                     .map_err(DecodeError::Resample)?,
             )
         };
-        let total_frames = total_frames_source
-            .map(|f| resample::convert_frame_count(f, source_sample_rate, output_sample_rate));
+        let total_frames = Some(resample::convert_frame_count(
+            total_frames_source,
+            source_sample_rate,
+            output_sample_rate,
+        ));
 
         Ok(Self {
             native,
@@ -700,7 +425,7 @@ impl SymphoniaDecoder {
     }
 }
 
-impl MusicDecoder for SymphoniaDecoder {
+impl MusicDecoder for WavDecoder {
     fn read(&mut self, out: &mut [f32]) -> Result<usize, DecodeError> {
         let mut want_frames = out.len() / CHANNELS;
         // total_frames を超えて配らないための安全弁(構造体 doc 参照)。
@@ -724,7 +449,7 @@ impl MusicDecoder for SymphoniaDecoder {
 
     fn seek(&mut self, frame: u64) -> Result<(), DecodeError> {
         // `frame` は出力レート基準(モジュール doc)。素材レートへ変換してから
-        // Symphonia のシークへ渡す。
+        // WAV ストリームリーダーのシークへ渡す。
         let source_frame =
             resample::convert_frame_count(frame, self.output_sample_rate, self.source_sample_rate);
         self.native.seek(source_frame)?;
@@ -740,7 +465,7 @@ impl MusicDecoder for SymphoniaDecoder {
         }
 
         // 出力レート基準の位置は要求値そのものを正とする(設計判断3)。素材側の着地点は
-        // レート変換の丸め・(ogg の場合は)パケット境界起因の誤差を持ちうるが、
+        // レート変換の丸めによる素材側の着地点の誤差を持ちうるが、
         // 呼び出し側(`music.rs::MusicVoice::position_frames`)が管理する位置と
         // 常に一致させることを優先する。
         self.position_frames = frame;
@@ -751,6 +476,9 @@ impl MusicDecoder for SymphoniaDecoder {
         self.total_frames
     }
 }
+
+/// 互換名。実装は WAV 専用の [`WavDecoder`] である。
+pub type SymphoniaDecoder = WavDecoder;
 
 #[cfg(test)]
 mod tests {
@@ -817,7 +545,7 @@ mod tests {
     ///
     /// ⚠️ これを `total_frames` 等の「動く」確認だけで守ろうとしても無理 ——
     /// 複製しても動きは一切変わらず、**変わるのは曲切り替えの所要時間とピークメモリだけ**
-    /// だからである(数十MB の ogg でゲームスレッドがヒッチする)。
+    /// だからである(数十MB の WAV でゲームスレッドがヒッチする)。
     /// 参照カウントを直接見るのが、この性質を固定できる唯一の方法。
     #[test]
     fn open_shared_shares_the_compressed_bytes_instead_of_copying_them() {
@@ -825,8 +553,8 @@ mod tests {
         let bytes = Arc::new(make_pcm16_wav(SAMPLE_RATE, 2, &samples));
         let before = Arc::strong_count(&bytes);
 
-        let decoder = SymphoniaDecoder::open_shared(Arc::clone(&bytes), SAMPLE_RATE)
-            .expect("valid wav must open");
+        let decoder =
+            WavDecoder::open_shared(Arc::clone(&bytes), SAMPLE_RATE).expect("valid wav must open");
 
         assert!(
             Arc::strong_count(&bytes) > before,
@@ -850,9 +578,9 @@ mod tests {
         let bytes = make_pcm16_wav(SAMPLE_RATE, 2, &samples);
 
         let mut by_value =
-            SymphoniaDecoder::open(bytes.clone(), SAMPLE_RATE).expect("valid wav must open");
-        let mut shared = SymphoniaDecoder::open_shared(Arc::new(bytes), SAMPLE_RATE)
-            .expect("valid wav must open");
+            WavDecoder::open(bytes.clone(), SAMPLE_RATE).expect("valid wav must open");
+        let mut shared =
+            WavDecoder::open_shared(Arc::new(bytes), SAMPLE_RATE).expect("valid wav must open");
 
         assert_eq!(by_value.total_frames(), shared.total_frames());
         assert_eq!(
@@ -865,7 +593,7 @@ mod tests {
     fn decodes_stereo_wav_in_order() {
         let samples: Vec<i16> = vec![0, 0, 16384, -16384, -16384, 16384, 32767, -32768];
         let bytes = make_pcm16_wav(SAMPLE_RATE, 2, &samples);
-        let mut decoder = SymphoniaDecoder::open(bytes, SAMPLE_RATE).expect("valid wav must open");
+        let mut decoder = WavDecoder::open(bytes, SAMPLE_RATE).expect("valid wav must open");
 
         assert_eq!(decoder.total_frames(), Some(4));
 
@@ -873,12 +601,20 @@ mod tests {
         let n = decoder.read(&mut out).expect("read must succeed");
         assert_eq!(n, 4);
 
-        assert_eq!(out[0], 0.0);
-        assert_eq!(out[1], 0.0);
-        assert!((out[2] - i16_to_f32(16384)).abs() < 1e-6);
-        assert!((out[3] - i16_to_f32(-16384)).abs() < 1e-6);
-        assert_eq!(out[6], i16_to_f32(32767));
-        assert_eq!(out[7], -1.0);
+        let expected = vec![
+            0.0,
+            0.0,
+            i16_to_f32(16384),
+            i16_to_f32(-16384),
+            i16_to_f32(-16384),
+            i16_to_f32(16384),
+            i16_to_f32(32767),
+            -1.0,
+        ];
+        assert_eq!(
+            out, expected,
+            "PCM16 WAV のストリーム出力ゴールデンが変わった"
+        );
 
         // 末尾に到達したら以降は 0 フレーム(EOF)。
         let mut tail = vec![1.0f32; 2 * CHANNELS];
@@ -890,8 +626,7 @@ mod tests {
     fn mono_expands_to_stereo_with_equal_power_gain() {
         let samples: Vec<i16> = vec![32767, -32768, 0];
         let bytes = make_pcm16_wav(SAMPLE_RATE, 1, &samples);
-        let mut decoder =
-            SymphoniaDecoder::open(bytes, SAMPLE_RATE).expect("valid mono wav must open");
+        let mut decoder = WavDecoder::open(bytes, SAMPLE_RATE).expect("valid mono wav must open");
 
         let mut out = vec![0.0f32; 3 * CHANNELS];
         let n = decoder.read(&mut out).expect("read must succeed");
@@ -901,7 +636,7 @@ mod tests {
             out[0], out[1],
             "mono source must expand identically to both channels"
         );
-        let expected = i16_to_f32(32767) * EQUAL_POWER_GAIN;
+        let expected = i16_to_f32(32767) * std::f32::consts::FRAC_1_SQRT_2;
         assert!((out[0] - expected).abs() < 1e-6);
 
         // 等パワー: 展開後の (L^2 + R^2) は元のモノラルサンプルの2乗と一致する。
@@ -913,9 +648,8 @@ mod tests {
 
     #[test]
     fn streams_across_multiple_packets_in_order() {
-        // symphonia-format-riff は PCM を最大 1152 フレーム/パケットに区切る。
-        // 3000 フレームなら 3 パケットに分割され、`pending` バッファの繰り越しを
-        // 実際に踏む(単一パケットに収まる短い素材では検証できない)。
+        // 3000 フレームを要求より小さい読み出しへ分割し、ストリームリーダーが
+        // 連続したバイト範囲を正しい順序で供給することを検証する。
         const FRAME_COUNT: usize = 3_000;
         let mut samples = Vec::with_capacity(FRAME_COUNT * 2);
         for i in 0..FRAME_COUNT {
@@ -924,7 +658,7 @@ mod tests {
             samples.push(-v);
         }
         let bytes = make_pcm16_wav(SAMPLE_RATE, 2, &samples);
-        let mut decoder = SymphoniaDecoder::open(bytes, SAMPLE_RATE).expect("valid wav must open");
+        let mut decoder = WavDecoder::open(bytes, SAMPLE_RATE).expect("valid wav must open");
         assert_eq!(decoder.total_frames(), Some(FRAME_COUNT as u64));
 
         // わざと半端な大きさ(パケット境界と揃わない)で少しずつ読み、繰り越しを踏む。
@@ -956,12 +690,11 @@ mod tests {
             samples.push(-(i as i16));
         }
         let bytes = make_pcm16_wav(SAMPLE_RATE, 2, &samples);
-        let mut decoder = SymphoniaDecoder::open(bytes, SAMPLE_RATE).expect("valid wav must open");
+        let mut decoder = WavDecoder::open(bytes, SAMPLE_RATE).expect("valid wav must open");
 
         // パケット境界(1152 の倍数)からずれた、中途半端な位置へシークする。
-        // wav 自体は本来サンプル精度で seek できるはずだが、`discard_frames` の
-        // コードパス自体はコーデックに依存しないため、ここで精度を固定化しておけば
-        // ogg のようにコンテナ側がパケット境界までしか戻せない場合にも同じ保証が働く。
+        // WAV のデータオフセットがフレーム単位で正しく計算されていることを、
+        // フレーム境界からずれた位置へのシークで固定化する。
         let target = 1_337u64;
         decoder.seek(target).expect("seek must succeed");
 
@@ -978,46 +711,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ogg_container_is_recognized_by_the_probe() {
-        // vorbis エンコーダは依存に追加していないため(§7.1: 依存を無用に太らせない)、
-        // 完全に有効な ogg vorbis ストリームをテストコードで合成することは非現実的
-        // (setup ヘッダのコードブック等、vorbis 仕様の相当な部分の再実装が必要になる)。
-        // そのため、ここでは「ogg フォーマットの検出自体は配線されている」ことだけを
-        // 最小限に確認する: "OggS" マジックで始まる(が中身は不正な)バイト列を渡し、
-        // エラーメッセージが「対応フォーマットが見つからない」という汎用エラーではなく、
-        // ogg 用の `FormatReader` が実際にパースを試みた結果のエラーになっていることを見る。
-        //
-        // 判断: ogg vorbis の完全なラウンドトリップ(pump → read でのデコード検証)は
-        // wav でのみ行い、ogg は「対応コーデックとして組み込まれていること」の
-        // 最小限の証跡に留める(対応コーデックの組み込みだけを検証する)。
-        let mut bytes = vec![0u8; 64];
-        bytes[0..4].copy_from_slice(b"OggS");
-        let err = match SymphoniaDecoder::open(bytes, SAMPLE_RATE) {
-            Ok(_) => panic!("a bare \"OggS\" marker with no valid page must not open successfully"),
-            Err(e) => e,
-        };
-        let message = err.to_string();
-        assert!(
-            !message.contains("no suitable format reader found"),
-            "ogg should be recognized by the probe via its \"OggS\" marker, got: {message}"
-        );
-    }
-
-    #[test]
-    fn vorbis_codec_is_registered() {
-        // ogg のコンテナ検出(上のテスト)とは独立に、vorbis コーデックの feature が
-        // 実際に有効化されていること自体も確認しておく(feature の指定ミスで
-        // 静かに wav only になっていないことのチェック)。
-        let registry = symphonia::default::get_codecs();
-        assert!(
-            registry
-                .get_audio_decoder(symphonia::core::codecs::audio::well_known::CODEC_ID_VORBIS,)
-                .is_some(),
-            "vorbis codec must be registered (Cargo.toml feature = [\"vorbis\"])"
-        );
-    }
-
     // --- ここから先はリサンプル(初期構築仕様『§4.7』)の検証 -------------------------
 
     #[test]
@@ -1029,7 +722,7 @@ mod tests {
         const FRAME_COUNT: usize = 4_410; // 100ms ぶん(1kHz の100周期)。
 
         let bytes = make_sine_wave_wav(SOURCE_RATE, FREQ_HZ, FRAME_COUNT, 20_000);
-        let mut decoder = SymphoniaDecoder::open(bytes, OUTPUT_RATE).expect("valid wav must open");
+        let mut decoder = WavDecoder::open(bytes, OUTPUT_RATE).expect("valid wav must open");
 
         let left = drain_left_channel(&mut decoder, 512);
         let estimated = estimate_frequency_hz(&left, OUTPUT_RATE);
@@ -1049,7 +742,7 @@ mod tests {
         const FRAME_COUNT: usize = 4_410;
 
         let bytes = make_sine_wave_wav(SOURCE_RATE, 1_000.0, FRAME_COUNT, 20_000);
-        let mut decoder = SymphoniaDecoder::open(bytes, OUTPUT_RATE).expect("valid wav must open");
+        let mut decoder = WavDecoder::open(bytes, OUTPUT_RATE).expect("valid wav must open");
 
         let expected = resample::convert_frame_count(FRAME_COUNT as u64, SOURCE_RATE, OUTPUT_RATE);
         assert_eq!(decoder.total_frames(), Some(expected));
@@ -1071,12 +764,12 @@ mod tests {
         let bytes = make_sine_wave_wav(SOURCE_RATE, 1_000.0, FRAME_COUNT, 20_000);
 
         let mut chunked =
-            SymphoniaDecoder::open(bytes.clone(), OUTPUT_RATE).expect("valid wav must open");
+            WavDecoder::open(bytes.clone(), OUTPUT_RATE).expect("valid wav must open");
         // 37 フレームというわざと半端な大きさで細切れに読み、内部リサンプラのブロック長
         // (STREAM_CHUNK_TARGET_FRAMES 由来)とは揃わない境界を何度も踏む。
         let chunked_out = drain_left_channel(&mut chunked, 37);
 
-        let mut bulk = SymphoniaDecoder::open(bytes, OUTPUT_RATE).expect("valid wav must open");
+        let mut bulk = WavDecoder::open(bytes, OUTPUT_RATE).expect("valid wav must open");
         // 総フレーム数より大きい一括読み出し(1回で読み切れるサイズ)。
         let bulk_out = drain_left_channel(&mut bulk, 100_000);
 
@@ -1092,7 +785,7 @@ mod tests {
         // そのまま(丸め誤差の入り込む余地なく)出てくることを見る。
         let samples: Vec<i16> = vec![0, 0, 16384, -16384, -16384, 16384, 32767, -32768];
         let bytes = make_pcm16_wav(48_000, 2, &samples);
-        let mut decoder = SymphoniaDecoder::open(bytes, 48_000).expect("valid wav must open");
+        let mut decoder = WavDecoder::open(bytes, 48_000).expect("valid wav must open");
 
         let mut out = vec![0.0f32; 4 * CHANNELS];
         let n = decoder.read(&mut out).expect("read must succeed");
@@ -1117,8 +810,7 @@ mod tests {
         let bytes = make_sine_wave_wav(SOURCE_RATE, 1_000.0, FRAME_COUNT, 20_000);
         let target = resample::convert_frame_count(2_000, SOURCE_RATE, OUTPUT_RATE);
 
-        let mut warmed =
-            SymphoniaDecoder::open(bytes.clone(), OUTPUT_RATE).expect("valid wav must open");
+        let mut warmed = WavDecoder::open(bytes.clone(), OUTPUT_RATE).expect("valid wav must open");
         let mut warm_buf = vec![0.0f32; 500 * CHANNELS];
         warmed
             .read(&mut warm_buf)
@@ -1126,7 +818,7 @@ mod tests {
         warmed.seek(target).expect("seek must succeed");
         let after_warm = drain_left_channel(&mut warmed, 333);
 
-        let mut fresh = SymphoniaDecoder::open(bytes, OUTPUT_RATE).expect("valid wav must open");
+        let mut fresh = WavDecoder::open(bytes, OUTPUT_RATE).expect("valid wav must open");
         fresh.seek(target).expect("seek must succeed");
         let after_fresh = drain_left_channel(&mut fresh, 333);
 
@@ -1144,8 +836,8 @@ mod tests {
         const SOURCE_RATE: u32 = 44_100;
         const OUTPUT_RATE: u32 = 48_000;
         let bytes = make_sine_wave_wav(SOURCE_RATE, 1_000.0, 2_000, 10_000);
-        let mut decoder = SymphoniaDecoder::open(bytes, OUTPUT_RATE)
-            .expect("mismatched sample rate must now succeed");
+        let mut decoder =
+            WavDecoder::open(bytes, OUTPUT_RATE).expect("mismatched sample rate must now succeed");
         let left = drain_left_channel(&mut decoder, 256);
         assert!(!left.is_empty());
     }

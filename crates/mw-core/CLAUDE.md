@@ -65,7 +65,7 @@ OS 非依存・デバイス非依存のコア。ミキサ、ボイス管理、�
   楽曲ロード FFI(`mw_music_set` 相当)はまだ無い——`mixer::build` は内部で
   `stream::channel` を組み立てて返すが、誰も `pump` しない限り楽曲ボイスは
   `Loading` のまま(M2-5 時点の正直な現状)。
-- `decode`: `MusicDecoder`/`SymphoniaDecoder` — wav / ogg vorbis のストリーミングデコード
+- `decode`: `MusicDecoder`/`WavDecoder` — 自前 WAV PCM のストリーミングデコード
   (§4.7, M2-3)。`stream.rs::MusicStreamProducer::pump` から呼ばれる。
 - `config`: `Config` — 【仮】既定値(ボイス数 64、既定ランプ 5ms、キュー容量、
   予約発音キュー容量32、イベントキュー容量64、アンダーラン集約報告閾値48000フレーム等)
@@ -87,7 +87,7 @@ OS 非依存・デバイス非依存のコア。ミキサ、ボイス管理、�
   `#[cfg(test)] pub mod golden` にゴールデンテスト用の wav バイト列ビルダを置く
   (バイナリはコミットしない。§8)。
 - `resample`: サンプルレート変換(§4.7, M2)。楽曲ストリーミング用の `StreamResampler`
-  (`rubato::Fft` + `FixedSync::Both`。`decode.rs::SymphoniaDecoder` が1曲につき1個だけ保持し
+  (`rubato::Fft` + `FixedSync::Both`。`decode.rs::WavDecoder` が1曲につき1個だけ保持し
   `pump()` をまたいで使い回すことでブロック境界の連続性を保つ)と、SE ロード時一括変換の
   `resample_oneshot`(`rubato::Async` sinc、高品質設定)の2系統。レート一致時はどちらも
   リサンプラを構築せずバイパスする。総フレーム数・シーク位置は常に出力レート基準
@@ -250,7 +250,7 @@ M4-3 で BGM ボイスの再生 + ループ折り返しもこの同じシナリ�
 自前 SPSC ロックフリーリングバッファ(`ring_buffer`。コマンドキューと回収キューの両方に使う。
 当初 mw-ffi 境界に置く想定だったが、`Renderer::render` が `&mut self` の単一所有権を保つには
 `Consumer`/`Producer` をミキサ自身が持つ設計の方が単純なため mw-core に置いた)。
-`symphonia`(デコード。wav / ogg vorbis、`decode.rs`)・`rubato`(リサンプル、`resample.rs`)
-を M2 で追加した(初期構築仕様 §7.1)。どちらもゲームスレッド(SE ロード時)・
+`rubato`(リサンプル、`resample.rs`)のみを外部依存として使う。WAV デコードは
+`wav.rs` の自前パーサで行い、どちらもゲームスレッド(SE ロード時)・
 デコードスレッド(`pump()` の内側)からのみ呼ばれ、音声コールバック経路には一切入らない
 (§5.3 のリアルタイム安全性規約はこの2クレートの呼び出し経路には適用されない設計)。

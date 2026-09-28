@@ -35,7 +35,7 @@ pub use clipper::SoftClipper;
 pub use clock::{BgmStatePublisher, MusicClockPublisher, MusicClockSnapshot, RenderedFrameCounter};
 pub use command::{Command, ScheduledSe};
 pub use config::Config;
-pub use decode::{DecodeError, MusicDecoder, SharedBytes, SymphoniaDecoder};
+pub use decode::{DecodeError, MusicDecoder, SharedBytes, SymphoniaDecoder, WavDecoder};
 pub use event::{Event, EventQueue, StreamErrorReason};
 pub use format::{AudioFormat, CHANNELS, Sample};
 pub use mixer::{BgmHandles, CommandSender, Mixer, ReclaimReceiver};

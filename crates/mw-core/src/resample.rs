@@ -48,7 +48,7 @@
 //! # 総フレーム数・シーク位置は出力レート基準(設計判断3)
 //!
 //! [`convert_frame_count`] は `from_rate` 基準のフレーム数を `to_rate` 基準へ
-//! 四捨五入で変換する。`decode.rs::SymphoniaDecoder` はこれを使って
+//! 四捨五入で変換する。`decode.rs::WavDecoder` はこれを使って
 //! 「素材の総フレーム数 → 出力レート換算の総フレーム数」「シーク要求(出力レート)→
 //! 素材側のシーク位置(素材レート)」の両方向を変換する。リサンプラはブロック単位でしか
 //! 出力できないため実際に生成できるフレーム数は端数ぶん `total_frames` を超えうるが、
@@ -208,7 +208,7 @@ fn append_resampled_output(
 
 /// 楽曲ストリーミング用のリサンプラ(`Fft` + `FixedSync::Both` ベース)。
 ///
-/// `decode.rs::SymphoniaDecoder` が1曲につき1個だけ保持し、`pump()` の呼び出しを
+/// `decode.rs::WavDecoder` が1曲につき1個だけ保持し、`pump()` の呼び出しを
 /// またいで使い回す(モジュール doc「ブロック境界の連続性」)。
 pub struct StreamResampler {
     inner: Fft<f32>,

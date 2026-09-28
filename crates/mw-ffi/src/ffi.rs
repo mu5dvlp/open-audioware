@@ -711,7 +711,7 @@ pub extern "C" fn mw_music_play_scheduled(handle: u64, host_time_ns: u64) -> MwR
 /// 渡すと `MwResult::ErrInvalidSoundId` を返す——`crate::handle::MUSIC_ID_FLAG` に
 /// よる ID 空間分離が効いている)。
 ///
-/// デコーダ(`mw_core::SymphoniaDecoder::open`)は**この呼び出しの中、ゲームスレッドで
+/// デコーダ(`mw_core::WavDecoder::open`)は**この呼び出しの中、ゲームスレッドで
 /// 開く**。ヘッダ読み取りでアロケーションが発生するが、ここはゲームスレッド経路
 /// なので初期構築仕様『§5.3』のリアルタイム安全性規約には抵触しない(デコード
 /// スレッドへは構築済みのデコーダをそのまま渡すだけで、以後の実際のデコード作業
@@ -768,10 +768,10 @@ fn set_music_track(handle: u64, sound_id: u64, target: MusicTarget) -> MwResult 
             let output_sample_rate = instance.backend_sample_rate();
 
             // 🔴 **複製しない**(P3-13)。`open_shared` は `Arc<Vec<u8>>` をそのまま取るので、
-            // 数十MB の ogg でもここでの `memcpy` はゼロ。デコードスレッドは同じバイト列を
+            // 数十MB の WAV でもここでの `memcpy` はゼロ。デコードスレッドは同じバイト列を
             // `Arc` で共有し、`mw_sound_release` されても参照が生きている限り解放されない
             // (`Instance::remove_music_bytes` のドキュメント参照)。
-            let decoder = match mw_core::SymphoniaDecoder::open_shared(bytes, output_sample_rate) {
+            let decoder = match mw_core::WavDecoder::open_shared(bytes, output_sample_rate) {
                 Ok(decoder) => decoder,
                 Err(err) => {
                     mw_backend::mw_log!(
@@ -1009,7 +1009,7 @@ pub unsafe extern "C" fn mw_music_get_position(handle: u64, out: *mut MwMusicPos
 // - **共有するもの**: 圧縮バイト列のストレージ・ID 空間(`mw_sound_load(mode =
 //   Music)` / `mw_sound_release` はそのまま流用できる——「デコード前の圧縮バイト列を
 //   保持する」という表現そのものへの分離であり、どちらのボイスで鳴らすかとは無関係)、
-//   ストリーミングデコードの仕組み一式(`SymphoniaDecoder` / `decode_thread::spawn`)、
+//   ストリーミングデコードの仕組み一式(`WavDecoder` / `decode_thread::spawn`)、
 //   状態機械(`MusicVoice` をそのまま転用。ループ・フェードの実装も共有)。
 // - **分けるもの**: リングバッファとデコードスレッドは BGM 専用にもう1本立てる
 //   (`crate::handle::Instance::bgm_decoder_tx` 等)。**クロックは発行しない**
@@ -1586,7 +1586,7 @@ mod tests {
     fn run_music_lifecycle(handle: u64) {
         // Music モードは圧縮のまま保持するだけでロード時に妥当性検証をしない
         // (`load_music` 参照)ため、実際に有効な wav バイト列を渡しておく
-        // (`mw_music_set` が `SymphoniaDecoder::open` でデコードを試みるため)。
+        // (`mw_music_set` が `WavDecoder::open` でデコードを試みるため)。
         // 短い素材でも、総フレーム数に達し次第 EOF 経由で `is_ready()` が true に
         // なる(`mw_core::stream` の `is_ready` ドキュメント参照)ので十分。
         let music_bytes = make_pcm16_wav(48_000, 2, &vec![12345i16; 400]);
