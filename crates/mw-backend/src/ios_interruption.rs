@@ -1546,7 +1546,8 @@ mod tests {
         }
     }
 
-    /// `NewDeviceAvailable` も復帰対象に含めるため、古い関数名では対象範囲と一致しない。
+    /// 復帰を要求するのは `OldDeviceUnavailable`(出力機器が外れた)と
+    /// `NewDeviceAvailable`(出力機器が繋がった)だけで、それ以外の理由は要求しない。
     #[test]
     fn old_device_unavailable_and_new_device_available_require_recovery_other_reasons_do_not() {
         assert!(RouteChangeReason::OldDeviceUnavailable.requires_recovery());

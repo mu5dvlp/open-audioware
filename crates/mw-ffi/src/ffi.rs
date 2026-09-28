@@ -2510,9 +2510,7 @@ mod tests {
 
     #[test]
     fn sound_load_accepts_music_mode_but_still_requires_a_valid_handle() {
-        // M2-7 より前は mode=1(Music)自体が非対応で `ErrUnsupportedSoundMode` を
-        // 返していた(このテストの旧名 `sound_load_rejects_music_mode_in_m1` の由来)。
-        // 今は Music モードは認識される有効な mode 値なので、mode 検証自体は通り、
+        // Music モード(mode=1)は有効な mode 値なので、mode 検証自体は通り、
         // 後続のハンドル検証(`load_music` 内の `with_instance`)で弾かれる
         // ——`ErrUnsupportedSoundMode` ではなく `ErrInvalidHandle` になることを固定化する。
         let wav_bytes = make_pcm16_wav(48_000, 1, &[0]);
