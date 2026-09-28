@@ -174,10 +174,13 @@ third-party-licenses:
 # 生成物が古いまま公開されるのを防ぐ。CI(= make lint)から呼ばれる。
 # 🔴 差分が出たら `make third-party-licenses` を実行してコミットすること。
 third-party-licenses-check:
-	@python3 scripts/gen-third-party-licenses.py >/dev/null
-	@git diff --quiet -- THIRD-PARTY-LICENSES.md || ( \
+	@tmp_file=$$(mktemp); \
+	trap 'rm -f "$$tmp_file"' EXIT; \
+	python3 scripts/gen-third-party-licenses.py --output "$$tmp_file" >/dev/null; \
+	cmp -s "$$tmp_file" THIRD-PARTY-LICENSES.md || ( \
 		echo "[error] THIRD-PARTY-LICENSES.md が依存構成と食い違っています。"; \
-		echo "        make third-party-licenses を実行してコミットしてください。"; \
+		echo "        make third-party-licenses を実行してください。"; \
+		diff -u THIRD-PARTY-LICENSES.md "$$tmp_file" || true; \
 		exit 1 )
 	@echo "[ok] THIRD-PARTY-LICENSES.md は最新です"
 
