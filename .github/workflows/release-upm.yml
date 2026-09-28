@@ -157,7 +157,8 @@ jobs:
 
           mkdir -p "$SRC/Runtime/Plugins/iOS"
           rm -rf "$SRC/Runtime/Plugins/iOS/MwFfi.xcframework"
-          cp -R /tmp/artifacts/ios-native/MwFfi.xcframework "$SRC/Runtime/Plugins/iOS/MwFfi.xcframework"
+          # upload-artifact はディレクトリを渡すと「中身」だけを載せるため、ios-native の直下が xcframework の中身になる
+          cp -R /tmp/artifacts/ios-native "$SRC/Runtime/Plugins/iOS/MwFfi.xcframework"
 
           mkdir -p "$SRC/Runtime/Plugins/Android/libs/arm64-v8a"
           cp /tmp/artifacts/android-native/libmw_ffi.so "$SRC/Runtime/Plugins/Android/libs/arm64-v8a/libmw_ffi.so"
