@@ -65,7 +65,7 @@ OS 非依存・デバイス非依存のコア。ミキサ、ボイス管理、�
   楽曲ロード FFI(`mw_music_set` 相当)はまだ無い——`mixer::build` は内部で
   `stream::channel` を組み立てて返すが、誰も `pump` しない限り楽曲ボイスは
   `Loading` のまま(M2-5 時点の正直な現状)。
-- `decode`: `MusicDecoder`/`WavDecoder` — 自前 WAV PCM のストリーミングデコード
+- `decode`: `MusicDecoder`/`WavDecoder` — 自前 WAV PCM/IEEE float のストリーミングデコード
   (§4.7, M2-3)。`stream.rs::MusicStreamProducer::pump` から呼ばれる。
 - `config`: `Config` — 【仮】既定値(ボイス数 64、既定ランプ 5ms、キュー容量、
   予約発音キュー容量32、イベントキュー容量64、アンダーラン集約報告閾値48000フレーム等)
@@ -80,7 +80,8 @@ OS 非依存・デバイス非依存のコア。ミキサ、ボイス管理、�
 - `sound`: `SoundData`(f32 ステレオ・インターリーブ PCM)、`SoundId`、`SoundStorage`
   (ID 管理。ゲームスレッド専用、ヒープアロケーションを伴うため音声コールバック経路からは
   絶対に使わない)。
-- `wav`: 16bit PCM / モノラル・ステレオの wav を自前パーサでデコードする。
+- `wav`: PCM 8/16/24/32bit、IEEE float 32/64bit、および WAVE_FORMAT_EXTENSIBLE の
+  PCM/IEEE float をモノラル・ステレオ対応の自前パーサでデコードする。
   モノは等パワー(`1/√2`)で両ch展開。サンプルレートは出力デバイスと一致しなくてよく、
   一致しない場合は `resample.rs`(rubato `Async` sinc)でロード時に一括変換して
   出力レート化する(§4.7, M2)。非対応フォーマットは `WavError` の具体的なバリアントで返す。

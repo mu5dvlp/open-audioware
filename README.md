@@ -215,7 +215,7 @@ Makefile・コードのどちらもアーチ非依存に書いてあります。
 | ツール名 | 概要 |
 |---|---|
 | cpal | 出力デバイス抽象(`Backend` trait)の実装。OS のローレイテンシ音声 API を直接叩く |
-| mw-core 内製 WAV デコーダ | 楽曲ストリーミングのデコード(wav PCM) |
+| mw-core 内製 WAV デコーダ | 楽曲ストリーミングのデコード(WAV PCM 8/16/24/32bit、IEEE float 32/64bit、WAVE_FORMAT_EXTENSIBLE) |
 | rubato | サンプルレート変換(リサンプリング) |
 | mw-core 内製 ring_buffer | ロックフリー SPSC リングバッファ。音声スレッドとのコマンド/回収/PCM 供給キューに使用 |
 | objc2 / objc2-avf-audio / objc2-foundation / block2 | iOS の AVAudioSession 設定と割り込み・バックグラウンド復帰の監視 |

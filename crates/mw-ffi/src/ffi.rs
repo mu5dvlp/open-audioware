@@ -194,7 +194,9 @@ pub extern "C" fn mw_shutdown(handle: u64) -> MwResult {
 /// (初期構築仕様 §5.5, §4.2, §5.2)。
 ///
 /// - `mode = 0`(SE): wav を全デコードしてメモリ常駐させる(M1)。対応フォーマットは
-///   16bit PCM / モノラルまたはステレオの wav のみ(`crates/mw-core/src/wav.rs`)。
+///   PCM 8/16/24/32bit、IEEE float 32/64bit、および対応する
+///   WAVE_FORMAT_EXTENSIBLE / モノラルまたはステレオの wav
+///   (`crates/mw-core/src/wav.rs`)。
 ///   サンプルレートは出力デバイスと一致しなくてよい(一致しない場合はロード時に
 ///   一括でリサンプルする。初期構築仕様『§4.7』)。非対応の場合は原因に応じた
 ///   エラーコードを返す。

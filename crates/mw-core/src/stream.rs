@@ -370,7 +370,7 @@ pub fn channel(config: Config, sample_rate: u32) -> (MusicStreamProducer, Stream
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::SymphoniaDecoder;
+    use crate::decode::WavDecoder;
     use crate::wav::golden::make_pcm16_wav;
 
     /// テスト用のフェイクデコーダ(`music.rs::tests::FakeSource` と同じ考え方)。
@@ -661,7 +661,7 @@ mod tests {
         assert_eq!(source.read(&mut out), 0);
     }
 
-    /// wav の実デコード(`SymphoniaDecoder`)と本モジュールを繋いだ end-to-end テスト
+    /// wav の実デコード(`WavDecoder`)と本モジュールを繋いだ end-to-end テスト
     /// wav をストリーミングデコードして、pump → read で元の PCM が順序どおり取り出せること。
     #[test]
     fn end_to_end_streams_a_real_wav_through_pump_and_read_in_order() {
@@ -673,7 +673,7 @@ mod tests {
             samples.push(-(i as i16));
         }
         let bytes = make_pcm16_wav(SAMPLE_RATE, 2, &samples);
-        let mut decoder = SymphoniaDecoder::open(bytes, SAMPLE_RATE).expect("valid wav must open");
+        let mut decoder = WavDecoder::open(bytes, SAMPLE_RATE).expect("valid wav must open");
 
         let (mut producer, mut source) = channel(small_config(20.0), SAMPLE_RATE);
 
@@ -707,7 +707,7 @@ mod tests {
 
     /// 既存の end-to-end(pump() → read())がレート不一致の素材でも通ること。素材(44.1kHz)
     /// と出力(48kHz)のレートが異なっていても、
-    /// `SymphoniaDecoder` 内部のリサンプル(`decode.rs`/`resample.rs`)が
+    /// `WavDecoder` 内部のリサンプル(`decode.rs`/`resample.rs`)が
     /// `pump`/`read` から見て完全に透明であることを確認する
     /// (`stream.rs` 自身はレート変換を一切知らない設計。モジュール doc 参照)。
     #[test]
@@ -722,7 +722,7 @@ mod tests {
         }
         let bytes = make_pcm16_wav(SOURCE_RATE, 2, &samples);
         let mut decoder =
-            SymphoniaDecoder::open(bytes, OUTPUT_RATE).expect("mismatched sample rate must open");
+            WavDecoder::open(bytes, OUTPUT_RATE).expect("mismatched sample rate must open");
 
         let expected_frames =
             crate::resample::convert_frame_count(FRAME_COUNT as u64, SOURCE_RATE, OUTPUT_RATE);

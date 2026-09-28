@@ -29,7 +29,7 @@ pub enum MwResult {
     /// 自体は M2(rubato)でロード時リサンプルするため、もはやここには当たらない
     /// (初期構築仕様 §4.7)。
     ErrUnsupportedSampleRate = -8,
-    /// wav が 16bit PCM でない、またはチャンネル数がモノ/ステレオでない。
+    /// wav のフォーマットまたはチャンネル数が対応範囲外だった。
     ErrUnsupportedFormat = -9,
     /// 指定されたサウンド ID が存在しない(未ロード / 既に解放済み)。
     ErrInvalidSoundId = -10,
@@ -62,6 +62,7 @@ impl From<mw_core::WavError> for MwResult {
             mw_core::WavError::InvalidSampleRate(_) => MwResult::ErrUnsupportedSampleRate,
             mw_core::WavError::Resample(_) => MwResult::ErrDecodeFailed,
             mw_core::WavError::UnsupportedFormatTag(_)
+            | mw_core::WavError::UnsupportedExtensibleSubFormat
             | mw_core::WavError::UnsupportedBitsPerSample(_)
             | mw_core::WavError::UnsupportedChannelCount(_) => MwResult::ErrUnsupportedFormat,
             mw_core::WavError::Truncated

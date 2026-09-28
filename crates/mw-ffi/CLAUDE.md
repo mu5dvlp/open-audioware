@@ -267,7 +267,7 @@ music_bytes`)、同じ ID 空間を共有すると `mw_sound_release` が誤っ�
 - **共有するもの**: 圧縮バイト列のストレージ・ID 空間(上記「楽曲 ID の空間分離」
   そのまま——`mw_bgm_set` は `Instance::get_music_bytes` を呼ぶだけで、BGM 専用の
   ストレージや ID フラグを新設していない)、ストリーミングデコードの仕組み一式
-  (`SymphoniaDecoder` / `decode_thread::spawn`)、状態機械(`mw_core::MusicVoice`
+  (`WavDecoder` / `decode_thread::spawn`)、状態機械(`mw_core::MusicVoice`
   をそのまま転用。ループ・フェードの実装も共有)、Bgm バス(`mw_bus_set_volume`/
   `mw_bus_fade` をそのまま使う。BGM 専用バスは追加しない)。
 - **分けるもの**: リングバッファとデコードスレッドは BGM 専用にもう1本立てる

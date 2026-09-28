@@ -1,6 +1,7 @@
 //! wav(RIFF/PCM)ローダ(初期構築仕様 M12, §4.7)。
 //!
-//! 対応: 16bit / ステレオ・モノラルの PCM wav。モノは等パワーで両ch展開する。
+//! 対応: PCM 8/16/24/32bit、IEEE float 32/64bit、およびそれらの
+//! WAVE_FORMAT_EXTENSIBLE 版 / ステレオ・モノラルの wav。モノは等パワーで両ch展開する。
 //! サンプルレートは**出力デバイスのレートに一致しなくてよい** —
 //! `decode` に渡された `output_sample_rate` と異なる場合、ロード時に一括で
 //! `resample.rs::resample_oneshot`(rubato `Async` sinc)へ通して出力レート化する
@@ -33,9 +34,11 @@ pub enum WavError {
     MissingFmtChunk,
     /// `data` チャンクが見つからない。
     MissingDataChunk,
-    /// PCM(フォーマットタグ 1)以外(拡張フォーマット等)。M1 は非対応。
+    /// 対応していない WAV フォーマットタグ。
     UnsupportedFormatTag(u16),
-    /// 16bit PCM 以外(8bit / 24bit / 32bit float 等)。M1 は非対応。
+    /// 対応していない WAVE_FORMAT_EXTENSIBLE の SubFormat GUID。
+    UnsupportedExtensibleSubFormat,
+    /// フォーマットに対して対応していないビット深度。
     UnsupportedBitsPerSample(u16),
     /// モノラル・ステレオ以外のチャンネル数。
     UnsupportedChannelCount(u16),
@@ -55,14 +58,13 @@ impl fmt::Display for WavError {
             WavError::NotWave => write!(f, "not a WAVE file (missing 'WAVE' format tag)"),
             WavError::MissingFmtChunk => write!(f, "wav is missing the 'fmt ' chunk"),
             WavError::MissingDataChunk => write!(f, "wav is missing the 'data' chunk"),
-            WavError::UnsupportedFormatTag(tag) => write!(
-                f,
-                "unsupported wav format tag {tag} (only PCM = 1 is supported in M1)"
-            ),
-            WavError::UnsupportedBitsPerSample(bits) => write!(
-                f,
-                "unsupported bits-per-sample {bits} (only 16-bit PCM is supported in M1)"
-            ),
+            WavError::UnsupportedFormatTag(tag) => write!(f, "unsupported wav format tag {tag}"),
+            WavError::UnsupportedExtensibleSubFormat => {
+                write!(f, "unsupported WAVE_FORMAT_EXTENSIBLE SubFormat GUID")
+            }
+            WavError::UnsupportedBitsPerSample(bits) => {
+                write!(f, "unsupported bits-per-sample {bits}")
+            }
             WavError::UnsupportedChannelCount(channels) => write!(
                 f,
                 "unsupported channel count {channels} (only mono or stereo is supported)"
@@ -92,6 +94,9 @@ mod display_tests {
             WavError::MissingFmtChunk => Some("missing the 'fmt ' chunk"),
             WavError::MissingDataChunk => Some("missing the 'data' chunk"),
             WavError::UnsupportedFormatTag(_) => Some("unsupported wav format tag"),
+            WavError::UnsupportedExtensibleSubFormat => {
+                Some("unsupported WAVE_FORMAT_EXTENSIBLE SubFormat GUID")
+            }
             WavError::UnsupportedBitsPerSample(_) => Some("unsupported bits-per-sample"),
             WavError::UnsupportedChannelCount(_) => Some("unsupported channel count"),
             WavError::InvalidSampleRate(_) => Some("invalid sample rate"),
@@ -108,6 +113,7 @@ mod display_tests {
             WavError::MissingFmtChunk,
             WavError::MissingDataChunk,
             WavError::UnsupportedFormatTag(3),
+            WavError::UnsupportedExtensibleSubFormat,
             WavError::UnsupportedBitsPerSample(24),
             WavError::UnsupportedChannelCount(5),
             WavError::InvalidSampleRate(0),
@@ -154,6 +160,7 @@ mod display_tests {
                 | WavError::NotWave
                 | WavError::MissingFmtChunk
                 | WavError::MissingDataChunk
+                | WavError::UnsupportedExtensibleSubFormat
                 | WavError::Resample(_) => None,
             };
             let Some(argument) = expected_argument else {
@@ -214,14 +221,85 @@ pub fn decode(bytes: &[u8], output_sample_rate: u32) -> Result<SoundData, WavErr
     })
 }
 
-fn i16_to_f32(sample: i16) -> f32 {
-    sample as f32 / 32_768.0
+const WAVE_FORMAT_PCM: u16 = 1;
+const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
+const WAVE_FORMAT_EXTENSIBLE: u16 = 0xfffe;
+
+const PCM_SUBFORMAT_GUID: [u8; 16] = [
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71,
+];
+const IEEE_FLOAT_SUBFORMAT_GUID: [u8; 16] = [
+    0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71,
+];
+
+#[derive(Clone, Copy)]
+enum SampleFormat {
+    Pcm { bits_per_sample: u16 },
+    IeeeFloat { bits_per_sample: u16 },
 }
 
-fn read_i16_le(bytes: &[u8], offset: usize) -> Option<i16> {
-    let a = *bytes.get(offset)?;
-    let b = *bytes.get(offset + 1)?;
-    Some(i16::from_le_bytes([a, b]))
+impl SampleFormat {
+    fn bits_per_sample(self) -> u16 {
+        match self {
+            Self::Pcm { bits_per_sample } | Self::IeeeFloat { bits_per_sample } => bits_per_sample,
+        }
+    }
+
+    fn bytes_per_sample(self) -> usize {
+        usize::from(self.bits_per_sample() / 8)
+    }
+}
+
+/// WAV の各サンプルを f32 へ変換する唯一の処理箇所。
+fn sample_to_f32(format: SampleFormat, bytes: &[u8]) -> Option<f32> {
+    match format {
+        SampleFormat::Pcm { bits_per_sample: 8 } => {
+            Some((f32::from(*bytes.first()?) - 128.0) / 128.0)
+        }
+        SampleFormat::Pcm {
+            bits_per_sample: 16,
+        } => {
+            let bytes = bytes.get(..2)?;
+            // 既存の PCM16 出力を維持するため、従来と同じ式を使う。
+            Some(i16::from_le_bytes([bytes[0], bytes[1]]) as f32 / 32_768.0)
+        }
+        SampleFormat::Pcm {
+            bits_per_sample: 24,
+        } => {
+            let bytes = bytes.get(..3)?;
+            let raw = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]);
+            let signed = if raw & 0x0080_0000 != 0 {
+                (raw | 0xff00_0000) as i32
+            } else {
+                raw as i32
+            };
+            Some(signed as f32 / 8_388_608.0)
+        }
+        SampleFormat::Pcm {
+            bits_per_sample: 32,
+        } => {
+            let bytes = bytes.get(..4)?;
+            Some(
+                i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f32
+                    / 2_147_483_648.0,
+            )
+        }
+        SampleFormat::IeeeFloat {
+            bits_per_sample: 32,
+        } => {
+            let bytes = bytes.get(..4)?;
+            Some(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        }
+        SampleFormat::IeeeFloat {
+            bits_per_sample: 64,
+        } => {
+            let bytes = bytes.get(..8)?;
+            Some(f64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]) as f32)
+        }
+        SampleFormat::Pcm { .. } | SampleFormat::IeeeFloat { .. } => None,
+    }
 }
 
 /// ヘッダ解析後の WAV 形式情報と data チャンクの位置。
@@ -229,6 +307,7 @@ fn read_i16_le(bytes: &[u8], offset: usize) -> Option<i16> {
 struct WavHeader {
     channels: u16,
     sample_rate: u32,
+    sample_format: SampleFormat,
     data_offset: usize,
     data_len: usize,
 }
@@ -252,6 +331,7 @@ fn parse_header(bytes: &[u8]) -> Result<WavHeader, WavError> {
     let mut channels: Option<u16> = None;
     let mut sample_rate: Option<u32> = None;
     let mut bits_per_sample: Option<u16> = None;
+    let mut extensible_sub_format: Option<[u8; 16]> = None;
     let mut data: Option<(usize, usize)> = None;
 
     // チャンクを順に走査する。未知のチャンクはサイズぶんスキップする
@@ -272,6 +352,20 @@ fn parse_header(bytes: &[u8]) -> Result<WavHeader, WavError> {
                 let _byte_rate = fmt_cursor.read_u32_le().ok_or(WavError::MissingFmtChunk)?;
                 let _block_align = fmt_cursor.read_u16_le().ok_or(WavError::MissingFmtChunk)?;
                 bits_per_sample = Some(fmt_cursor.read_u16_le().ok_or(WavError::MissingFmtChunk)?);
+                if format_tag == Some(WAVE_FORMAT_EXTENSIBLE) {
+                    let cb_size = fmt_cursor.read_u16_le().ok_or(WavError::MissingFmtChunk)?;
+                    if cb_size < 22 || fmt_cursor.remaining() < 22 {
+                        return Err(WavError::MissingFmtChunk);
+                    }
+                    let _valid_bits_per_sample =
+                        fmt_cursor.read_u16_le().ok_or(WavError::MissingFmtChunk)?;
+                    let _channel_mask =
+                        fmt_cursor.read_u32_le().ok_or(WavError::MissingFmtChunk)?;
+                    let guid = fmt_cursor.take(16).ok_or(WavError::MissingFmtChunk)?;
+                    let mut sub_format = [0u8; 16];
+                    sub_format.copy_from_slice(guid);
+                    extensible_sub_format = Some(sub_format);
+                }
             }
             b"data" => data = Some((chunk_offset, chunk_size)),
             _ => {
@@ -290,11 +384,23 @@ fn parse_header(bytes: &[u8]) -> Result<WavHeader, WavError> {
     let bits_per_sample = bits_per_sample.ok_or(WavError::MissingFmtChunk)?;
     let (data_offset, data_len) = data.ok_or(WavError::MissingDataChunk)?;
 
-    // WAVE_FORMAT_PCM = 1 のみ対応。拡張フォーマット(0xFFFE 等)は M1 非対応。
-    if format_tag != 1 {
-        return Err(WavError::UnsupportedFormatTag(format_tag));
-    }
-    if bits_per_sample != 16 {
+    let sample_format = match format_tag {
+        WAVE_FORMAT_PCM => SampleFormat::Pcm { bits_per_sample },
+        WAVE_FORMAT_IEEE_FLOAT => SampleFormat::IeeeFloat { bits_per_sample },
+        WAVE_FORMAT_EXTENSIBLE => match extensible_sub_format {
+            Some(guid) if guid == PCM_SUBFORMAT_GUID => SampleFormat::Pcm { bits_per_sample },
+            Some(guid) if guid == IEEE_FLOAT_SUBFORMAT_GUID => {
+                SampleFormat::IeeeFloat { bits_per_sample }
+            }
+            _ => return Err(WavError::UnsupportedExtensibleSubFormat),
+        },
+        tag => return Err(WavError::UnsupportedFormatTag(tag)),
+    };
+    let supported_bits = match sample_format {
+        SampleFormat::Pcm { .. } => matches!(bits_per_sample, 8 | 16 | 24 | 32),
+        SampleFormat::IeeeFloat { .. } => matches!(bits_per_sample, 32 | 64),
+    };
+    if !supported_bits {
         return Err(WavError::UnsupportedBitsPerSample(bits_per_sample));
     }
     if channels != 1 && channels != 2 {
@@ -307,6 +413,7 @@ fn parse_header(bytes: &[u8]) -> Result<WavHeader, WavError> {
     Ok(WavHeader {
         channels,
         sample_rate,
+        sample_format,
         data_offset,
         data_len,
     })
@@ -321,6 +428,7 @@ pub(crate) struct WavStreamReader {
     bytes: Arc<Vec<u8>>,
     channels: u16,
     sample_rate: u32,
+    sample_format: SampleFormat,
     data_offset: usize,
     frame_size: usize,
     total_frames: u64,
@@ -334,13 +442,14 @@ impl WavStreamReader {
 
     pub(crate) fn open_shared(bytes: Arc<Vec<u8>>) -> Result<Self, WavError> {
         let header = parse_header(&bytes)?;
-        let bytes_per_sample = 2usize;
+        let bytes_per_sample = header.sample_format.bytes_per_sample();
         let frame_size = bytes_per_sample * header.channels as usize;
         let frames = header.data_len.checked_div(frame_size).unwrap_or(0);
         Ok(Self {
             bytes,
             channels: header.channels,
             sample_rate: header.sample_rate,
+            sample_format: header.sample_format,
             data_offset: header.data_offset,
             frame_size,
             total_frames: frames as u64,
@@ -364,19 +473,31 @@ impl WavStreamReader {
                 break;
             };
             if self.channels == 2 {
-                let Some(left) = read_i16_le(data, frame_offset) else {
+                let bytes_per_sample = self.sample_format.bytes_per_sample();
+                let Some(left) = data.get(frame_offset..frame_offset + bytes_per_sample) else {
                     break;
                 };
-                let Some(right) = read_i16_le(data, frame_offset + 2) else {
+                let right_offset = frame_offset + bytes_per_sample;
+                let Some(right) = data.get(right_offset..right_offset + bytes_per_sample) else {
                     break;
                 };
-                out[frame * CHANNELS] = i16_to_f32(left);
-                out[frame * CHANNELS + 1] = i16_to_f32(right);
+                let Some(left) = sample_to_f32(self.sample_format, left) else {
+                    break;
+                };
+                let Some(right) = sample_to_f32(self.sample_format, right) else {
+                    break;
+                };
+                out[frame * CHANNELS] = left;
+                out[frame * CHANNELS + 1] = right;
             } else {
-                let Some(mono) = read_i16_le(data, frame_offset) else {
+                let bytes_per_sample = self.sample_format.bytes_per_sample();
+                let Some(mono) = data.get(frame_offset..frame_offset + bytes_per_sample) else {
                     break;
                 };
-                let sample = i16_to_f32(mono) * EQUAL_POWER_GAIN;
+                let Some(sample) = sample_to_f32(self.sample_format, mono) else {
+                    break;
+                };
+                let sample = sample * EQUAL_POWER_GAIN;
                 out[frame * CHANNELS] = sample;
                 out[frame * CHANNELS + 1] = sample;
             }
@@ -444,14 +565,24 @@ pub mod golden {
     //! テスト用の wav バイト列生成(ゴールデンテスト用。バイナリはコミットせずコードで生成する。
     //! 初期構築仕様 §8)。
 
-    /// 既知の PCM16 サンプル列から最小限の wav(RIFF/PCM)バイト列を組み立てる。
-    pub fn make_pcm16_wav(sample_rate: u32, channels: u16, samples: &[i16]) -> Vec<u8> {
-        let bytes_per_sample = 2u32;
+    use super::{
+        IEEE_FLOAT_SUBFORMAT_GUID, PCM_SUBFORMAT_GUID, WAVE_FORMAT_EXTENSIBLE,
+        WAVE_FORMAT_IEEE_FLOAT, WAVE_FORMAT_PCM,
+    };
+
+    fn make_wav(
+        sample_rate: u32,
+        channels: u16,
+        bits_per_sample: u16,
+        format_tag: u16,
+        data_bytes: &[u8],
+        sub_format: Option<[u8; 16]>,
+    ) -> Vec<u8> {
+        let bytes_per_sample = u32::from(bits_per_sample / 8);
         let block_align = bytes_per_sample as u16 * channels;
-        let byte_rate = sample_rate * block_align as u32;
-        let data_bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let byte_rate = sample_rate * u32::from(block_align);
         let data_size = data_bytes.len() as u32;
-        let fmt_size: u32 = 16;
+        let fmt_size: u32 = if sub_format.is_some() { 40 } else { 16 };
         let riff_size = 4 /* WAVE */ + (8 + fmt_size) + (8 + data_size);
 
         let mut out = Vec::new();
@@ -461,47 +592,130 @@ pub mod golden {
 
         out.extend_from_slice(b"fmt ");
         out.extend_from_slice(&fmt_size.to_le_bytes());
-        out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        out.extend_from_slice(&format_tag.to_le_bytes());
         out.extend_from_slice(&channels.to_le_bytes());
         out.extend_from_slice(&sample_rate.to_le_bytes());
         out.extend_from_slice(&byte_rate.to_le_bytes());
         out.extend_from_slice(&block_align.to_le_bytes());
-        out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        out.extend_from_slice(&bits_per_sample.to_le_bytes());
+        if let Some(sub_format) = sub_format {
+            out.extend_from_slice(&22u16.to_le_bytes()); // cbSize
+            out.extend_from_slice(&bits_per_sample.to_le_bytes()); // valid bits
+            out.extend_from_slice(&0u32.to_le_bytes()); // channel mask (unused by decoder)
+            out.extend_from_slice(&sub_format);
+        }
 
         out.extend_from_slice(b"data");
         out.extend_from_slice(&data_size.to_le_bytes());
-        out.extend_from_slice(&data_bytes);
+        out.extend_from_slice(data_bytes);
 
         out
     }
 
-    /// 非対応ビット深度(8bit PCM)の wav を組み立てる(拒否テスト用)。
+    /// 既知の PCM16 サンプル列から最小限の wav(RIFF/PCM)バイト列を組み立てる。
+    pub fn make_pcm16_wav(sample_rate: u32, channels: u16, samples: &[i16]) -> Vec<u8> {
+        let data_bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        make_wav(
+            sample_rate,
+            channels,
+            16,
+            WAVE_FORMAT_PCM,
+            &data_bytes,
+            None,
+        )
+    }
+
+    /// PCM8(符号なし) wav を組み立てる。
     pub fn make_pcm8_wav(sample_rate: u32, channels: u16, samples: &[u8]) -> Vec<u8> {
-        let block_align = channels; // 1 byte/sample
-        let byte_rate = sample_rate * block_align as u32;
-        let data_size = samples.len() as u32;
-        let fmt_size: u32 = 16;
-        let riff_size = 4 + (8 + fmt_size) + (8 + data_size);
+        make_wav(sample_rate, channels, 8, WAVE_FORMAT_PCM, samples, None)
+    }
 
-        let mut out = Vec::new();
-        out.extend_from_slice(b"RIFF");
-        out.extend_from_slice(&riff_size.to_le_bytes());
-        out.extend_from_slice(b"WAVE");
+    /// PCM24 サンプル列を組み立てる。各値の下位24bitが little-endian で格納される。
+    pub fn make_pcm24_wav(sample_rate: u32, channels: u16, samples: &[i32]) -> Vec<u8> {
+        let data_bytes: Vec<u8> = samples
+            .iter()
+            .flat_map(|sample| {
+                let bytes = sample.to_le_bytes();
+                [bytes[0], bytes[1], bytes[2]]
+            })
+            .collect();
+        make_wav(
+            sample_rate,
+            channels,
+            24,
+            WAVE_FORMAT_PCM,
+            &data_bytes,
+            None,
+        )
+    }
 
-        out.extend_from_slice(b"fmt ");
-        out.extend_from_slice(&fmt_size.to_le_bytes());
-        out.extend_from_slice(&1u16.to_le_bytes());
-        out.extend_from_slice(&channels.to_le_bytes());
-        out.extend_from_slice(&sample_rate.to_le_bytes());
-        out.extend_from_slice(&byte_rate.to_le_bytes());
-        out.extend_from_slice(&block_align.to_le_bytes());
-        out.extend_from_slice(&8u16.to_le_bytes());
+    /// PCM32 サンプル列を組み立てる。
+    pub fn make_pcm32_wav(sample_rate: u32, channels: u16, samples: &[i32]) -> Vec<u8> {
+        let data_bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        make_wav(
+            sample_rate,
+            channels,
+            32,
+            WAVE_FORMAT_PCM,
+            &data_bytes,
+            None,
+        )
+    }
 
-        out.extend_from_slice(b"data");
-        out.extend_from_slice(&data_size.to_le_bytes());
-        out.extend_from_slice(samples);
+    /// IEEE float32 サンプル列を組み立てる。
+    pub fn make_float32_wav(sample_rate: u32, channels: u16, samples: &[f32]) -> Vec<u8> {
+        let data_bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        make_wav(
+            sample_rate,
+            channels,
+            32,
+            WAVE_FORMAT_IEEE_FLOAT,
+            &data_bytes,
+            None,
+        )
+    }
 
-        out
+    /// IEEE float64 サンプル列を組み立てる。
+    pub fn make_float64_wav(sample_rate: u32, channels: u16, samples: &[f64]) -> Vec<u8> {
+        let data_bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        make_wav(
+            sample_rate,
+            channels,
+            64,
+            WAVE_FORMAT_IEEE_FLOAT,
+            &data_bytes,
+            None,
+        )
+    }
+
+    /// WAVE_FORMAT_EXTENSIBLE の PCM16 wav を組み立てる。
+    pub fn make_extensible_pcm16_wav(sample_rate: u32, channels: u16, samples: &[i16]) -> Vec<u8> {
+        let data_bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        make_wav(
+            sample_rate,
+            channels,
+            16,
+            WAVE_FORMAT_EXTENSIBLE,
+            &data_bytes,
+            Some(PCM_SUBFORMAT_GUID),
+        )
+    }
+
+    /// WAVE_FORMAT_EXTENSIBLE の IEEE float32 wav を組み立てる。
+    pub fn make_extensible_float32_wav(
+        sample_rate: u32,
+        channels: u16,
+        samples: &[f32],
+    ) -> Vec<u8> {
+        let data_bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        make_wav(
+            sample_rate,
+            channels,
+            32,
+            WAVE_FORMAT_EXTENSIBLE,
+            &data_bytes,
+            Some(IEEE_FLOAT_SUBFORMAT_GUID),
+        )
     }
 }
 
@@ -566,9 +780,10 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_bit_depth() {
-        let bytes = make_pcm8_wav(48_000, 1, &[128, 200, 10]);
+        let mut bytes = make_pcm8_wav(48_000, 1, &[128, 200, 10]);
+        bytes[34..36].copy_from_slice(&7u16.to_le_bytes());
         let err = decode(&bytes, 48_000).unwrap_err();
-        assert_eq!(err, WavError::UnsupportedBitsPerSample(8));
+        assert_eq!(err, WavError::UnsupportedBitsPerSample(7));
     }
 
     #[test]
@@ -618,6 +833,158 @@ mod tests {
         let sound = decode(&bytes, 48_000)
             .expect("unknown odd-sized chunk must be skipped, not break parsing");
         assert_eq!(sound.frames, 2);
+    }
+
+    fn assert_samples_are_close(name: &str, actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len(), "{name}: sample count differs");
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1e-6,
+                "{name}: sample {index} differs: actual={actual:?}, expected={expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decodes_all_supported_sample_formats_in_bulk_and_streaming_paths() {
+        let cases = [
+            (
+                "PCM8",
+                make_pcm8_wav(48_000, 2, &[0, 255, 128, 64]),
+                vec![-1.0, 127.0 / 128.0, 0.0, -64.0 / 128.0],
+            ),
+            (
+                "PCM16",
+                make_pcm16_wav(48_000, 2, &[-32_768, 32_767, 16_384, -16_384]),
+                vec![-1.0, 32_767.0 / 32_768.0, 0.5, -0.5],
+            ),
+            (
+                "PCM24",
+                make_pcm24_wav(48_000, 2, &[-8_388_608, 8_388_607, 1, -1]),
+                vec![
+                    -1.0,
+                    8_388_607.0 / 8_388_608.0,
+                    1.0 / 8_388_608.0,
+                    -1.0 / 8_388_608.0,
+                ],
+            ),
+            (
+                "PCM32",
+                make_pcm32_wav(48_000, 2, &[i32::MIN, i32::MAX, 1, -1]),
+                vec![
+                    -1.0,
+                    i32::MAX as f32 / 2_147_483_648.0,
+                    1.0 / 2_147_483_648.0,
+                    -1.0 / 2_147_483_648.0,
+                ],
+            ),
+            (
+                "IEEE float32",
+                make_float32_wav(48_000, 2, &[-1.25, 0.25, 0.5, -0.75]),
+                vec![-1.25, 0.25, 0.5, -0.75],
+            ),
+            (
+                "IEEE float64",
+                make_float64_wav(48_000, 2, &[-1.25, 0.25, 0.5, -0.75]),
+                vec![-1.25, 0.25, 0.5, -0.75],
+            ),
+            (
+                "WAVE_FORMAT_EXTENSIBLE PCM",
+                make_extensible_pcm16_wav(48_000, 2, &[-16_384, 16_384, 32_767, -32_768]),
+                vec![-0.5, 0.5, 32_767.0 / 32_768.0, -1.0],
+            ),
+            (
+                "WAVE_FORMAT_EXTENSIBLE IEEE float",
+                make_extensible_float32_wav(48_000, 2, &[-0.25, 0.75, 0.5, -0.5]),
+                vec![-0.25, 0.75, 0.5, -0.5],
+            ),
+        ];
+
+        for (name, bytes, expected) in cases {
+            let sound = decode(&bytes, 48_000)
+                .unwrap_or_else(|error| panic!("{name}: bulk decode failed: {error}"));
+            assert_samples_are_close(name, &sound.interleaved, &expected);
+
+            let mut reader = WavStreamReader::open(bytes).expect("streaming reader must open");
+            let mut streamed = vec![0.0; expected.len()];
+            let frames = reader.read(&mut streamed);
+            assert_eq!(
+                frames,
+                expected.len() / CHANNELS,
+                "{name}: frame count differs"
+            );
+            assert_samples_are_close(name, &streamed, &expected);
+        }
+    }
+
+    #[test]
+    fn extensible_channel_mask_is_ignored() {
+        let mut bytes = make_extensible_pcm16_wav(48_000, 2, &[16_384, -16_384]);
+        // WAVE_FORMAT_EXTENSIBLE の channel mask は fmt body の byte 20..24。
+        bytes[40..44].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+        let sound =
+            decode(&bytes, 48_000).expect("channel mask must not affect channel-count decoding");
+        assert_samples_are_close(
+            &sound.sample_rate.to_string(),
+            &sound.interleaved,
+            &[0.5, -0.5],
+        );
+    }
+
+    #[test]
+    fn seeking_is_sample_accurate_for_each_supported_bit_depth() {
+        let cases = [
+            (
+                "PCM8",
+                make_pcm8_wav(48_000, 2, &[0, 255, 128, 64, 32, 224]),
+                [-0.75, 0.75],
+            ),
+            (
+                "PCM16",
+                make_pcm16_wav(
+                    48_000,
+                    2,
+                    &[-32_768, 32_767, 16_384, -16_384, 8_192, -8_192],
+                ),
+                [0.25, -0.25],
+            ),
+            (
+                "PCM24",
+                make_pcm24_wav(
+                    48_000,
+                    2,
+                    &[-8_388_608, 8_388_607, 1, -1, 2_097_152, -2_097_152],
+                ),
+                [0.25, -0.25],
+            ),
+            (
+                "PCM32",
+                make_pcm32_wav(
+                    48_000,
+                    2,
+                    &[i32::MIN, i32::MAX, 1, -1, 536_870_912, -536_870_912],
+                ),
+                [0.25, -0.25],
+            ),
+            (
+                "IEEE float32",
+                make_float32_wav(48_000, 2, &[-1.0, 1.0, 0.125, -0.125, 0.5, -0.5]),
+                [0.5, -0.5],
+            ),
+            (
+                "IEEE float64",
+                make_float64_wav(48_000, 2, &[-1.0, 1.0, 0.125, -0.125, 0.5, -0.5]),
+                [0.5, -0.5],
+            ),
+        ];
+
+        for (name, bytes, expected) in cases {
+            let mut reader = WavStreamReader::open(bytes).expect("streaming reader must open");
+            reader.seek(2);
+            let mut out = [0.0; CHANNELS];
+            assert_eq!(reader.read(&mut out), 1, "{name}: seeked frame is missing");
+            assert_samples_are_close(name, &out, &expected);
+        }
     }
 
     // --- ここから先はリサンプル(初期構築仕様『§4.7』)の検証 -------------------------

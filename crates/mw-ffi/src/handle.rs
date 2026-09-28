@@ -27,7 +27,7 @@ use mw_backend::{Backend, BackendError, CpalBackend};
 use mw_core::{
     BUS_COUNT, BgmStatePublisher, BusId, Command, CommandSender, Config, EventQueue,
     MusicClockPublisher, MusicClockSnapshot, MusicDecoder, MusicState, ReclaimReceiver, Renderer,
-    SoundStorage, StreamErrorReason, SymphoniaDecoder,
+    SoundStorage, StreamErrorReason, WavDecoder,
 };
 
 use crate::decode_thread::{self, DecoderSender};
@@ -331,9 +331,9 @@ impl Instance {
     /// 再生中の楽曲を release した場合の挙動: 拒否せず即座に解放を受け付ける。
     ///
     /// 🔴 **共有ストレージを使う理由。** `mw_music_set` は
-    /// `SymphoniaDecoder::open` へバイト列の**複製**を渡していた(`Vec<u8>` を値で
+    /// `WavDecoder::open` へバイト列の**複製**を渡していた(`Vec<u8>` を値で
     /// 要求するため)ので「そもそも別々のメモリ」だった。いまは
-    /// `SymphoniaDecoder::open_shared` に `Arc<Vec<u8>>` をそのまま渡しており、
+    /// `WavDecoder::open_shared` に `Arc<Vec<u8>>` をそのまま渡しており、
     /// **デコードスレッドとストレージは同じメモリを共有している。**
     ///
     /// それでも release が安全なのは `Arc` の参照カウントによる ——
@@ -599,7 +599,7 @@ impl Instance {
     /// 🔴 **P3-11 で3段構成へ分割した設計の入口。** 元の `attempt_reopen`
     /// は「close → デコードスレッド2本 join(待ち時間に上限無し)→
     /// `Renderer::build_with_events` → `backend.open`(cpal のデバイスオープン。
-    /// 数百 ms かかりうる)→ `SymphoniaDecoder::open_shared`(デコード probe)」を
+    /// 数百 ms かかりうる)→ `WavDecoder::open_shared`(デコード probe)」を
     /// **レジストリの `Mutex` を握ったまま**通しで実行しており、その間は他のあらゆる
     /// FFI 呼び出し(`with_instance` 経由)がゲームスレッドで足止めされていた
     /// (初期構築仕様『§5.4』「全関数非ブロッキング」への最悪の違反、
@@ -835,7 +835,7 @@ impl Instance {
         };
         let output_sample_rate = self.backend_sample_rate();
         // 🔴 複製しない(P3-13)。`get_music_bytes` が返す `Arc` をそのまま渡す。
-        let decoder = match SymphoniaDecoder::open_shared(bytes, output_sample_rate) {
+        let decoder = match WavDecoder::open_shared(bytes, output_sample_rate) {
             Ok(decoder) => decoder,
             Err(err) => {
                 mw_backend::mw_log!("[mw-ffi] attempt_reopen: re-decoding music failed: {err}");
@@ -890,7 +890,7 @@ impl Instance {
         };
         let output_sample_rate = self.backend_sample_rate();
         // 🔴 複製しない(P3-13)。`get_music_bytes` が返す `Arc` をそのまま渡す。
-        let decoder = match SymphoniaDecoder::open_shared(bytes, output_sample_rate) {
+        let decoder = match WavDecoder::open_shared(bytes, output_sample_rate) {
             Ok(decoder) => decoder,
             Err(err) => {
                 mw_backend::mw_log!("[mw-ffi] attempt_reopen: re-decoding bgm failed: {err}");

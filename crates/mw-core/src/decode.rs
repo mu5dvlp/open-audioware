@@ -477,9 +477,6 @@ impl MusicDecoder for WavDecoder {
     }
 }
 
-/// 互換名。実装は WAV 専用の [`WavDecoder`] である。
-pub type SymphoniaDecoder = WavDecoder;
-
 #[cfg(test)]
 mod tests {
     use super::*;

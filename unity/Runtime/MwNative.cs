@@ -52,7 +52,7 @@ namespace Mw.Native
         /// </summary>
         ErrUnsupportedSampleRate = -8,
 
-        /// <summary>wav が 16bit PCM でない、またはチャンネル数がモノ/ステレオでない。</summary>
+        /// <summary>wav のフォーマットまたはチャンネル数が対応範囲外だった。</summary>
         ErrUnsupportedFormat = -9,
 
         /// <summary>指定されたサウンド ID が存在しない(未ロード / 既に解放済み)。</summary>
@@ -428,7 +428,8 @@ namespace Mw.Native
         /// 音源のバイト列をロードする(初期構築仕様 §5.5, §4.2)。
         /// <para>
         /// <see cref="SoundMode.Se"/>: wav を全デコードしてメモリ常駐させる。対応フォーマットは
-        /// 48kHz / 16bit PCM / モノラルまたはステレオの wav のみ。
+        /// PCM 8/16/24/32bit、IEEE float 32/64bit、および対応する
+        /// WAVE_FORMAT_EXTENSIBLE のモノラルまたはステレオ wav。
         /// </para>
         /// <para>
         /// <see cref="SoundMode.Music"/>: デコードせず圧縮バイト列のまま保持する(M2-7)。
