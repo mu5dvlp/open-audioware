@@ -1030,8 +1030,7 @@ mod tests {
         const FRAME_COUNT: usize = 4_410; // 100ms
 
         let bytes = make_sine_wave_wav(SOURCE_RATE, FREQ_HZ, FRAME_COUNT, 20_000);
-        let sound =
-            decode(&bytes, OUTPUT_RATE).expect("non-48k wav must now decode via resampling");
+        let sound = decode(&bytes, OUTPUT_RATE).expect("non-48k wav must decode via resampling");
 
         assert_eq!(sound.sample_rate, OUTPUT_RATE);
         let expected_frames =

@@ -834,7 +834,7 @@ mod tests {
         const OUTPUT_RATE: u32 = 48_000;
         let bytes = make_sine_wave_wav(SOURCE_RATE, 1_000.0, 2_000, 10_000);
         let mut decoder =
-            WavDecoder::open(bytes, OUTPUT_RATE).expect("mismatched sample rate must now succeed");
+            WavDecoder::open(bytes, OUTPUT_RATE).expect("mismatched sample rate must succeed");
         let left = drain_left_channel(&mut decoder, 256);
         assert!(!left.is_empty());
     }
