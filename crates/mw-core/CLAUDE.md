@@ -179,7 +179,7 @@ M0 では `Arc<Renderer>` をゲームスレッドと音声スレッドで共有
 `mw-backend::Backend::open` へ値渡し(ムーブ)する設計にした。ゲームスレッドは
 以下の2つの別ハンドルを経由してのみ音声スレッドとやり取りする:
 
-- `CommandSender`(`build` が返す): `rtrb::Producer<Command>` を `Mutex` で包んだもの。
+- `CommandSender`(`build` が返す): 自前 SPSC 生産側(`Producer<Command>`)を `Mutex` で包んだもの。
   ゲームスレッド側は複数スレッドから並行に呼ばれうる(§5.4)ため `Mutex` を使ってよい
   (§5.3 が禁止するのは音声スレッド側でのロック取得のみ)。
 - `ReclaimReceiver`(`build` が返す): 音声スレッドが手放した `Arc<SoundData>` を
@@ -196,7 +196,7 @@ M0 では `Arc<Renderer>` をゲームスレッドと音声スレッドで共有
   してコマンドへ載せ、音声スレッドの `VoicePool` へムーブする。
 - ボイスが終了(自然終了・停止・スティール完了)した際、音声スレッドはその `Arc` を
   **その場でドロップしない**。`ReclaimSender`(`Mixer` 内部専用、`ReclaimReceiver` と対になる
-  rtrb キューの送信側)へムーブで送り出す。ゲームスレッド側が `ReclaimReceiver::drain()` で
+  SPSC キューの送信側へムーブで送り出す。ゲームスレッド側が `ReclaimReceiver::drain()` で
   回収してドロップする(= 実際のデアロケーションはゲームスレッド上で起こる)。
   **「コールバック内での Arc ドロップ禁止」がこの設計の核心。**
 - 回収キューが満杯(通常運用では到達しない設計容量にしてある)の場合の最終手段として
@@ -247,7 +247,7 @@ M4-3 で BGM ボイスの再生 + ループ折り返しもこの同じシナリ�
 
 ## 依存
 
-`rtrb`(SPSC ロックフリーリングバッファ。コマンドキューと回収キューの両方に使う。
+自前 SPSC ロックフリーリングバッファ(`ring_buffer`。コマンドキューと回収キューの両方に使う。
 当初 mw-ffi 境界に置く想定だったが、`Renderer::render` が `&mut self` の単一所有権を保つには
 `Consumer`/`Producer` をミキサ自身が持つ設計の方が単純なため mw-core に置いた)。
 `symphonia`(デコード。wav / ogg vorbis、`decode.rs`)・`rubato`(リサンプル、`resample.rs`)

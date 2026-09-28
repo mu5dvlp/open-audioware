@@ -11,11 +11,7 @@ description = "OS 非依存のミキサ・ボイス管理・クロック・デ�
 crate-type = ["rlib"]
 
 [dependencies]
-# SPSC ロックフリーリングバッファ。コマンドキュー(ゲーム→音声スレッド)と
-# 回収キュー(音声→ゲームスレッド、Arc<SoundData> の解放をゲームスレッド側へ戻す)、
-# および楽曲ストリーミングの PCM 供給キュー(§4.7, `stream.rs`)に使う
-# (初期構築仕様 §7.1, §5.2)。
-rtrb = "0.4"
+# SPSC ロックフリーリングバッファは `mw-core::ring_buffer` に実装する。
 # 楽曲のストリーミングデコード(初期構築仕様 §4.7, M7)。wav(PCM)/ ogg vorbis のみを
 # 使うため default-features を切り、必要な feature だけを有効化する(依存ツリーを
 # 無用に太らせない。§7.1 の実装方針)。opus 等の将来コーデック追加は MU2 の判断を待つ。
@@ -33,3 +29,7 @@ symphonia = { version = "0.6", default-features = false, features = [
 rubato = "5.0"
 
 [dev-dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }

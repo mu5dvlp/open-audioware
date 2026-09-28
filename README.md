@@ -216,7 +216,7 @@ Makefile・コードのどちらもアーチ非依存に書いてあります。
 | cpal | 出力デバイス抽象(`Backend` trait)の実装。OS のローレイテンシ音声 API を直接叩く |
 | symphonia | 楽曲ストリーミングのデコード(wav / ogg / vorbis) |
 | rubato | サンプルレート変換(リサンプリング) |
-| rtrb | ロックフリー SPSC リングバッファ。音声スレッドとのコマンド/回収/PCM 供給キューに使用 |
+| mw-core 内製 ring_buffer | ロックフリー SPSC リングバッファ。音声スレッドとのコマンド/回収/PCM 供給キューに使用 |
 | objc2 / objc2-avf-audio / objc2-foundation / block2 | iOS の AVAudioSession 設定と割り込み・バックグラウンド復帰の監視 |
 | mach2 | macOS / iOS / tvOS での高精度ホスト時刻取得 |
 | libc | Android / Linux での `CLOCK_MONOTONIC` 取得 |

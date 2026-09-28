@@ -18,9 +18,9 @@ pub struct Config {
     /// 初期構築仕様 M13(確定): 「すべての音量変化・停止はランプを通す」。
     /// 既定値 5ms は【仮】(§4.1)。
     pub default_ramp_ms: f32,
-    /// ゲームスレッド → 音声スレッドのコマンドキュー容量(SPSC, rtrb)。【仮】。
+    /// ゲームスレッド → 音声スレッドのコマンドキュー容量(SPSC)。【仮】。
     pub command_queue_capacity: usize,
-    /// 音声スレッド → ゲームスレッドの回収キュー容量(SPSC, rtrb)。【仮】。
+    /// 音声スレッド → ゲームスレッドの回収キュー容量(SPSC)。【仮】。
     /// `max_voices + steal_tail_capacity` を上回る余裕を持たせ、通常運用では
     /// 溢れない(= 音声スレッドでの Arc ドロップが発生しない)ようにする。
     pub reclaim_queue_capacity: usize,

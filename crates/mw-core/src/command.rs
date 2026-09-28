@@ -2,7 +2,7 @@
 //!
 //! FFI 呼び出しはこのコマンドをキューへ積むだけ(非ブロッキング)。
 //! 音声スレッドはコールバック先頭でキューを消化する([`crate::mixer::Mixer::render`])。
-//! SPSC ロックフリーキューの実体は `rtrb`(【仮】)。生成・Producer/Consumer の分配は
+//! SPSC ロックフリーキューの実体は [`crate::ring_buffer`]。生成・Producer/Consumer の分配は
 //! [`crate::mixer::build`] が行う。
 
 use std::sync::Arc;

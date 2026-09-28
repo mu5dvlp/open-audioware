@@ -59,7 +59,7 @@ maybe_reopen`(`mw_poll_events` から毎フレーム呼ばれる)がレジスト
   - getter 系は `self.backend`(段2の間は未オープンの `CpalBackend`)を読むだけなので、
     `Backend` トレイトが元々持つ「未オープンなら 0」の契約にそのまま乗る。
   - コマンド系は `self.command_sender`(畳まれつつある旧 `Renderer` の受信側)へ積むだけ
-    なので、rtrb の `Producer::push` は相手が消えていても即座にはエラーにならず、
+    なので、自前 SPSC リングの `Producer::push` は相手が消えていても即座にはエラーにならず、
     容量に余裕がある限り `Ok` を返しつつ実際には誰にも読まれず捨てられる——
     「成功を返して捨てる」がそのまま実現される。
 - ロックを早期に手放しつつ `Instance` を有効なまま保つことで、「バックエンドの無い
@@ -80,7 +80,7 @@ maybe_reopen`(`mw_poll_events` から毎フレーム呼ばれる)がレジスト
   `NotOpen` は、この変更以前から存在する挙動のため、従来通り `CloseFailed` のまま扱う。
 - **既知の残り**: `mw_music_set`/`mw_bgm_set` が使う `decoder_tx`/`bgm_decoder_tx`
   (`mpsc::Sender`)は、旧デコードスレッドが段2で実際に `join()` され切った後は `send` が
-  失敗し `MwResult::ErrCommandQueueFull` を返す——rtrb のコマンドキューと異なり
+  失敗し `MwResult::ErrCommandQueueFull` を返す——SPSC コマンドキューと異なり
   「相手が消えても即座にはエラーにならない」わけではないため。ただしこれは今回の分割が
   新たに持ち込んだものではなく、再オープンが失敗した後の自動再試行までの待機中にも
   以前から起きていた挙動であり、ブロックしない・新しいエラーコードを増やさないという

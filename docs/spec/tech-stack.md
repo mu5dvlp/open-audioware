@@ -17,7 +17,7 @@
 | cpal | 出力バックエンド | M6。全ターゲットを1系統で |
 | symphonia | デコード(wav / ogg vorbis) | M7 |
 | rubato | リサンプリング | §4.7 |
-| rtrb | SPSC ロックフリーリングバッファ | コマンド / イベント / PCM 供給 |
+| mw-core 内製 ring_buffer | SPSC ロックフリーリングバッファ | コマンド / イベント / PCM 供給 |
 | csbindgen | C# バインディング生成 | M2。IL2CPP 実績あり |
 | cargo-ndk | Android ビルド | .so 生成 |
 | criterion | ベンチマーク(任意) | ミキサのブロック処理性能の回帰検知 |

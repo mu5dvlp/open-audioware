@@ -16,18 +16,18 @@
 //! # 全体構成
 //!
 //! - 生産側 [`MusicStreamProducer`]: `pump(&mut decoder)`(`decoder` は
-//!   [`crate::decode::MusicDecoder`])でデコードし、`rtrb` の SPSC リングバッファへ
+//!   [`crate::decode::MusicDecoder`])でデコードし、自前の SPSC リングバッファへ
 //!   詰める。デコードスレッド(mw-ffi)から呼ばれる想定。
 //! - 消費側 [`StreamingMusicSource`]: [`crate::music::MusicFrameSource`] を実装する。
 //!   `read` は音声コールバックから呼ばれるため、アロケーション・ロック・パニック経路を
-//!   一切踏まない(`rtrb::Consumer::pop_partial_slice`/`read_chunk` は割り当て無しで使える)。
+//!   一切踏まない(`Consumer::pop_partial_slice`/`read_chunk` は割り当て無しで使える)。
 //!
 //! # シークの調停(エポックの ack 方式)
 //!
 //! 素直に「シーク要求 → デコーダをシークして詰め直す」だけでは壊れる。理由:
 //!
 //! - 音声スレッド(消費側)は待てない(§5.3: ブロッキング禁止)。
-//! - `rtrb` は**消費側しか pop できない**。生産側はリングバッファに残った古い PCM を
+//! - リングバッファは**消費側しか pop できない**。生産側はリングバッファに残った古い PCM を
 //!   自分では掃除できない。
 //! - 結果、素朴な実装ではシーク直後に古い位置の PCM が数フレーム鳴ってしまう。
 //!
@@ -69,13 +69,12 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use rtrb::RingBuffer;
-
 use crate::config::Config;
 use crate::decode::{DecodeError, MusicDecoder};
 use crate::format::CHANNELS;
 use crate::music::MusicFrameSource;
 use crate::ramp::ms_to_samples;
+use crate::ring_buffer::{Consumer, Producer, RingBuffer};
 
 /// 総フレーム数「不明」を表すセンチネル値。`u64::MAX` フレーム(見積もり上限)は
 /// 現実的な楽曲長では起こり得ないため、`Option<u64>` を素の `AtomicU64` に落とし込む
@@ -127,7 +126,7 @@ pub struct PumpOutcome {
 /// リングバッファの生産側(初期構築仕様『§5.2』のデコードスレッドに相当する処理を提供する。
 /// ただしスレッドそのものは持たない。モジュール doc 参照)。
 pub struct MusicStreamProducer {
-    producer: rtrb::Producer<f32>,
+    producer: Producer<f32>,
     shared: Arc<SharedState>,
     /// 直近に処理し終えた(ack 済みの)epoch。`shared.seek_epoch` と比較して新しい
     /// シーク要求の有無を判定する、生産側専用のローカルキャッシュ(共有はしない)。
@@ -141,7 +140,7 @@ impl MusicStreamProducer {
     ///   (`MusicDecoder::seek` がサンプル境界への合わせ込みを行う)、ack してから
     ///   このリングバッファへの詰め込みへ進む。
     /// - リングバッファの空き分だけをまとめて `decoder.read` に渡す
-    ///   (`rtrb::Producer::write_chunk` でアロケーション無しに直接書き込む)。
+    ///   (`Producer::write_chunk` でアロケーション無しに直接書き込む)。
     /// - デコードエラーは状態として保持し(`has_error`)、`Err` を返す。
     ///   イベント通知(`StreamError`)への昇格は後続作業(モジュール doc 参照)。
     ///
@@ -243,7 +242,7 @@ impl MusicStreamProducer {
 
 /// リングバッファの消費側。[`MusicFrameSource`] を実装し、音声コールバックから呼ばれる。
 pub struct StreamingMusicSource {
-    consumer: rtrb::Consumer<f32>,
+    consumer: Consumer<f32>,
     shared: Arc<SharedState>,
     /// `is_ready` がプリロール完了とみなすために必要な最小バッファ済みフレーム数。
     preroll_frames: usize,
@@ -323,7 +322,7 @@ impl MusicFrameSource for StreamingMusicSource {
 
     fn request_seek(&mut self, frame: u64) {
         // 一次防御: 今リングバッファにあるものは全部消費側自身の手で掃除する
-        // (rtrb は消費側しか pop できないため、これができるのは消費側だけ)。
+        // (リングバッファは消費側しか pop できないため、これができるのは消費側だけ)。
         self.drain_all_available();
 
         // Relaxed で先に書く: 続く `seek_epoch` の Release ストアが、この書き込みを
@@ -503,7 +502,7 @@ mod tests {
         );
 
         // プリロール(5フレーム)を割り込むまで読み出す(EOF はまだ来ていない)。
-        let mut drain = vec![0.0f32; 16 * CHANNELS];
+        let mut drain = vec![0.0f32; 32 * CHANNELS];
         let drained = source.read(&mut drain);
         assert!(drained >= 16);
         assert!(

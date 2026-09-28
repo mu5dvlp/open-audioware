@@ -7,8 +7,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rtrb::{Consumer, Producer, PushError, RingBuffer};
-
 use crate::bus::{ALL_BUSES, BUS_COUNT, BusId, BusSet};
 use crate::clipper::SoftClipper;
 use crate::clock::{BgmStatePublisher, MusicClockPublisher};
@@ -18,6 +16,7 @@ use crate::event::{Event, EventQueue};
 use crate::format::CHANNELS;
 use crate::music::{MusicFrameSource, MusicState, MusicVoice};
 use crate::ramp::ms_to_samples;
+use crate::ring_buffer::{Consumer, Producer, PushError, RingBuffer};
 use crate::schedule::{ScheduleQueue, buffer_duration_ns, offset_within_buffer};
 use crate::sound::SoundData;
 use crate::stream::{self, MusicStreamProducer, StreamingMusicSource};
@@ -25,7 +24,7 @@ use crate::voice::{StealOutcome, VoicePool};
 
 /// ゲームスレッド側から音声スレッドへコマンドを送るハンドル。
 ///
-/// 複数スレッドから並行に呼ばれても安全なよう、内部の `rtrb::Producer` を
+/// 複数スレッドから並行に呼ばれても安全なよう、内部の SPSC 生産側を
 /// `Mutex` で包む(§5.4: 「全関数スレッドセーフ」。これはゲームスレッド側のコードであり、
 /// 音声コールバック経路の対象外なので `Mutex` を使ってよい。§5.3 が禁止するのは
 /// 音声スレッド側でのロック取得のみ)。

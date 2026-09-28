@@ -281,7 +281,7 @@ impl Instance {
     }
 
     /// 音声スレッドが手放した `Arc<SoundData>` をゲームスレッド上で回収する。
-    /// FFI 呼び出しの合間に日和見的に呼ぶ(§5.4: 非ブロッキング。rtrb の pop は O(1))。
+    /// FFI 呼び出しの合間に日和見的に呼ぶ(§5.4: 非ブロッキング。リングの pop は O(1))。
     pub fn drain_reclaimed(&self) {
         let mut guard = self
             .reclaim_receiver
@@ -632,7 +632,7 @@ impl Instance {
     ///   (`crates/mw-backend/src/backend.rs` の各メソッド doc)にそのまま乗る——
     ///   新しいエラーコードもパニックも要らない。
     /// - コマンド系は `self.command_sender`(段2の間は畳まれつつある旧 `Renderer` の
-    ///   受信側を指す、いずれ受信側ごと破棄される)へ積むだけなので、rtrb の
+    ///   受信側を指す、いずれ受信側ごと破棄される)へ積むだけなので、SPSC リングの
     ///   `Producer::push` は相手が消えていても即座にはエラーにならず(容量に余裕が
     ///   ある限り成功を返す)、`Ok` を返しつつ実際には誰にも読まれず捨てられる——
     ///   まさに「成功を返して捨てる」がそのまま実現される。
@@ -642,7 +642,7 @@ impl Instance {
     /// ため、直近の実測値へフォールバックする専用の対処を入れてある(同メソッドの
     /// ドキュメント参照)。
     /// ⚠️ **例外2箇所目(軽微、実装時に判明)**: `mw_music_set`/`mw_bgm_set` が使う
-    /// `decoder_tx`/`bgm_decoder_tx`(`mpsc::Sender`)は rtrb と異なり、受信側
+    /// `decoder_tx`/`bgm_decoder_tx`(`mpsc::Sender`)は SPSC リングと異なり、受信側
     /// (旧デコードスレッド)が段2で実際に `join()` され切った後は `send` が
     /// `Err`(切断)を返す——`send_decoder_for` はこれを `false` として伝播し、
     /// `mw_music_set`/`mw_bgm_set` は `MwResult::ErrCommandQueueFull` を返す。

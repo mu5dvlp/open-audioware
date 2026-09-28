@@ -47,8 +47,8 @@
 //! `mw-backend::CpalBackend` の cpal `err_fn` が同じことをしているのと同じ思想。
 //! パニックしたデコーダは内部状態が不定になりうるため以後使い回さず捨てる
 //! (次の `mw_music_set` を待つ)。一方 [`MusicStreamProducer`] 自体は使い回して
-//! 問題ない: `rtrb::WriteChunk` は commit されなかった書き込みを `Drop` で
-//! 安全に破棄する設計(`rtrb` のソース確認済み)なので、`pump` の途中(chunk を
+//! 問題ない: 自前 `WriteChunk` は commit されなかった書き込みを `Drop` で
+//! 安全に破棄する設計なので、`pump` の途中(chunk を
 //! commit する前)でパニックしても内部のリングバッファは壊れない。
 
 use std::panic::{self, AssertUnwindSafe};
