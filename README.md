@@ -59,12 +59,12 @@ Unity のバージョンは **6000.4.1f1** で検証しています。
 `Packages/manifest.json` に1行足すだけです:
 
 ```json
-"com.mu5dvlp.open-audioware": "https://github.com/mu5dvlp/open-audioware.git?path=unity#upm/v1.0.0"
+"com.mu5dvlp.open-audioware": "https://github.com/mu5dvlp/open-audioware.git?path=unity#upm/v0.1.0"
 ```
 
 - `upm/vX.Y.Z` はビルド済みネイティブライブラリ(iOS: `xcframework` / Android: `.so` /
   macOS: `.dylib`)を同梱したタグです。**自分でビルドする必要はありません**
-- 版を固定したい場合は末尾の `#upm/v1.0.0` を目的のタグに変えてください。**タグを明示することを
+- 版を固定したい場合は末尾の `#upm/v0.1.0` を目的のタグに変えてください。**タグを明示することを
   推奨します**(省略して `upm` ブランチの先頭を指すと、リリース作業の途中の状態を掴む可能性があります)
 - ⚠️ **ワークスペース内で client と一緒に Rust 側も改造しながら開発する場合はこちらではなく**
   [`docs/integration.md`](./docs/integration.md) の `file:` 参照(ソースからビルド)を使ってください。
@@ -258,8 +258,8 @@ Makefile・コードのどちらもアーチ非依存に書いてあります。
 2. そのバージョンに `v` を付けたタグを打って push する
 
    ```sh
-   git tag v1.0.0
-   git push origin v1.0.0
+   git tag v0.1.0
+   git push origin v0.1.0
    ```
 3. ワークフローが iOS(xcframework)/ macOS(dylib)/ Android(.so)を並列ビルドし、
    `unity/` の中身(`package.json` / `.meta` / 手書き C# ラッパ)と合わせて **`upm` ブランチ**
