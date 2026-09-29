@@ -480,7 +480,7 @@ impl MusicDecoder for WavDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wav::golden::make_pcm16_wav;
+    use crate::wav::golden::{make_float32_wav, make_pcm16_wav};
 
     const SAMPLE_RATE: u32 = 48_000;
 
@@ -857,5 +857,49 @@ mod tests {
             WavDecoder::open(bytes, OUTPUT_RATE).expect("mismatched sample rate must succeed");
         let left = drain_left_channel(&mut decoder, 256);
         assert!(!left.is_empty());
+    }
+
+    #[test]
+    // Miri では対象外: rubato(外部クレート)の FFT リサンプラを Miri で解釈すると1本で数分〜十数分かかる。
+    // 検査したいのは自前コードの unsafe(ring_buffer / wav / decode の本体)で、rubato の中身ではない。
+    // rubato を自前化(依存排除のステップ2)したら外して、Miri の対象に戻す。
+    #[cfg_attr(miri, ignore = "rubato(外部)の FFT を Miri で解釈すると数分かかる")]
+    fn non_finite_samples_in_a_resampled_wav_do_not_panic_and_read_to_eof() {
+        // float32 の WAV に NaN / inf / 極端な値を直接埋め込み、レート不一致
+        // (48000 -> 44100、resample.rs::StreamResampler の Fft 経路を通る)でも
+        // 最後まで読み切れること(`resample.rs::sanitize_sample` が rubato へ渡す前に
+        // 正規化していることの回帰)。
+        const SOURCE_RATE: u32 = 48_000;
+        const OUTPUT_RATE: u32 = 44_100;
+        let samples: Vec<f32> = vec![
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            1.0e9,
+            -1.0e9,
+            0.0,
+            0.3,
+            -0.3,
+        ];
+        let bytes = make_float32_wav(SOURCE_RATE, 2, &samples);
+        let mut decoder = WavDecoder::open(bytes, OUTPUT_RATE)
+            .expect("valid wav must open even with non-finite samples");
+
+        let mut got = Vec::new();
+        loop {
+            let mut buf = vec![0.0f32; 64 * CHANNELS];
+            let n = decoder
+                .read(&mut buf)
+                .expect("read must not panic on non-finite input");
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n * CHANNELS]);
+        }
+        assert!(!got.is_empty(), "decoder must still produce output");
+        assert!(
+            got.iter().all(|v| v.is_finite()),
+            "decoded output must not contain NaN/inf: {got:?}"
+        );
     }
 }

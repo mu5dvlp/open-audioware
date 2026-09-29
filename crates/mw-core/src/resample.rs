@@ -85,6 +85,41 @@ const ONESHOT_WINDOW: WindowFunction = WindowFunction::BlackmanHarris2;
 /// SE 一括リサンプルの補間方式。線形/最近傍より高品質な三次補間を選ぶ。
 const ONESHOT_INTERPOLATION: SincInterpolationType = SincInterpolationType::Cubic;
 
+/// 許容するサンプルレート比(大きい方 / 小さい方)の上限。
+///
+/// `StreamResampler`(`rubato::Fft`、`FixedSync::Both`)は出力側の FFT サイズがおおよそ
+/// `STREAM_CHUNK_TARGET_FRAMES * 比`、`resample_oneshot`(`rubato::Async` sinc、
+/// `FixedAsync::Input`)は出力バッファがおおよそ `ONESHOT_CHUNK_FRAMES * 比` になる。
+/// 比が極端(例: 1Hz と 384,000Hz)だとどちらも確保が破綻するため、`validate_rates` で
+/// リサンプラを構築する前に弾く。現実的な音声のサンプルレート(8kHz〜384kHz程度)の
+/// 組み合わせはこの比に十分収まる。
+const MAX_RATE_RATIO: u32 = 256;
+
+/// レートの組み合わせが安全かを検査する。`StreamResampler::new` と `resample_oneshot` の
+/// 両方が、リサンプラを構築する・比を計算する前に必ずこれを通す。
+///
+/// - どちらかが 0 だと比が定義できない(0 除算、または無限大の比になる)。
+/// - 比が `MAX_RATE_RATIO` を超えると、リサンプラ内部のバッファ確保が比に比例して
+///   膨れ上がり、OOM やタイムアウトを起こしうる(`MAX_RATE_RATIO` のドキュメント参照)。
+fn validate_rates(source_rate: u32, output_rate: u32) -> Result<(), ResampleError> {
+    let invalid = || ResampleError::InvalidRates {
+        source_rate,
+        output_rate,
+    };
+    if source_rate == 0 || output_rate == 0 {
+        return Err(invalid());
+    }
+    let (hi, lo) = if source_rate >= output_rate {
+        (source_rate, output_rate)
+    } else {
+        (output_rate, source_rate)
+    };
+    if hi / lo > MAX_RATE_RATIO {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 /// リサンプル処理で発生しうるエラー。
 ///
 /// rubato のエラー型(`ResamplerConstructionError`/`ResampleError`)は `Clone`/`PartialEq`
@@ -96,6 +131,9 @@ pub enum ResampleError {
     Construction(String),
     /// 変換処理そのものが失敗した(バッファサイズ不一致等。通常の入力では起こらない)。
     Processing(String),
+    /// レートの組み合わせが不正(どちらかが 0、または比〔大きい方 / 小さい方〕が
+    /// `MAX_RATE_RATIO` を超える)。`validate_rates` がリサンプラの構築より前に弾く。
+    InvalidRates { source_rate: u32, output_rate: u32 },
 }
 
 impl fmt::Display for ResampleError {
@@ -103,6 +141,14 @@ impl fmt::Display for ResampleError {
         match self {
             ResampleError::Construction(msg) => write!(f, "resampler construction failed: {msg}"),
             ResampleError::Processing(msg) => write!(f, "resampling failed: {msg}"),
+            ResampleError::InvalidRates {
+                source_rate,
+                output_rate,
+            } => write!(
+                f,
+                "invalid resample rates (source: {source_rate} Hz, output: {output_rate} Hz): \
+                 both must be > 0 and their ratio must not exceed {MAX_RATE_RATIO}x"
+            ),
         }
     }
 }
@@ -118,6 +164,7 @@ mod display_tests {
         match error {
             ResampleError::Construction(_) => "resampler construction failed",
             ResampleError::Processing(_) => "resampling failed",
+            ResampleError::InvalidRates { .. } => "invalid resample rates",
         }
     }
 
@@ -126,6 +173,10 @@ mod display_tests {
         let errors = [
             ResampleError::Construction("zero rate".into()),
             ResampleError::Processing("short input".into()),
+            ResampleError::InvalidRates {
+                source_rate: 0,
+                output_rate: 48_000,
+            },
         ];
         let rendered: Vec<String> = errors
             .iter()
@@ -149,15 +200,27 @@ mod display_tests {
         // 引数(内側の詳細メッセージ)が文言に出ていることも見る。
         // 🔴 添字ではなく `match` で取り出すこと(理由は `wav.rs` の同じ検査のコメント参照)。
         for error in &errors {
-            let detail = match error {
-                ResampleError::Construction(detail) | ResampleError::Processing(detail) => detail,
-            };
             let message = error.to_string();
-            assert!(
-                message.contains(detail.as_str()),
-                "{error:?} must print the underlying detail ({detail}) so the device log \
-                 says what was actually wrong: {message}"
-            );
+            match error {
+                ResampleError::Construction(detail) | ResampleError::Processing(detail) => {
+                    assert!(
+                        message.contains(detail.as_str()),
+                        "{error:?} must print the underlying detail ({detail}) so the device \
+                         log says what was actually wrong: {message}"
+                    );
+                }
+                ResampleError::InvalidRates {
+                    source_rate,
+                    output_rate,
+                } => {
+                    assert!(
+                        message.contains(&source_rate.to_string())
+                            && message.contains(&output_rate.to_string()),
+                        "{error:?} must print both rates so the device log says what was \
+                         actually wrong: {message}"
+                    );
+                }
+            }
         }
     }
 }
@@ -177,13 +240,37 @@ pub fn convert_frame_count(frames: u64, from_rate: u32, to_rate: u32) -> u64 {
     ((numerator + denominator / 2) / denominator) as u64
 }
 
+/// rubato へ渡す入力サンプルの絶対値上限。
+///
+/// rubato の `Fft`(realfft 経由)は NaN / inf や極端に大きい値を含む入力に対して、
+/// 内部の `unwrap()` で abort することがある(戻り値の `Result` では受け止められない)。
+/// 音声として意味のある値はこの範囲に収まるため、rubato へ渡す前にここで正規化する。
+const MAX_ABS_INPUT_SAMPLE: f32 = 1.0e4;
+
+/// rubato へ渡す前にサンプル1個を正規化する(`deinterleave` からのみ呼ぶ)。
+///
+/// 非有限(NaN / ±inf)は無音(0.0)へ、有限でも [`MAX_ABS_INPUT_SAMPLE`] を超える値は
+/// その範囲へ clamp する。rubato の `Fft` が内部の `unwrap()` で abort するのを防ぐための
+/// 唯一の正規化ポイント(`process_full_chunk_into`/`flush_into`/`resample_oneshot` の
+/// いずれも入力はここを通ってから rubato へ渡る)。
+fn sanitize_sample(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(-MAX_ABS_INPUT_SAMPLE, MAX_ABS_INPUT_SAMPLE)
+    } else {
+        0.0
+    }
+}
+
 /// インターリーブ PCM を平面(チャンネルごとの `Vec`)へ書き出す。
 /// `planar` の各要素は少なくとも `frames` フレームぶんの長さを持っていること。
+///
+/// rubato へ渡す入力はすべてこの関数を経由するため、[`sanitize_sample`] による正規化を
+/// ここで一括して行う(呼び出し側ごとに個別の正規化パスを増やさない)。
 fn deinterleave(input: &[f32], frames: usize, planar: &mut [Vec<f32>]) {
     debug_assert_eq!(planar.len(), CHANNELS);
     for i in 0..frames {
         for (ch, plane) in planar.iter_mut().enumerate() {
-            plane[i] = input[i * CHANNELS + ch];
+            plane[i] = sanitize_sample(input[i * CHANNELS + ch]);
         }
     }
 }
@@ -223,7 +310,11 @@ pub struct StreamResampler {
 impl StreamResampler {
     /// `source_rate != output_rate` のときだけ呼ぶこと(一致する場合は
     /// `decode.rs` 側でバイパスし、このリサンプラ自体を作らない)。
+    ///
+    /// レートが 0、または比(大きい方 / 小さい方)が `MAX_RATE_RATIO` を超える場合は
+    /// `ResampleError::InvalidRates` を返す([`validate_rates`] 参照)。
     pub fn new(source_rate: u32, output_rate: u32) -> Result<Self, ResampleError> {
+        validate_rates(source_rate, output_rate)?;
         let inner = Fft::<f32>::new(
             source_rate as usize,
             output_rate as usize,
@@ -323,12 +414,17 @@ impl StreamResampler {
 /// 出力フレーム数は常に `convert_frame_count(frames, source_rate, output_rate)` に一致する
 /// (末尾のブロック丸めによる超過分は切り詰め、逆に不足することがあれば無音で埋める。
 /// `SoundData::frames == interleaved.len() / CHANNELS` の不変条件を壊さないため)。
+///
+/// レートが 0、または比(大きい方 / 小さい方)が `MAX_RATE_RATIO` を超える場合は
+/// `ResampleError::InvalidRates` を返す([`validate_rates`] 参照。`source_rate == 0` を
+/// 検査せず比を計算すると無限大になり、後段のバッファ確保が破綻するため必須)。
 pub fn resample_oneshot(
     input: &[f32],
     frames: usize,
     source_rate: u32,
     output_rate: u32,
 ) -> Result<(Vec<f32>, usize), ResampleError> {
+    validate_rates(source_rate, output_rate)?;
     let ratio = output_rate as f64 / source_rate as f64;
     let f_cutoff = calculate_cutoff::<f32>(ONESHOT_SINC_LEN, ONESHOT_WINDOW);
     let params = SincInterpolationParameters {
@@ -428,5 +524,188 @@ mod tests {
     #[test]
     fn convert_frame_count_handles_zero() {
         assert_eq!(convert_frame_count(0, 44_100, 48_000), 0);
+    }
+
+    /// NaN / inf / 極端な値を混ぜた入力(`sanitize_sample` が正規化する対象)。
+    fn adversarial_samples() -> Vec<f32> {
+        vec![
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            1.0e9,
+            -1.0e9,
+            0.0,
+            0.3,
+            -0.3,
+        ]
+    }
+
+    /// `StreamResampler` は `Debug`/`PartialEq` を実装しないため(音声コールバック経路の
+    /// 型に不要な派生を持ち込まないため)、`assert_eq!` ではなく `match` で `Err` の中身だけ見る。
+    fn assert_stream_resampler_new_err(
+        source_rate: u32,
+        output_rate: u32,
+        expected: ResampleError,
+    ) {
+        match StreamResampler::new(source_rate, output_rate) {
+            Err(err) => assert_eq!(err, expected),
+            Ok(_) => panic!("expected {expected:?}, got Ok"),
+        }
+    }
+
+    #[test]
+    fn stream_resampler_new_rejects_zero_source_rate() {
+        assert_stream_resampler_new_err(
+            0,
+            48_000,
+            ResampleError::InvalidRates {
+                source_rate: 0,
+                output_rate: 48_000,
+            },
+        );
+    }
+
+    #[test]
+    fn stream_resampler_new_rejects_zero_output_rate() {
+        assert_stream_resampler_new_err(
+            48_000,
+            0,
+            ResampleError::InvalidRates {
+                source_rate: 48_000,
+                output_rate: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn stream_resampler_new_rejects_rate_ratio_beyond_the_limit() {
+        // 48000 / 100 = 480 > MAX_RATE_RATIO(256)。
+        assert_stream_resampler_new_err(
+            48_000,
+            100,
+            ResampleError::InvalidRates {
+                source_rate: 48_000,
+                output_rate: 100,
+            },
+        );
+    }
+
+    #[test]
+    // Miri では対象外: rubato(外部クレート)の FFT リサンプラの構築を Miri で解釈すると数分かかる。
+    // 検査したいのは自前コードの unsafe(ring_buffer / wav / decode の本体)で、rubato の中身ではない。
+    // rubato を自前化(依存排除のステップ2)したら外して、Miri の対象に戻す。
+    #[cfg_attr(miri, ignore = "rubato(外部)の FFT を Miri で解釈すると数分かかる")]
+    fn stream_resampler_new_accepts_rate_ratio_at_the_limit() {
+        // 25600 / 100 = 256 == MAX_RATE_RATIO。境界は許容する。
+        assert!(StreamResampler::new(25_600, 100).is_ok());
+    }
+
+    #[test]
+    fn resample_oneshot_rejects_zero_source_rate() {
+        let samples = vec![0.0f32; 8];
+        assert_eq!(
+            resample_oneshot(&samples, 4, 0, 48_000),
+            Err(ResampleError::InvalidRates {
+                source_rate: 0,
+                output_rate: 48_000,
+            })
+        );
+    }
+
+    #[test]
+    fn resample_oneshot_rejects_zero_output_rate() {
+        let samples = vec![0.0f32; 8];
+        assert_eq!(
+            resample_oneshot(&samples, 4, 48_000, 0),
+            Err(ResampleError::InvalidRates {
+                source_rate: 48_000,
+                output_rate: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn resample_oneshot_rejects_rate_ratio_beyond_the_limit() {
+        let samples = vec![0.0f32; 8];
+        assert_eq!(
+            resample_oneshot(&samples, 4, 48_000, 100),
+            Err(ResampleError::InvalidRates {
+                source_rate: 48_000,
+                output_rate: 100,
+            })
+        );
+    }
+
+    #[test]
+    // Miri では対象外: rubato(外部クレート)の FFT リサンプラを Miri で解釈すると1本で数分〜十数分かかる。
+    // 検査したいのは自前コードの unsafe(ring_buffer / wav / decode の本体)で、rubato の中身ではない。
+    // rubato を自前化(依存排除のステップ2)したら外して、Miri の対象に戻す。
+    #[cfg_attr(miri, ignore = "rubato(外部)の FFT を Miri で解釈すると数分かかる")]
+    fn stream_resampler_sanitizes_non_finite_and_extreme_input_upsampling() {
+        let mut resampler = StreamResampler::new(44_100, 48_000).expect("valid rates");
+        let need = resampler.input_frames_needed();
+        let mut input = adversarial_samples();
+        input.resize(need * CHANNELS, 0.1);
+
+        let mut out = Vec::new();
+        resampler
+            .process_full_chunk_into(&input, &mut out)
+            .expect("must not error on adversarial input");
+        resampler
+            .flush_into(&[], &mut out)
+            .expect("flush must not error");
+
+        assert!(!out.is_empty());
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "output must not contain NaN/inf: {out:?}"
+        );
+    }
+
+    #[test]
+    // Miri では対象外: rubato(外部クレート)の FFT リサンプラを Miri で解釈すると1本で数分〜十数分かかる。
+    // 検査したいのは自前コードの unsafe(ring_buffer / wav / decode の本体)で、rubato の中身ではない。
+    // rubato を自前化(依存排除のステップ2)したら外して、Miri の対象に戻す。
+    #[cfg_attr(miri, ignore = "rubato(外部)の FFT を Miri で解釈すると数分かかる")]
+    fn stream_resampler_sanitizes_non_finite_and_extreme_input_downsampling() {
+        let mut resampler = StreamResampler::new(48_000, 44_100).expect("valid rates");
+        let need = resampler.input_frames_needed();
+        let mut input = adversarial_samples();
+        input.resize(need * CHANNELS, 0.1);
+
+        let mut out = Vec::new();
+        resampler
+            .process_full_chunk_into(&input, &mut out)
+            .expect("must not error on adversarial input");
+        resampler
+            .flush_into(&[], &mut out)
+            .expect("flush must not error");
+
+        assert!(!out.is_empty());
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "output must not contain NaN/inf: {out:?}"
+        );
+    }
+
+    #[test]
+    // Miri では対象外: rubato(外部クレート)の sinc リサンプラを Miri で解釈すると数分かかる。
+    // 検査したいのは自前コードの unsafe(ring_buffer / wav / decode の本体)で、rubato の中身ではない。
+    // rubato を自前化(依存排除のステップ2)したら外して、Miri の対象に戻す。
+    #[cfg_attr(
+        miri,
+        ignore = "rubato(外部)の sinc リサンプラを Miri で解釈すると数分かかる"
+    )]
+    fn resample_oneshot_sanitizes_non_finite_and_extreme_input() {
+        let input = adversarial_samples();
+        let frames = input.len() / CHANNELS;
+        let (out, out_frames) = resample_oneshot(&input, frames, 44_100, 48_000)
+            .expect("must not error on adversarial input");
+
+        assert_eq!(out.len(), out_frames * CHANNELS);
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "output must not contain NaN/inf: {out:?}"
+        );
     }
 }
