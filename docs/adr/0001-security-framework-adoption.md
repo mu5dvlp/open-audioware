@@ -41,6 +41,7 @@ ASVS は stg 後 / OGSF は観測のみ / ATT&CK はいまは採らない)。
 
 - `proptest` / `cargo-fuzz` / `miri` / `loom` の導入は**否定ではなく保留**。着手するなら
   FFI 境界(`mw-ffi` の引数検証)とロックフリー境界(RT スレッドとの共有構造)から。
+  → **`cargo-fuzz` / `miri` と TSan は [ADR-0003](0003-fuzz-miri-sanitizer-adoption.md) で導入した**(`proptest` / `loom` は保留のまま)。
 - OGSF(ゲーム専用の OWASP プロジェクト)の「クライアント整合性」領域が将来
   ミドルウェアへ触れる可能性はあるが、要件文言が固まるまで(目標 Q4 2026)は観測のみ。
 - セキュリティ関連の参考資料はこのリポジトリではなくワークスペースの
