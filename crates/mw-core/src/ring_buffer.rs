@@ -60,7 +60,13 @@ impl<T> Inner<T> {
         let index = position & (self.capacity - 1);
         // SAFETY: `index` は `capacity` 未満であり、`data` は同じ長さで構築される。
         // SPSC の所有権プロトコルにより、呼び出し側はこのスロットへのアクセス権を持つ。
-        unsafe { (*self.data.get_unchecked(index).get()).as_mut_ptr() }
+        //
+        // 生ポインタのまま取り出し、途中で `&mut` を作らない。`(*cell.get()).as_mut_ptr()` の形は
+        // 一瞬 `&mut MaybeUninit<T>` を作るため、同じスロットへ先に取ってあった生ポインタ
+        // (write_chunk が第1区間の先頭として持つ `first_ptr` など)の権限を無効にしてしまう
+        // (Stacked Borrows。Miri が検出する)。`UnsafeCell::raw_get` なら参照を経由しない。
+        let cell = unsafe { self.data.as_ptr().add(index) };
+        std::cell::UnsafeCell::raw_get(cell).cast::<T>()
     }
 
     fn available_from(&self, head: usize, tail: usize) -> usize {

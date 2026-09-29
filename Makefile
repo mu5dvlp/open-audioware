@@ -40,6 +40,8 @@ help:
 	@echo "  make third-party-licenses-check - 再生成して差分が無いか検査(CI 用)"
 	@echo "  make format         - cargo fmt (自動整形)"
 	@echo "  make test           - cargo test --workspace"
+	@echo "  make miri           - unsafe を持つ ring_buffer と、パーサ(wav / decode / stream)のテストを Miri で実行(約2分。CI と同じ範囲)"
+	@echo "  make miri-all       - mw-core の全テストを Miri で実行(30分前後。rubato の FFT と seqlock の並行テストは対象外)"
 	@echo "  make bench          - criterion ベンチ(未導入。任意)"
 	@echo "  make doc            - API リファレンス(rustdoc)を生成。docs/integration.md §6 が正とする出力"
 	@echo "  make doc-coverage   - C ABI の全エクスポート関数に doc コメントがあるか検査"
@@ -189,6 +191,41 @@ format:
 
 test:
 	cargo test --workspace
+
+# --- Miri(unsafe の未定義動作の検査)---------------------------------------
+#
+# 対象は mw-core だけ。自前のロックフリーリングバッファ(ring_buffer.rs)とデコーダは
+# 外部クレートを置き換えた自前実装で、unsafe のポインタ操作を Miri 以外に検査する手段が無い。
+# mw-backend / mw-ffi は cpal(C の音声デバイス)と FFI を呼ぶため Miri では動かせない。
+#
+# nightly は stable(rust-toolchain.toml)とは別に、ここで日付固定で持つ。
+# 🔴 日付はこの変数だけに書く(CI は `make miri` を呼ぶだけで、日付を持たない)。
+# 上げるときは手元で `make miri` を通してから変える。
+MIRI_TOOLCHAIN := nightly-2026-09-27
+# Miri はホストに関係なくこのターゲットとして解釈する(rust-src から std をビルドするので
+# クロスでも動く)。x86_64-apple-darwin は SSE4.1 が既定で有効なため rustfft(rubato の依存)が
+# SSE 経路を選び、その中の `_mm_load1_pd` が 4 バイト整列の Complex<f32> を 8 バイト整列として
+# 読む上流の未定義動作を Miri が止めてしまう。x86_64 Linux は SSE2 までなのでスカラー経路になり、
+# 自分たちのコード(mw-core)の検査に集中できる。CI(ubuntu)とも同じ条件になる。
+MIRI_TARGET := x86_64-unknown-linux-gnu
+
+# `miri` は CI に載せる範囲: unsafe を持つ唯一のモジュール(ring_buffer)と、外部のバイト列を読む
+# パーサ(wav / decode)、リングバッファへ書き込む経路(stream)。実測 40 件 109 秒(コーヒー基準内)。
+# mixer / music などは音声を描画するため Miri では1件ずつ数十秒かかり、全体では 30 分前後になるので
+# `miri-all` に分けて手元で回す(依存を自前化した直後や、unsafe を触ったときに1回)。
+MIRI_CI_FILTER := ring_buffer wav decode stream
+
+miri: miri-toolchain
+	cargo +$(MIRI_TOOLCHAIN) miri test -p mw-core --target $(MIRI_TARGET) --lib -- $(MIRI_CI_FILTER)
+
+miri-all: miri-toolchain
+	cargo +$(MIRI_TOOLCHAIN) miri test -p mw-core --target $(MIRI_TARGET)
+
+miri-toolchain:
+	@if ! rustup toolchain list | grep -q "^$(MIRI_TOOLCHAIN)"; then \
+		echo "$(MIRI_TOOLCHAIN) が無いため導入します(miri / rust-src 付き)"; \
+		rustup toolchain install $(MIRI_TOOLCHAIN) --profile minimal --component miri --component rust-src; \
+	fi
 
 bench:
 	@echo "criterion ベンチマークは未導入(初期構築仕様 §7.3: 任意)。M1 以降のミキサ実装後に追加する。"

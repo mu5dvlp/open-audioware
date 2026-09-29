@@ -1021,6 +1021,10 @@ mod tests {
     }
 
     #[test]
+    // Miri では対象外: rubato(外部クレート)の FFT リサンプラを Miri で解釈すると1本で数分〜十数分かかる。
+    // 検査したいのは自前コードの unsafe(ring_buffer / wav / decode の本体)で、rubato の中身ではない。
+    // rubato を自前化(依存排除のステップ2)したら外して、Miri の対象に戻す。
+    #[cfg_attr(miri, ignore = "rubato(外部)の FFT を Miri で解釈すると数分かかる")]
     fn decodes_a_non_48k_wav_by_resampling_to_the_output_rate() {
         // SE 側(wav.rs)も 48kHz 以外の wav が読めること。
         // あわせて周波数が保たれること・長さが正しいことも見る。

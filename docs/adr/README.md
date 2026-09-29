@@ -7,3 +7,4 @@
 |---|---|---|
 | [0001](0001-security-framework-adoption.md) | セキュリティ枠組みの採用方針 —— サプライチェーン検査の継続と、自前脅威モデルでの unsafe FFI / RT スレッドの扱いに限定する | 採用 |
 | [0002](0002-p3-11-async-reopen.md) | 内部再オープン(P3-11)はレジストリの `Mutex` を保持したまま行わず、3段構成へ分割する | 採用 |
+| [0003](0003-fuzz-miri-sanitizer-adoption.md) | 自前実装の unsafe とパーサに Miri / cargo-fuzz / TSan を順に入れる —— 依存排除で外部クレートの検証を失った分を自分で持つ | 採用 |

@@ -711,6 +711,10 @@ mod tests {
     // --- ここから先はリサンプル(初期構築仕様『§4.7』)の検証 -------------------------
 
     #[test]
+    // Miri では対象外: rubato(外部クレート)の FFT リサンプラを Miri で解釈すると1本で数分〜十数分かかる。
+    // 検査したいのは自前コードの unsafe(ring_buffer / wav / decode の本体)で、rubato の中身ではない。
+    // rubato を自前化(依存排除のステップ2)したら外して、Miri の対象に戻す。
+    #[cfg_attr(miri, ignore = "rubato(外部)の FFT を Miri で解釈すると数分かかる")]
     fn resample_preserves_frequency_when_upsampling_44_1k_to_48k() {
         // 周波数が保たれること。
         const SOURCE_RATE: u32 = 44_100;
@@ -730,6 +734,10 @@ mod tests {
     }
 
     #[test]
+    // Miri では対象外: rubato(外部クレート)の FFT リサンプラを Miri で解釈すると1本で数分〜十数分かかる。
+    // 検査したいのは自前コードの unsafe(ring_buffer / wav / decode の本体)で、rubato の中身ではない。
+    // rubato を自前化(依存排除のステップ2)したら外して、Miri の対象に戻す。
+    #[cfg_attr(miri, ignore = "rubato(外部)の FFT を Miri で解釈すると数分かかる")]
     fn resample_produces_the_expected_output_length() {
         // 長さが正しいこと。総フレーム数・実際に読み出せる
         // フレーム数の両方が `convert_frame_count` の換算式ちょうどに一致することを見る
@@ -749,6 +757,10 @@ mod tests {
     }
 
     #[test]
+    // Miri では対象外: rubato(外部クレート)の FFT リサンプラを Miri で解釈すると1本で数分〜十数分かかる。
+    // 検査したいのは自前コードの unsafe(ring_buffer / wav / decode の本体)で、rubato の中身ではない。
+    // rubato を自前化(依存排除のステップ2)したら外して、Miri の対象に戻す。
+    #[cfg_attr(miri, ignore = "rubato(外部)の FFT を Miri で解釈すると数分かかる")]
     fn resample_block_boundaries_are_seamless() {
         // ブロック境界の連続性。細切れに read() したときと、
         // 一括に近い大きさで read() したときとで、リサンプル結果が完全一致することを見る
@@ -795,6 +807,10 @@ mod tests {
     }
 
     #[test]
+    // Miri では対象外: rubato(外部クレート)の FFT リサンプラを Miri で解釈すると1本で数分〜十数分かかる。
+    // 検査したいのは自前コードの unsafe(ring_buffer / wav / decode の本体)で、rubato の中身ではない。
+    // rubato を自前化(依存排除のステップ2)したら外して、Miri の対象に戻す。
+    #[cfg_attr(miri, ignore = "rubato(外部)の FFT を Miri で解釈すると数分かかる")]
     fn seek_after_resample_matches_a_fresh_decoder_seeked_to_the_same_position() {
         // リサンプル併用時のシーク調停。
         // 「途中まで読んでからシークした場合」と「開いた直後にシークした場合」とで、
@@ -826,6 +842,10 @@ mod tests {
     }
 
     #[test]
+    // Miri では対象外: rubato(外部クレート)の FFT リサンプラを Miri で解釈すると1本で数分〜十数分かかる。
+    // 検査したいのは自前コードの unsafe(ring_buffer / wav / decode の本体)で、rubato の中身ではない。
+    // rubato を自前化(依存排除のステップ2)したら外して、Miri の対象に戻す。
+    #[cfg_attr(miri, ignore = "rubato(外部)の FFT を Miri で解釈すると数分かかる")]
     fn end_to_end_resamples_a_44_1k_wav_through_pump_and_read_without_error() {
         // `stream.rs` の pump/read 経路は `stream.rs` 側の
         // end-to-end テストで直接カバーする。ここでは decode.rs 単体として、

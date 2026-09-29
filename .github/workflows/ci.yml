@@ -119,6 +119,31 @@ jobs:
       - name: make csharp-check
         run: make csharp-check
 
+  # Miri: mw-core の unsafe(自前のロックフリーリングバッファ)とパーサ(wav / decode / stream)を
+  # 未定義動作の観点で検査する(ADR-0003)。範囲と nightly の日付は Makefile(MIRI_CI_FILTER /
+  # MIRI_TOOLCHAIN)だけが持ち、ここには書かない(`make miri` が無ければ導入する)。
+  # mw-core は cpal を使わないので ALSA は要らない。
+  # ⚠️ コーヒー基準: テスト本体は約2分。Miri の sysroot(~/.cache/miri)を毎回作り直すと数分足すので
+  # キャッシュする。基準を割るようなら on: push から外して schedule(週次)+ workflow_dispatch へ回す。
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # stable の lint-test とは別のツールチェーン・別の成果物なのでキャッシュを分ける。
+          key: miri
+
+      - name: Cache the Miri sysroot
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/miri
+          key: miri-sysroot-${{ runner.os }}-${{ hashFiles('Makefile') }}
+
+      - name: make miri
+        run: make miri
+
   # macos: .dylib(Unity Editor 用)+ xcframework(iOS)
   macos-build:
     runs-on: macos-latest
