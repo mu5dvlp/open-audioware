@@ -222,7 +222,7 @@ MIRI_TARGET := x86_64-unknown-linux-gnu
 
 # `miri` は CI に載せる範囲: unsafe を持つ唯一のモジュール(ring_buffer)と、外部のバイト列を読む
 # パーサ(wav / decode)、リングバッファへ書き込む経路(stream)。実測 40 件 109 秒(コーヒー基準内)。
-# mixer / music などは音声を描画するため Miri では1件ずつ数十秒かかり、全体では 30 分前後になるので
+# mixer / music などは音声を描画するため Miri では1件ずつ数十秒かかり、lib 全体では約13分になるので
 # `miri-all` に分けて手元で回す(依存を自前化した直後や、unsafe を触ったときに1回)。
 MIRI_CI_FILTER := ring_buffer wav decode stream
 
