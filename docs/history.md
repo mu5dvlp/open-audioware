@@ -30,6 +30,7 @@
 ### [2026-09-29](history/16-2026-09-29.md)
 
 - Miri を導入(`make miri` / `miri-all` / CI)。リングバッファの Stacked Borrows 違反を1件修正。rustfft の上流 UB は Linux ターゲットで回避(ADR-0003)
+- cargo-fuzz を導入(3本 + コーパス回帰の CI + 週次)。初回 60 秒で rubato の NaN abort と `resample_oneshot` のレート 0 の巨大確保を発見し、入口で防いだ
 
 ### [2026-09-27](history/15-2026-09-27.md)
 
