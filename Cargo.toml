@@ -5,6 +5,10 @@ members = [
     "crates/mw-backend",
     "crates/mw-ffi",
 ]
+# fuzz/ は独立した workspace(fuzz/Cargo.toml 末尾に空の [workspace])。
+# clippy / cargo-deny / test の対象に紛れ込ませないため、ここでも除外しておく
+# (ADR-0003 の2段目、cargo-fuzz ターゲット)。
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

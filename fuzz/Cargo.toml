@@ -1,0 +1,39 @@
+[package]
+name = "mw-core-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+mw-core = { path = "../crates/mw-core" }
+
+[[bin]]
+name = "wav_decode"
+path = "fuzz_targets/wav_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wav_decoder_pump"
+path = "fuzz_targets/wav_decoder_pump.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "resample"
+path = "fuzz_targets/resample.rs"
+test = false
+doc = false
+bench = false
+
+# ルートの workspace から切り離す(fuzz 専用の依存・ツールチェーンをそちらへ
+# 持ち込まないため。clippy / cargo-deny / test はルートの Cargo.toml 側の
+# `exclude = ["fuzz"]` でここを対象外にする)。
+[workspace]

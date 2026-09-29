@@ -59,3 +59,10 @@ stable の固定(`rust-toolchain.toml`)はそのまま。日付を書く場所�
   ⚠️ ignore にしたテストは「Miri の対象外」であって「検査済み」ではない。理由をその場に書くこと。
 - nightly の日付を上げると Miri の検査が厳しくなって新しく赤が出ることがある。上げるのは手元で `make miri` を
   通してから。
+
+## 追記(決定2の実際の置き場)
+
+cargo-fuzz のターゲット3本は `fuzz/`(ルートの `Cargo.toml` の `[workspace]` から `exclude` した
+別ワークスペース)に置いた。`libfuzzer-sys`/`arbitrary` は `fuzz/` 専用の開発時依存で配布物
+(mw-core/mw-backend/mw-ffi のビルド成果物)には一切含まれないため、`THIRD-PARTY-LICENSES.md`
+の対象外とした。

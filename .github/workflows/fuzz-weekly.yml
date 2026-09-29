@@ -1,0 +1,49 @@
+name: Fuzz (weekly)
+
+# ADR-0003 の2段目: cargo-fuzz の長時間実行はコーヒー基準を割るため push の CI には載せない
+# (.github/workflows/ci.yml の fuzz ジョブはコーパスの回帰実行だけ)。ここでは週1回の
+# 定期実行と、手動実行(workflow_dispatch)だけを行う。open-audioware は public リポジトリで
+# Actions は無料だが、push では動かさない(コーヒー基準は「待てる長さ」の話であって
+# 「課金」の話ではないため)。
+
+on:
+  schedule:
+    # 毎週土曜 18:00 UTC。
+    - cron: "0 18 * * 6"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "1ターゲットあたりの実行秒数"
+        required: false
+        default: "900"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz-run:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wav_decode, wav_decoder_pump, resample]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz
+          workspaces: fuzz
+
+      - uses: taiki-e/install-action@cargo-fuzz
+
+      - name: make fuzz-run
+        run: make fuzz-run TARGET=${{ matrix.target }} SECONDS=${{ github.event.inputs.seconds || '900' }}
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          retention-days: 30

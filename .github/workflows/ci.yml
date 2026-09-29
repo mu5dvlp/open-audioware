@@ -144,6 +144,27 @@ jobs:
       - name: make miri
         run: make miri
 
+  # cargo-fuzz: 既存コーパスの回帰実行だけ(ADR-0003 の2段目)。
+  # 🔴 コーパスの回帰だけ。長時間の実行は載せない(コーヒー基準)——週1回の長時間実行は
+  # 別ワークフロー(.github/workflows/fuzz-weekly.yml)で行う。
+  # nightly の日付は Makefile(NIGHTLY_TOOLCHAIN)だけが持つ(`fuzz-toolchain` が
+  # `rustup toolchain install` で導入する)。cargo-fuzz 本体は install-action が先に入れるため、
+  # `make fuzz-corpus` の中の `cargo install cargo-fuzz` 分岐(`fuzz-toolchain`)は走らない。
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz
+          workspaces: fuzz
+
+      - uses: taiki-e/install-action@cargo-fuzz
+
+      - name: make fuzz-corpus
+        run: make fuzz-corpus
+
   # macos: .dylib(Unity Editor 用)+ xcframework(iOS)
   macos-build:
     runs-on: macos-latest

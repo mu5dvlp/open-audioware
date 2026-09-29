@@ -4,6 +4,11 @@
 Cargo.lock.bak
 *.pdb
 
+# --- cargo-fuzz(ADR-0003) ---
+# シードコーパス(fuzz/corpus/)は追跡する。ビルド成果物と、見つかったクラッシュ入力は追跡しない。
+/fuzz/target/
+/fuzz/artifacts/
+
 # --- macOS ---
 .DS_Store
 .AppleDouble

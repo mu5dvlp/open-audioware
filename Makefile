@@ -29,7 +29,9 @@ XCFRAMEWORK           := $(PLUGINS_IOS_DIR)/MwFfi.xcframework
 .PHONY: help setup lint format gitleaks test bench bindgen csharp-check \
         build-macos build-ios build-android \
         package unity-sample-create unity-test \
-        measurement-scene measurement-export-ios measurement-build-android clean
+        measurement-scene measurement-export-ios measurement-build-android clean \
+        miri miri-all miri-toolchain \
+        fuzz-toolchain fuzz-build fuzz-corpus fuzz-run fuzz-seeds
 
 help:
 	@echo "open-audioware — make ターゲット"
@@ -42,6 +44,10 @@ help:
 	@echo "  make test           - cargo test --workspace"
 	@echo "  make miri           - unsafe を持つ ring_buffer と、パーサ(wav / decode / stream)のテストを Miri で実行(約2分。CI と同じ範囲)"
 	@echo "  make miri-all       - mw-core の全テストを Miri で実行(30分前後。rubato の FFT と seqlock の並行テストは対象外)"
+	@echo "  make fuzz-seeds     - fuzz/corpus/ のシードコーパスを再生成(fuzz/seeds/make_seeds.py)"
+	@echo "  make fuzz-build     - cargo-fuzz のターゲット3本をビルド(wav_decode / wav_decoder_pump / resample)"
+	@echo "  make fuzz-corpus    - 既存コーパスの回帰実行のみ(数秒。CI が呼ぶのはこれ)"
+	@echo "  make fuzz-run       - TARGET=<name> SECONDS=<秒数、既定600> で1本を指定時間だけ実行(手元/週次専用)"
 	@echo "  make bench          - criterion ベンチ(未導入。任意)"
 	@echo "  make doc            - API リファレンス(rustdoc)を生成。docs/integration.md §6 が正とする出力"
 	@echo "  make doc-coverage   - C ABI の全エクスポート関数に doc コメントがあるか検査"
@@ -199,9 +205,12 @@ test:
 # mw-backend / mw-ffi は cpal(C の音声デバイス)と FFI を呼ぶため Miri では動かせない。
 #
 # nightly は stable(rust-toolchain.toml)とは別に、ここで日付固定で持つ。
-# 🔴 日付はこの変数だけに書く(CI は `make miri` を呼ぶだけで、日付を持たない)。
-# 上げるときは手元で `make miri` を通してから変える。
-MIRI_TOOLCHAIN := nightly-2026-09-27
+# 🔴 日付はこの変数(NIGHTLY_TOOLCHAIN)だけに書く(CI は `make miri` / `make fuzz-corpus` を
+# 呼ぶだけで、日付を持たない)。上げるときは手元で `make miri` を通してから変える。
+# Miri 専用だった名前の名残で `MIRI_TOOLCHAIN` も残す(cargo-fuzz(ADR-0003 の2段目)も
+# 同じ nightly を共有するため、変数名を先に一般化した)。
+NIGHTLY_TOOLCHAIN := nightly-2026-09-27
+MIRI_TOOLCHAIN := $(NIGHTLY_TOOLCHAIN)
 # Miri はホストに関係なくこのターゲットとして解釈する(rust-src から std をビルドするので
 # クロスでも動く)。x86_64-apple-darwin は SSE4.1 が既定で有効なため rustfft(rubato の依存)が
 # SSE 経路を選び、その中の `_mm_load1_pd` が 4 バイト整列の Complex<f32> を 8 バイト整列として
@@ -226,6 +235,46 @@ miri-toolchain:
 		echo "$(MIRI_TOOLCHAIN) が無いため導入します(miri / rust-src 付き)"; \
 		rustup toolchain install $(MIRI_TOOLCHAIN) --profile minimal --component miri --component rust-src; \
 	fi
+
+# --- cargo-fuzz(ADR-0003 の2段目)-------------------------------------------
+#
+# 対象は wav::decode / decode.rs(WavDecoder の open とストリーミング供給)/ resample.rs の3本
+# (`fuzz/fuzz_targets/`)。`fuzz/` はルートの workspace から切り離してある(`Cargo.toml` の
+# `exclude`)ので、clippy / cargo-deny / test の対象には入らない。
+#
+# `cargo fuzz` は `fuzz/` を自動で見つけるため、どこから呼んでもよい(ここではルートから
+# 呼ぶ)。nightly は Miri と同じ NIGHTLY_TOOLCHAIN を共有する(🔴 日付はそちらの変数だけに書く)。
+FUZZ_TARGETS := wav_decode wav_decoder_pump resample
+
+fuzz-toolchain: miri-toolchain
+	@if ! cargo fuzz --version >/dev/null 2>&1; then \
+		echo "cargo-fuzz が無いため導入します"; \
+		cargo +$(NIGHTLY_TOOLCHAIN) install cargo-fuzz --locked; \
+	fi
+
+fuzz-build: fuzz-toolchain
+	cargo +$(NIGHTLY_TOOLCHAIN) fuzz build
+
+# コーパスの回帰実行だけ(-runs=0: 新規生成はせず、既存コーパスを1件ずつ流して
+# クラッシュが無いことだけ見る。数秒で終わる)。**CI はこれを呼ぶ**(コーヒー基準)。
+# 長時間のファジングは fuzz-run(手元)か週次ワークフロー(.github/workflows/fuzz-weekly.yml)で行う。
+fuzz-corpus: fuzz-toolchain
+	@for t in $(FUZZ_TARGETS); do \
+		echo "== fuzz-corpus: $$t =="; \
+		cargo +$(NIGHTLY_TOOLCHAIN) fuzz run $$t -- -runs=0 || exit 1; \
+	done
+
+# 1本を指定秒数だけ実行する(手元での探索・週次ワークフロー用。CI の push には載せない)。
+# 例: make fuzz-run TARGET=wav_decode SECONDS=60
+fuzz-run: fuzz-toolchain
+	@if [ -z "$(TARGET)" ]; then \
+		echo "使い方: make fuzz-run TARGET=<$(FUZZ_TARGETS)> [SECONDS=600]"; \
+		exit 1; \
+	fi
+	cargo +$(NIGHTLY_TOOLCHAIN) fuzz run $(TARGET) -- -max_total_time=$(if $(SECONDS),$(SECONDS),600) -rss_limit_mb=2048
+
+fuzz-seeds:
+	python3 fuzz/seeds/make_seeds.py
 
 bench:
 	@echo "criterion ベンチマークは未導入(初期構築仕様 §7.3: 任意)。M1 以降のミキサ実装後に追加する。"
