@@ -27,6 +27,7 @@ make lint
 - `make lint` は `cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo deny check`、第三者ライセンス表記の鮮度検査、C# ラッパのコンパイル検査を実行します。
 - `make miri` は `mw-core` のテストを Miri(nightly。日付は Makefile の `MIRI_TOOLCHAIN` で固定)で実行し、自前のロックフリーリングバッファやデコーダの unsafe に未定義動作が無いことを検査します。初回は nightly と rust-src の導入で数分かかります。rubato の FFT を使うテストと、seqlock の並行テストは Miri では対象外です(理由はテストの属性に書いてあります)。
 - `make fuzz-corpus` は `fuzz/`(ルートの workspace から切り離した cargo-fuzz 専用クレート、ADR-0003)の3ターゲット(`wav_decode`/`wav_decoder_pump`/`resample`)を、既存のシードコーパス(`fuzz/corpus/`)に対して1回ずつ流すだけの回帰実行です(数秒。CI もこれを呼びます)。`make fuzz-run TARGET=<name> SECONDS=<秒数、既定600>` で1ターゲットを指定時間だけ実際にファジングできます(手元での探索・週次ワークフロー用。長時間の実行は push の CI には載せません)。コーパスを追加・更新したら `make fuzz-seeds` で再生成してからコミットしてください。
+- `make tsan` は ThreadSanitizer でワークスペースのテストを実行します(手元専用。ADR-0003 の3段目)。初回は `-Zbuild-std` で std を作り直すため数分かかります。CI には載せません。
 - `make csharp-check` は .NET 8 以降で、通常経路と iOS の `__Internal` 経路を Unity 無しでコンパイルします。
 - `make doc` は `make doc-coverage` を先に実行したうえで rustdoc を生成します。C ABI の公開関数に説明を追加・変更した場合は `make doc-coverage` も確認してください。
 - Unity サンプルを変更した場合は `make unity-test` を実行してください。Unity の起動はリポジトリのロックラッパーを経由します。

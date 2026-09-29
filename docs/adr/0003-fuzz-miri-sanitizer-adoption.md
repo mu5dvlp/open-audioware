@@ -66,3 +66,11 @@ cargo-fuzz のターゲット3本は `fuzz/`(ルートの `Cargo.toml` の `[wor
 別ワークスペース)に置いた。`libfuzzer-sys`/`arbitrary` は `fuzz/` 専用の開発時依存で配布物
 (mw-core/mw-backend/mw-ffi のビルド成果物)には一切含まれないため、`THIRD-PARTY-LICENSES.md`
 の対象外とした。
+
+## 追記(TSan の実際の置き場)
+
+TSan は `make tsan`(手元専用)として入れた。実機の音声コールバックとテストスレッドの
+終了処理で、`CpalBackend::close` の `pause()` 直後に最後のコールバックの完了を `Acquire` で
+観測してから `Renderer`(とその内部の `Mixer` / `VoicePool`)を drop する経路にした
+——ストリーム停止時の同期が cpal / OS の内部(CoreAudio の `AudioOutputUnitStop` 等)に
+あって Rust からは見えないため、その順序を OS の内部実装に暗黙に頼らず、コードで明示する。

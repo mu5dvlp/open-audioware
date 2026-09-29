@@ -31,7 +31,8 @@ XCFRAMEWORK           := $(PLUGINS_IOS_DIR)/MwFfi.xcframework
         package unity-sample-create unity-test \
         measurement-scene measurement-export-ios measurement-build-android clean \
         miri miri-all miri-toolchain \
-        fuzz-toolchain fuzz-build fuzz-corpus fuzz-run fuzz-seeds
+        fuzz-toolchain fuzz-build fuzz-corpus fuzz-run fuzz-seeds \
+        tsan
 
 help:
 	@echo "open-audioware — make ターゲット"
@@ -43,11 +44,12 @@ help:
 	@echo "  make format         - cargo fmt (自動整形)"
 	@echo "  make test           - cargo test --workspace"
 	@echo "  make miri           - unsafe を持つ ring_buffer と、パーサ(wav / decode / stream)のテストを Miri で実行(約2分。CI と同じ範囲)"
-	@echo "  make miri-all       - mw-core の全テストを Miri で実行(30分前後。rubato の FFT と seqlock の並行テストは対象外)"
+	@echo "  make miri-all       - mw-core の lib の全テストを Miri で実行(約13分。rubato の FFT と seqlock の並行テストは対象外)"
 	@echo "  make fuzz-seeds     - fuzz/corpus/ のシードコーパスを再生成(fuzz/seeds/make_seeds.py)"
 	@echo "  make fuzz-build     - cargo-fuzz のターゲット3本をビルド(wav_decode / wav_decoder_pump / resample)"
 	@echo "  make fuzz-corpus    - 既存コーパスの回帰実行のみ(数秒。CI が呼ぶのはこれ)"
 	@echo "  make fuzz-run       - TARGET=<name> SECONDS=<秒数、既定600> で1本を指定時間だけ実行(手元/週次専用)"
+	@echo "  make tsan           - ThreadSanitizer でワークスペースのテストを実行(手元専用。ADR-0003 の3段目)"
 	@echo "  make bench          - criterion ベンチ(未導入。任意)"
 	@echo "  make doc            - API リファレンス(rustdoc)を生成。docs/integration.md §6 が正とする出力"
 	@echo "  make doc-coverage   - C ABI の全エクスポート関数に doc コメントがあるか検査"
@@ -227,8 +229,10 @@ MIRI_CI_FILTER := ring_buffer wav decode stream
 miri: miri-toolchain
 	cargo +$(MIRI_TOOLCHAIN) miri test -p mw-core --target $(MIRI_TARGET) --lib -- $(MIRI_CI_FILTER)
 
+# 統合テスト(tests/realtime_safety.rs)は Miri では終わらない(カウンティングアロケータの下で
+# 大量の描画を回すため 40 分を超えても1件目が終わらなかった)ので lib のテストだけにする。
 miri-all: miri-toolchain
-	cargo +$(MIRI_TOOLCHAIN) miri test -p mw-core --target $(MIRI_TARGET)
+	cargo +$(MIRI_TOOLCHAIN) miri test -p mw-core --target $(MIRI_TARGET) --lib
 
 miri-toolchain:
 	@if ! rustup toolchain list | grep -q "^$(MIRI_TOOLCHAIN)"; then \
@@ -275,6 +279,19 @@ fuzz-run: fuzz-toolchain
 
 fuzz-seeds:
 	python3 fuzz/seeds/make_seeds.py
+
+# --- ThreadSanitizer(手元専用。ADR-0003 の3段目)-----------------------------
+# 実デバイスの音声スレッドと制御スレッドの実行時の競合を見る(loom のモデル検証と補完関係)。
+# nightly の -Zsanitizer=thread は std を作り直す(-Zbuild-std)ため初回は数分、flaky にもなりうるので
+# CI には載せない。unsafe や スレッド間の共有構造(ring_buffer / clock / mixer の受け渡し)を触ったら1回回す。
+#
+# RUSTDOCFLAGS にも同じフラグを渡す —— cargo test はドキュメントテストを rustdoc 経由で
+# 別途コンパイルするが、rustdoc は RUSTFLAGS を継承しない。渡さないと、既にサニタイザ付きで
+# ビルド済みの依存 rlib(bitflags / coreaudio 等)に対して、サニタイザ無しでコンパイルされる
+# ドキュメントテスト側の crate が ABI 不一致でエラーになる(実測で確認済み)。
+TSAN_TARGET := $(shell rustc -vV | sed -n 's/^host: //p')
+tsan: miri-toolchain
+	RUSTFLAGS="-Zsanitizer=thread" RUSTDOCFLAGS="-Zsanitizer=thread" cargo +$(NIGHTLY_TOOLCHAIN) test -Zbuild-std --target $(TSAN_TARGET) --target-dir target/tsan --workspace
 
 bench:
 	@echo "criterion ベンチマークは未導入(初期構築仕様 §7.3: 任意)。M1 以降のミキサ実装後に追加する。"

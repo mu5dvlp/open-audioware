@@ -47,6 +47,12 @@ pub struct CpalBackend {
     /// 連続した場合に「進んだかどうか」を値の変化だけでは区別できない。単調増加の
     /// カウンタなら、値が変わっていれば必ず「少なくとも1回呼ばれた」ことを意味する。
     callback_ticks: Arc<AtomicU64>,
+    /// 音声スレッドが `Renderer::render` を呼び終えるたびに `Release` で加算する
+    /// カウンタ(値そのものに意味は無い)。`close()` がストリーム停止後に `Acquire` で
+    /// 読み、最後のコールバックの書き込みと drop 側の読み出しの間に happens-before の
+    /// 辺を明示するために使う(`close` の実装コメント参照)。`callback_ticks`
+    /// (呼ばれた回数の復帰確認用、`Relaxed`)とは役割を分ける。
+    render_completions: Arc<AtomicU64>,
     /// 音声スレッドが書き、ゲームスレッドが読む「直近の出力レイテンシ(ns)」。
     /// 詳細は [`Backend::output_latency_ns`]。
     output_latency_ns: Arc<AtomicU64>,
@@ -77,6 +83,7 @@ impl CpalBackend {
             ios_interruption: None,
             callback_frames: Arc::new(AtomicU32::new(0)),
             callback_ticks: Arc::new(AtomicU64::new(0)),
+            render_completions: Arc::new(AtomicU64::new(0)),
             output_latency_ns: Arc::new(AtomicU64::new(0)),
             logged_output_latency: AtomicBool::new(false),
             sample_rate: 0,
@@ -192,6 +199,7 @@ impl Backend for CpalBackend {
             // `ios_interruption::Watcher::new` へも同じカウンタを渡すため、ここでは
             // clone を渡す(コールバッククロージャへムーブされる分)。
             ticks: Arc::clone(&self.callback_ticks),
+            render_completions: Arc::clone(&self.render_completions),
         };
         let underrun_tracker = OutputUnderrunTracker::new(
             Arc::clone(&self.output_underrun_count),
@@ -237,10 +245,20 @@ impl Backend for CpalBackend {
                 self.ios_interruption = None;
                 // `pause` はベストエフォート。stream の drop で確実にコールバックは止まる。
                 let _ = stream.pause();
+                // `pause()` の後に最後のコールバックが `Release` で残した書き込みを、
+                // この `Acquire` で drop 側へ届ける(値は使わない)。ストリーム停止の
+                // 同期は cpal / OS の内部(ここでは CoreAudio の `AudioOutputUnitStop`)
+                // にあって Rust からは見えないため、直後の `drop(stream)`(→cpal の
+                // `Stream` drop → コールバッククロージャ drop → `Renderer` → `Mixer` →
+                // `VoicePool` → `Vec<Voice>` の drop)が最後のコールバックの書き込みを
+                // 読む前に、この経路で順序を明示しておく(TSan が実データ競合として
+                // 報告した経路)。
+                let _ = self.render_completions.load(Ordering::Acquire);
                 drop(stream);
                 self.sample_rate = 0;
                 self.callback_frames.store(0, Ordering::Relaxed);
                 self.callback_ticks.store(0, Ordering::Relaxed);
+                self.render_completions.store(0, Ordering::Relaxed);
                 self.output_latency_ns.store(0, Ordering::Relaxed);
                 self.logged_output_latency.store(false, Ordering::Relaxed);
                 self.output_underrun_count.store(0, Ordering::Relaxed);
@@ -412,6 +430,8 @@ struct CallbackTelemetry {
     output_latency_ns: Arc<AtomicU64>,
     /// [`CpalBackend::callback_ticks`] へ渡す `Arc`。
     ticks: Arc<AtomicU64>,
+    /// [`CpalBackend::render_completions`] へ渡す `Arc`。
+    render_completions: Arc<AtomicU64>,
 }
 
 fn build_output_stream(
@@ -431,6 +451,7 @@ fn build_output_stream(
         frames: callback_frames,
         output_latency_ns,
         ticks: callback_ticks,
+        render_completions,
     } = telemetry;
     // ストリーム構成時に確定するサンプルレート。オープン中は変わらないため、
     // アトミックにせずクロージャへそのまま値でムーブする(`Copy`)。
@@ -500,6 +521,11 @@ fn build_output_stream(
                 // mw-core の別関数を追加で呼んではいない)。
                 // `Renderer::render` はリアルタイム安全性規約(§5.3)を満たす実装である前提。
                 renderer.render(data, buffer_start_host_time_ns);
+
+                // `close()` がストリーム停止後の `Acquire` でこの書き込みを観測する
+                // ための同期点(`CpalBackend::render_completions` のdoc参照)。
+                // アトミック加算1回のみで、リアルタイム安全性規約(§5.3)に抵触しない。
+                render_completions.fetch_add(1, Ordering::Release);
             },
             err_fn,
             None,
