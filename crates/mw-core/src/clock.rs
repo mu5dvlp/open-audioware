@@ -357,16 +357,26 @@ mod tests {
         // 経路(ドキュメント記載の「書き手がプリエンプトされ続けた場合の保険」)を
         // 不自然に踏みやすくなる。読み過ぎを避けるため毎回小さく待つ
         // (これは終了条件ではなく単なるバックオフなので、フレークの原因にはならない)。
+        // 再試行を使い切った読み取り(ドキュメント記載の保険。整合は保証されない)は検査から外す。
+        // TSan の下ではスレッドが大きく遅くなり、この経路をまれに踏むため。
+        let mut consistent_reads = 0usize;
         while !writer.is_finished() {
-            let snapshot = publisher.snapshot();
-            assert_eq!(
-                snapshot.host_time_ns,
-                snapshot.song_frames * 2,
-                "seqlock が壊れ、更新途中の不整合なスナップショットが見えた"
-            );
+            let (snapshot, consistent) = publisher.read_snapshot();
+            if consistent {
+                consistent_reads += 1;
+                assert_eq!(
+                    snapshot.host_time_ns,
+                    snapshot.song_frames * 2,
+                    "seqlock が壊れ、更新途中の不整合なスナップショットが見えた"
+                );
+            }
             std::thread::sleep(std::time::Duration::from_micros(10));
         }
         writer.join().unwrap();
+        assert!(
+            consistent_reads > 0,
+            "整合の取れた読み取りが1回も無く、検査になっていない"
+        );
 
         // 書き手が完全に終わった後の最終状態も整合しているはず。
         let snapshot = publisher.snapshot();
@@ -426,15 +436,20 @@ mod tests {
                 let publisher = Arc::clone(&publisher);
                 let stop = Arc::clone(&stop);
                 std::thread::spawn(move || {
+                    let mut consistent_reads = 0usize;
                     while !stop.load(Ordering::Relaxed) {
-                        let snapshot = publisher.snapshot();
-                        assert_eq!(
-                            snapshot.host_time_ns,
-                            snapshot.song_frames * 2,
-                            "seqlock が壊れ、複数読み手のいずれかが不整合なスナップショットを見た"
-                        );
+                        let (snapshot, consistent) = publisher.read_snapshot();
+                        if consistent {
+                            consistent_reads += 1;
+                            assert_eq!(
+                                snapshot.host_time_ns,
+                                snapshot.song_frames * 2,
+                                "seqlock が壊れ、複数読み手のいずれかが不整合なスナップショットを見た"
+                            );
+                        }
                         std::thread::sleep(std::time::Duration::from_micros(10));
                     }
+                    consistent_reads
                 })
             })
             .collect();
@@ -443,7 +458,11 @@ mod tests {
         writer.join().unwrap();
         stop.store(true, Ordering::Relaxed);
         for reader in readers {
-            reader.join().unwrap();
+            let consistent_reads = reader.join().unwrap();
+            assert!(
+                consistent_reads > 0,
+                "整合の取れた読み取りが1回も無く、検査になっていない"
+            );
         }
     }
 }
@@ -628,6 +647,12 @@ impl MusicClockPublisher {
     /// 保証されない)。この経路に入るのは書き手がプリエンプトされ続けたときだけで、
     /// 実運用では 1 コールバックぶんの相関点のずれに留まる。
     pub fn snapshot(&self) -> MusicClockSnapshot {
+        self.read_snapshot().0
+    }
+
+    /// [`Self::snapshot`] の本体。2つ目の値は整合が取れたかどうか(再試行を使い切って
+    /// 最後に読んだ値を返したときは false)。テストが seqlock の正しさだけを検査するのに使う。
+    fn read_snapshot(&self) -> (MusicClockSnapshot, bool) {
         let mut snapshot = MusicClockSnapshot {
             song_frames: 0,
             host_time_ns: 0,
@@ -661,11 +686,11 @@ impl MusicClockPublisher {
             // (このコメントを消してここを単純な `Acquire` ロードに戻さないこと)。
             fence(Ordering::Acquire);
             if self.seq.load(Ordering::Relaxed) == before {
-                return snapshot;
+                return (snapshot, true);
             }
         }
 
-        snapshot
+        (snapshot, false)
     }
 
     /// seqlock の書き込み区間。前後で `seq` を進める。
