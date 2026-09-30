@@ -51,7 +51,7 @@ make lint / format    # fmt + clippy + cargo-deny / 自動整形
 make test             # cargo test(mw-core のオフラインレンダリングが主)
 make bench            # criterion(任意)
 make bindgen          # csbindgen で C# バインディング生成
-make build-macos      # .dylib(Unity Editor 用)
+make build-macos      # universal .dylib(Unity Editor 用)
 make build-ios        # .a → xcframework
 make build-android    # .so(cargo-ndk)
 make package          # UPM パッケージ組み立て(バイナリ + バインディング + ラッパ)

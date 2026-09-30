@@ -53,7 +53,7 @@ jobs:
           path: unity/Runtime/Plugins/iOS/MwFfi.xcframework
           retention-days: 5
 
-  # macOS: Unity Editor 用の dylib(ホストアーチ)。同じ cargo build がついでに
+  # macOS: Unity Editor 用の universal dylib。両アーチを束ねる cargo build がついでに
   # csbindgen の C# バインディング(NativeMethods.g.cs)も生成するので、あわせて取り出す。
   build-macos:
     runs-on: macos-latest
@@ -62,6 +62,10 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: |
+            aarch64-apple-darwin
+            x86_64-apple-darwin
 
       - uses: Swatinem/rust-cache@v2
 

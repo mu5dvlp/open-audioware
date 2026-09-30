@@ -25,7 +25,7 @@ open-audioware/
     package.json
     Runtime/
       Generated/NativeMethods.g.cs   ← csbindgen が生成(コミットしない)
-      Plugins/macOS/libmw_ffi.dylib  ← ビルド成果物(コミットしない)
+      Plugins/macOS/libmw_ffi.dylib  ← universal ビルド成果物(コミットしない)
       Plugins/iOS/…xcframework       ← 同上
       Plugins/Android/libmw_ffi.so   ← 同上
 ```
@@ -56,7 +56,7 @@ Unity 側が `.meta` で対象プラットフォームを既に絞ってある�
 | コマンド | 出力 | 用途 |
 |---|---|---|
 | `make bindgen` | `unity/Runtime/Generated/NativeMethods.g.cs` | C# バインディング。**関数シグネチャはターゲットに依存しない**ので、ホストビルド1回で足りる |
-| `make build-macos` | `libmw_ffi.dylib` | **Unity Editor で鳴らすため**。ホストアーチでビルドする(Intel / Apple Silicon どちらでも `--target` を明示しない) |
+| `make build-macos` | `libmw_ffi.dylib` | **Unity Editor で鳴らすため**。`aarch64-apple-darwin` と `x86_64-apple-darwin` を束ねた universal dylib を配置する |
 | `make build-ios` | `libmw_ffi.xcframework` | `aarch64-apple-ios` の静的ライブラリを `xcodebuild -create-xcframework` で包む |
 | `make build-android` | `libmw_ffi.so` | `cargo ndk`(ABI / API レベルは Makefile の変数) |
 | `make package` | (検証のみ) | 必須ファイルが揃っているかを確認する。揃っていなければ何を先に実行すべきかを表示する |

@@ -177,7 +177,10 @@ jobs:
         # バージョンはリポジトリ直下の rust-toolchain.toml と手で合わせること。
         uses: dtolnay/rust-toolchain@1.98.0
         with:
-          targets: aarch64-apple-ios
+          targets: |
+            aarch64-apple-darwin
+            x86_64-apple-darwin
+            aarch64-apple-ios
 
       - uses: Swatinem/rust-cache@v2
 

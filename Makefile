@@ -54,7 +54,7 @@ help:
 	@echo "  make doc            - API リファレンス(rustdoc)を生成。docs/integration.md §6 が正とする出力"
 	@echo "  make doc-coverage   - C ABI の全エクスポート関数に doc コメントがあるか検査"
 	@echo "  make bindgen        - csbindgen で C# バインディング生成"
-	@echo "  make build-macos    - .dylib をビルドし unity/Runtime/Plugins/macOS/ へ配置(ホストアーチ)"
+	@echo "  make build-macos    - universal .dylib をビルドし unity/Runtime/Plugins/macOS/ へ配置"
 	@echo "  make build-ios      - aarch64-apple-ios 静的ライブラリ → xcframework"
 	@echo "  make build-android  - cargo-ndk で $(ANDROID_ABI) の .so を生成"
 	@echo "  make package        - UPM パッケージ組み立て(スタブ)"
@@ -323,17 +323,24 @@ bindgen:
 
 # --- ネイティブビルド -----------------------------------------------------
 
-# 初期構築仕様の元表は aarch64-apple-darwin(Apple Silicon)前提だったが、
-# 開発機が Intel Mac(x86_64-apple-darwin)であるため、Unity Editor 用 dylib は
-# 常に「ホストアーチ」でビルドする(--target を明示しない = cargo のデフォルト
-# ホストターゲットを使う)。Apple Silicon 機でこのターゲットを実行すれば
-# 自動的に aarch64-apple-darwin の dylib になる。
+# Intel Mac と Apple Silicon Mac のどちらの Unity Editor でも同じ配布物を使えるよう、
+# macOS 用 dylib は両ターゲットを release ビルドし、lipo で universal に束ねる。
 build-macos:
-	cargo build -p mw-ffi --release
+	cargo build -p mw-ffi --release --target aarch64-apple-darwin
+	cargo build -p mw-ffi --release --target x86_64-apple-darwin
 	@mkdir -p $(PLUGINS_MACOS_DIR)
-	@cp target/release/libmw_ffi.dylib $(PLUGINS_MACOS_DIR)/libmw_ffi.dylib
-	@echo "built: $(PLUGINS_MACOS_DIR)/libmw_ffi.dylib"
-	@ls -la $(PLUGINS_MACOS_DIR)/libmw_ffi.dylib
+	@# install name はビルドした機械の絶対パスになるので、配布物では @rpath に揃える
+	@# (Unity はプラグインをパスで読み込むため、値そのものは読み込みに影響しない)。
+	@for arch in aarch64 x86_64; do \
+		install_name_tool -id @rpath/libmw_ffi.dylib target/$$arch-apple-darwin/release/libmw_ffi.dylib; \
+	done
+	@lipo -create \
+		target/aarch64-apple-darwin/release/libmw_ffi.dylib \
+		target/x86_64-apple-darwin/release/libmw_ffi.dylib \
+		-output $(PLUGINS_MACOS_DIR)/libmw_ffi.dylib
+	@lipo $(PLUGINS_MACOS_DIR)/libmw_ffi.dylib -verify_arch arm64 x86_64 \
+		|| (echo "universal dylib に arm64 / x86_64 の両方が入っていません" && exit 1)
+	@echo "built: $(PLUGINS_MACOS_DIR)/libmw_ffi.dylib($$(lipo -archs $(PLUGINS_MACOS_DIR)/libmw_ffi.dylib))"
 
 build-ios:
 	cargo build -p mw-ffi --release --target aarch64-apple-ios

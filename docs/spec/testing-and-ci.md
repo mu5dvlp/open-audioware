@@ -37,10 +37,10 @@
 
 | ターゲット | 形態 | 用途 |
 |---|---|---|
-| aarch64-apple-darwin | .dylib | Unity Editor(開発の主環境) |
+| aarch64-apple-darwin + x86_64-apple-darwin | universal .dylib | Unity Editor(Apple Silicon / Intel) |
 | aarch64-apple-ios | .a → xcframework | iOS 実機(静的リンク) |
 | aarch64-linux-android | .so(cargo-ndk) | Android 実機 |
-| x86_64 系 | 任意 | CI テスト実行用。Windows Editor 対応は当面見送り 【仮】 |
+| x86_64-unknown-linux-gnu 等 | 任意 | CI テスト実行用。Windows Editor 対応は当面見送り 【仮】 |
 
 ### 配布 【仮】
 
@@ -48,7 +48,7 @@
   `Mw.Native` ラッパ、最小サンプルを含める。パッケージ名 / 組織 ID は **決定済み**(MU7。2026-09-23)
 - バージョニングは semver。**ABI 互換の破壊はメジャーバージョンでのみ許可**し、
   `mw_abi_version()` で実行時検証する
-- リリースは GitHub Actions でタグ駆動ビルド(macOS ランナーで dylib / xcframework、
+- リリースは GitHub Actions でタグ駆動ビルド(macOS ランナーで universal dylib / xcframework、
   Linux ランナーで Android .so)→ パッケージに固めて Release 添付
 
 ### CI 【仮】
