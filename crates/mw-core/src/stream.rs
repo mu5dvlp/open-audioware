@@ -757,4 +757,86 @@ mod tests {
             "resampled stream must deliver exactly the rate-converted frame count via pump/read"
         );
     }
+
+    /// 【高】レビュー指摘1: 尾が出し切れないと `WavDecoder` は `total_frames` へ届かず、
+    /// `MusicVoice` は自然終了 (`Ready` への遷移・`MusicRenderOutcome::ended`) を検出できない
+    /// まま `Playing` に留まる(位置が止まり、アンダーランが積み上がり続ける)。
+    ///
+    /// `pump`/`read` を `MusicVoice::render` に配線し、チャンク長の手前の長さ(既存テストが
+    /// 割り切れる長さしか試していなかった見逃しの原因)で複数のレート対を試し、
+    /// 最後まで再生して自然終了することを見る。
+    ///
+    /// 🔴 **Miri では対象外にする。** レート対を1組(44.1k→48k)だけに絞った縮小版でも
+    /// 実測で3分を超えても終わらなかった(`decoder_delivers_exactly_total_frames_near_chunk_boundary_lengths`
+    /// 〔WAV パース + リサンプルのみ、20秒〕と違い、このテストは `ring_buffer`(唯一 unsafe を
+    /// 持つモジュール)の `Producer`/`Consumer` 経由の `pump`/`read` を挟むため、Miri が
+    /// 生ポインタ操作ごとに行う来歴(provenance)検査のオーバーヘッドが乗る)。
+    /// `ring_buffer` 自体の Miri 検査は他の既存テスト
+    /// (`pump_then_read_returns_pcm_in_order` 等、レート変換を伴わない軽いもの)で
+    /// 引き続きカバーされているため、ここでの安全性は
+    /// (a) 本テストの論理自体は通常の `cargo test`(本番タップ数)と
+    /// `RUSTFLAGS="--cfg miri" cargo test`(タップ数だけ Miri 相当に減らした高速な代用実行)の
+    /// 両方で確認済み、(b) `resample.rs`/`decode.rs` 側の尾の出し切り自体は
+    /// `decoder_delivers_exactly_total_frames_near_chunk_boundary_lengths`(Miri 実行)で
+    /// カバー済み、の2点で代替する。
+    #[cfg_attr(
+        miri,
+        ignore = "ring_buffer 経由の pump/read とリサンプルを組み合わせると実測3分超で \
+                   完了しなかった(レート対を1組に絞った縮小版でも)。ring_buffer 自体の \
+                   Miri 検査は他の軽いテストで、尾の出し切りは decode.rs 側の Miri テストで \
+                   それぞれカバー済み"
+    )]
+    #[test]
+    fn music_voice_reaches_a_natural_end_near_chunk_boundary_lengths() {
+        use crate::music::{MusicState, MusicVoice};
+        use crate::resample::StreamResampler;
+
+        const CHUNK_BOUNDARY_RATE_PAIRS: &[(u32, u32)] = &[
+            (44_100, 48_000),
+            (48_000, 44_100),
+            (22_050, 48_000),
+            (96_000, 48_000),
+        ];
+
+        for &(source_rate, output_rate) in CHUNK_BOUNDARY_RATE_PAIRS {
+            let need = StreamResampler::new(source_rate, output_rate)
+                .expect("valid rates")
+                .input_frames_needed();
+            let frame_count = need - 1;
+
+            let mut samples = Vec::with_capacity(frame_count * 2);
+            for i in 0..frame_count {
+                let v = ((i % 1_000) as i16) - 500;
+                samples.push(v);
+                samples.push(-v);
+            }
+            let bytes = make_pcm16_wav(source_rate, 2, &samples);
+            let mut decoder = WavDecoder::open(bytes, output_rate).expect("valid wav must open");
+
+            let (mut producer, mut source) = channel(Config::default(), output_rate);
+            let mut voice = MusicVoice::new(output_rate);
+
+            let mut ended = false;
+            for _ in 0..2_000 {
+                producer.pump(&mut decoder).expect("pump must succeed");
+                if voice.state() == MusicState::Ready {
+                    voice.play();
+                }
+                let mut buf = vec![0.0f32; 64 * CHANNELS];
+                let outcome = voice.render(&mut buf, &mut source);
+                if outcome.ended {
+                    ended = true;
+                    break;
+                }
+            }
+
+            assert!(
+                ended,
+                "{source_rate}->{output_rate}: MusicVoice must reach a natural end for input \
+                 length {frame_count} (chunk_len={need}); stuck at state {:?}, position {}",
+                voice.state(),
+                voice.position_frames()
+            );
+        }
+    }
 }

@@ -31,9 +31,17 @@
 //!   ロード時の一度きりのコストなので、計算量よりストップバンド減衰(エイリアシング抑制)を
 //!   優先する。
 //!
+//! 🔴 **間引き(`M > L`。素材レートが出力レートより高いとき)は、上記のタップ数を
+//! `ceil(M/L)` 倍する**(`PolyphaseCoeffs::design`)。遷移帯域幅(Hz)は素材レート `S` と
+//! タップ数 `K` だけで決まり `L` に依存しないため、`K` を固定したまま `M` だけ大きくすると
+//! 出力ナイキスト(`O/2`)に対する遷移帯域幅の割合が `M/L` に比例して悪化し、可聴域高域が
+//! 大きく落ちる(実測: 192k→48k で 16kHz -4.9dB・20kHz -20.4dB)。`ceil(M/L)` 倍することで
+//! 素材レートで見たフィルタの実効長を間引き量によらず一定に保つ。
+//!
 //! カットオフ周波数は「小さい方のレートのナイキスト周波数」を目標に、Kaiser の遷移帯域幅
-//! 近似式(`(A-8) / (2.285 * 2π * N)`, `N` はポリフェーズ展開前の全体タップ数 `K*L`)から
-//! 逆算したガードバンドぶんだけ手前に置く(`PolyphaseCoeffs::design` 参照)。
+//! 近似式(`(A-8) / (2.285 * 2π * N)`, `N` はポリフェーズ展開前の全体タップ数
+//! `K*L`。`K` は上記の間引きスケーリング後の値)から逆算したガードバンドぶんだけ手前に
+//! 置く(`PolyphaseCoeffs::design` 参照)。
 //!
 //! # レート比の安全域(`validate_rates`)
 //!
@@ -45,11 +53,14 @@
 //!
 //! # 遅延(レイテンシ)の扱い(設計判断2・3にまたがる)
 //!
-//! ポリフェーズ sinc フィルタは対称窓の群遅延ぶん(`(K-1)/2` 入力サンプル。出力レート換算は
-//! `PolyphaseCoeffs::design` の `delay_output_frames`)、出力側に遅延を持つ。
+//! ポリフェーズ sinc フィルタは対称窓の群遅延ぶん(出力レート基準で `(K*L-1)/(2M)`
+//! フレーム、`PolyphaseCoeffs::design` の `delay_output_frames`)、出力側に遅延を持つ
+//! (🔴 分子は `K*L-1`。`(K-1)*L` ではない——ポリフェーズ展開前の中間レート換算での
+//! 対称窓の中心タップ位置 `(K*L-1)/2` を出力レートへ換算した値であり、先に `-1` した
+//! ものを `L` 倍するのとは異なる)。
 //! **この遅延は rubato のときと同じく、呼び出し側(`decode.rs`)に一切見せない**:
 //! 生成直後・`reset()` 直後の出力から `delay_output_frames` フレームぶんを内部で読み捨てて
-//! から呼び出し側へ渡す(`PolyphaseEngine::process_chunk` 参照)。旧実装(rubato)からの
+//! から呼び出し側へ渡す(`PolyphaseEngine::convolve` 参照)。旧実装(rubato)からの
 //! 置き換えで遅延の**値**は変わるが、この「呼び出し側には一切見せない」という契約自体は
 //! 変わらない。`convert_frame_count`・FFI のいずれもこの遅延を織り込んでいる箇所は無い
 //! (grep 済み。`mw_get_output_latency_ns` は出力デバイスのレイテンシで、リサンプラの
@@ -90,18 +101,24 @@ const STREAM_CHUNK_TARGET_FRAMES: u64 = 1024;
 /// ストリーミング用ポリフェーズフィルタの1位相あたりのタップ数(`K`)。
 ///
 /// デコードスレッドで `pump()` のたびに評価される(§4.7)ため、CPU コストと遅延
-/// (`(K-1)/2` 入力サンプル)を抑える設定にする。64 タップは一般的な「中品質」sinc
+/// (正確な式はモジュール doc「遅延(レイテンシ)の扱い」・`PolyphaseCoeffs::design` 参照。
+/// 概ね `K/2` 程度の入力サンプル)を抑える設定にする。64 タップは一般的な「中品質」sinc
 /// リサンプラ(例: libsamplerate の Medium Quality 相当)と同程度で、[`STREAM_ATTENUATION_DB`]
 /// との組み合わせでゲーム音声として十分な折り返し抑圧が得られる(ADR-0004 参照)。
 ///
 /// 🔴 **Miri では 8 に落とす**(`decode.rs`/`wav.rs` 経由でリサンプルを通す既存テストの
 /// ために)。係数表のサイズ・畳み込みの繰り返し回数は `K*L`(`L` はレート対から決まる
 /// 補間係数)に比例し、64 タップだと `decode.rs` の単体テスト1本を Miri で解釈するだけで
-/// 数分かかる(ADR-0003 が許容する「Miri では回数を減らす」対応。テストの合否判定に
-/// 使う数値の精度〔`resample.rs::tests` の許容誤差〕はこの定数を直接使わないテスト
-/// (`ring_buffer`/`wav`/`decode`/`stream` を対象にする `make miri` の CI 範囲)には
-/// 影響しない——精度そのものを検査する `resample.rs::tests` は名前がこのフィルタに
-/// 一致しないため Miri の対象外のまま)。
+/// 数分かかる(ADR-0003 が許容する「Miri では回数を減らす」対応)。
+///
+/// この定数を直接使うテスト(`resample.rs::tests`)への影響:
+/// - CI が呼ぶ `make miri`(`MIRI_CI_FILTER` = `ring_buffer wav decode stream`)は
+///   `resample::` 自体をフィルタで除外しているため、この定数が 8 に落ちても CI の
+///   合否には影響しない。
+/// - 🔴 一方 `make miri-all`(フィルタ無しで `--lib` を丸ごと実行)は `resample::tests`
+///   も実行する。精度そのものを検査するテスト(`oneshot_attenuates_frequencies_above_the_output_nyquist_when_downsampling`
+///   等)は K=8 では目標減衰量(dB)を満たせず本物の失敗として落ちるため、
+///   `#[cfg_attr(miri, ignore)]` で個別に対象外にしてある(各テストの属性を参照)。
 #[cfg(not(miri))]
 const STREAM_TAPS_PER_PHASE: usize = 64;
 #[cfg(miri)]
@@ -129,8 +146,12 @@ const ONESHOT_ATTENUATION_DB: f64 = 100.0;
 ///
 /// `PolyphaseCoeffs::design` が Kaiser の遷移帯域幅からガードバンドを逆算する際の安全弁。
 /// 実際の対応レート(8kHz〜384kHz程度の一般的な組み合わせ)ではガードバンドが
-/// ナイキストの数%程度に収まり、この下限に触れることは無い(触れるのはタップ数に対して
-/// `L` が極端に大きい病的な組み合わせのときだけで、[`MAX_POLYPHASE_FACTOR`] が先に弾く)。
+/// ナイキストの数%程度に収まり、この下限に触れることは無い。**間引き(`M > L`)時に
+/// タップ数を `ceil(M/L)` 倍していること**(モジュール doc「窓関数とタップ数」参照)が
+/// この性質を保つ前提——スケーリングしなければ `M` が大きいほどガードバンドが出力
+/// ナイキストに対して肥大化する(実測: 192k→48k で放置すると 16kHz で -4.9dB)。
+/// 触れるのはタップ数に対して `L` が極端に大きい病的な組み合わせのときだけで、
+/// [`MAX_POLYPHASE_FACTOR`] が先に弾く。
 const MIN_CUTOFF_FRACTION_OF_NYQUIST: f64 = 0.05;
 
 /// 許容するサンプルレート比(大きい方 / 小さい方)の上限。
@@ -326,7 +347,7 @@ const MAX_ABS_INPUT_SAMPLE: f32 = 1.0e4;
 /// 畳み込みへ渡す前にサンプル1個を正規化する。
 ///
 /// 非有限(NaN / ±inf)は無音(0.0)へ、有限でも [`MAX_ABS_INPUT_SAMPLE`] を超える値は
-/// その範囲へ clamp する。`PolyphaseEngine::process_chunk` の唯一の入力正規化ポイント。
+/// その範囲へ clamp する。`PolyphaseEngine::process_chunk`/`flush` の唯一の入力正規化ポイント。
 fn sanitize_sample(value: f32) -> f32 {
     if value.is_finite() {
         value.clamp(-MAX_ABS_INPUT_SAMPLE, MAX_ABS_INPUT_SAMPLE)
@@ -403,12 +424,30 @@ impl PolyphaseCoeffs {
     fn design(
         source_rate: u32,
         output_rate: u32,
-        taps_per_phase: usize,
+        base_taps_per_phase: usize,
         attenuation_db: f64,
     ) -> Self {
         let g = gcd_u32(source_rate, output_rate);
         let l = output_rate / g;
         let m = source_rate / g;
+
+        // 🔴 レビュー指摘2の修正。間引き(`M > L`)のとき、1位相あたりのタップ数
+        // (`base_taps_per_phase`)をそのまま使うと、全体のタップ数 `K*L` は `M` に
+        // 追従せず、素材レートで見たフィルタ長(= `K*L / (S*L) = K/S` 秒)が
+        // `M`(間引き量)によらず一定のままになる。間引きは出力レートのナイキストを
+        // ずっと下げるので、遷移帯域幅(Kaiser 近似式)を出力ナイキストの一定割合に
+        // 保つには、素材レートで見た長さを `M/L` に比例させる必要がある
+        // (実測: 192k→48k は `M/L=4`、96k→48k は `M/L=2`)。`ceil(M/L)` 倍だけ
+        // `taps_per_phase` を増やし、全体のタップ数を `K*L*ceil(M/L)` にすることで、
+        // 出力ナイキストに対する遷移帯域幅の割合を `L` の値によらずほぼ一定に保つ
+        // (導出: 遷移帯域幅(Hz)は `(A-8)*S / (2.285*2π*K)` で `L` に依存しないため、
+        // 出力ナイキスト `O/2` に対する割合は `S/O`(= `M/L`)に比例して悪化する。
+        // `K` を `M/L` 倍すれば打ち消せる)。
+        // アップサンプル寄り(`M <= L`)のときは `n_total = K*L` が既に `S*L` に対して
+        // 十分な密度を持つ(`L` 自体が大きいため)ので増やさない
+        // (実測: 44.1k↔48k は ADR-0004 の比較で既に 50dB 超)。
+        let decimation_factor = if m > l { m.div_ceil(l) } else { 1 };
+        let taps_per_phase = base_taps_per_phase * decimation_factor as usize;
         let n_total = taps_per_phase * l as usize;
 
         let beta = kaiser_beta(attenuation_db);
@@ -451,9 +490,15 @@ impl PolyphaseCoeffs {
             taps[phase * taps_per_phase + tap] = (h * scale) as f32;
         }
 
-        // 群遅延 = (K-1)/2 入力サンプル。出力レート基準に換算し四捨五入する
-        // (`convert_frame_count` と同じ「分母の半分を足してから整数除算する」丸め方)。
-        let numerator = (taps_per_phase as u64 - 1) * l as u64;
+        // 🔴 レビュー指摘3の修正。群遅延は出力レート換算で `(K*L-1)/(2M)`。
+        // 対称窓の中心タップ位置は、ポリフェーズ展開前の中間レート(`f_int`)換算で
+        // `(n_total-1)/2 = (K*L-1)/2`(上の `center` と同じ定義)であり、これを
+        // 出力レートへ変換(`/M` して `f_int` と出力レートの比ぶん調整すると `/(2M)` に
+        // まとまる)したものが `delay_output_frames`。旧実装は `(K-1)*L/(2M)` になって
+        // おり、`-1` を `L` 倍する前に引いてしまっていた(`L` が大きいレート対ほど
+        // ずれが大きくなる)。四捨五入は `convert_frame_count` と同じ「分母の半分を
+        // 足してから整数除算する」丸め方。
+        let numerator = (taps_per_phase as u64 * l as u64).saturating_sub(1);
         let delay_output_frames = (numerator + m as u64) / (2 * m as u64);
 
         Self {
@@ -469,11 +514,12 @@ impl PolyphaseCoeffs {
 /// [`PolyphaseCoeffs`] を消費する畳み込みエンジン。
 ///
 /// [`StreamResampler`]・[`resample_oneshot`] のどちらも、この構造体の
-/// `process_chunk` だけを呼ぶ(一括変換とストリーミングを1実装で賄う、という要件の核)。
-/// 相違点は「同じインスタンスを使い回すか(ストリーミング)」「毎回作り直すか(一括、実質は
-/// 同じインスタンスをループで使い回す)」の呼び出し方だけで、畳み込みロジックは共有する。
+/// `process_chunk`(定常呼び出し)・`flush`(終端呼び出し)だけを呼ぶ(一括変換と
+/// ストリーミングを1実装で賄う、という要件の核)。相違点は「同じインスタンスを使い回すか
+/// (ストリーミング)」「毎回作り直すか(一括、実質は同じインスタンスをループで使い回す)」の
+/// 呼び出し方だけで、畳み込みロジック(`convolve`)は共有する。
 ///
-/// 🔴 **構築後の呼び出し(`process_chunk`/`reset`)はヒープ確保・ロックを一切行わない**
+/// 🔴 **定常呼び出し(`process_chunk`/`reset`)はヒープ確保・ロックを一切行わない**
 /// (`history`/`scratch` は構築時に固定長で確保し、以後は書き換えるだけ)。
 /// `mw-core/CLAUDE.md`「依存」に記載のとおり、このモジュールの呼び出し元
 /// (ゲームスレッドのロード時・デコードスレッドの `pump()` 内)は音声コールバック経路
@@ -481,6 +527,12 @@ impl PolyphaseCoeffs {
 /// デコードスレッドは楽曲バッファの供給を途切れさせない実時間性が要る経路であり、
 /// 呼び出しのたびに確保が発生するとジッタの原因になる。既存(rubato)実装も
 /// 固定長バッファを使い回す設計だったため、同じ特性を維持する。
+///
+/// 一方 **`flush`(ストリーム終端・一括変換の末尾で1回だけ呼ばれる)はヒープ確保を伴う**
+/// (フィルタの尾を出し切るのに必要な長さぶんのローカル作業領域を都度確保する。
+/// `flush` のドキュメント参照)。ストリームにつき1回・曲の終端でしか起こらないため
+/// ジッタの懸念はなく、`process_chunk`(`pump()` のたびに何度も呼ばれる定常経路)を
+/// アロケーション無しに保つこととは両立する。
 struct PolyphaseEngine {
     /// 直前チャンクの末尾 `taps_per_phase - 1` サンプル(チャンネルごと)。
     history: Vec<Vec<f32>>,
@@ -524,8 +576,8 @@ impl PolyphaseEngine {
 
     /// `input` の先頭 `frames` フレームぶん(`frames <= self.chunk_len`)を実データとして
     /// 畳み込み、残り(`self.chunk_len - frames`)は無音として扱う。`frames == self.chunk_len`
-    /// が通常の呼び出し、`frames < self.chunk_len` がストリーム終端のフラッシュ
-    /// (`StreamResampler::flush_into`)・一括変換の末尾ブロックに相当する。
+    /// が通常の呼び出し、`frames < self.chunk_len` が一括変換の末尾ブロックに相当する
+    /// (ストリーム終端は [`Self::flush`] を使う。理由はそちらのドキュメント参照)。
     ///
     /// 出力(出力レート基準のインターリーブ PCM)は `out` の末尾へ積む。
     fn process_chunk(
@@ -535,9 +587,7 @@ impl PolyphaseEngine {
         frames: usize,
         out: &mut Vec<f32>,
     ) {
-        let k = coeffs.taps_per_phase;
-        let k1 = k - 1;
-        let chunk_start = self.total_input_fed;
+        let k1 = coeffs.taps_per_phase - 1;
         let chunk_len = self.chunk_len;
 
         for ch in 0..CHANNELS {
@@ -552,27 +602,131 @@ impl PolyphaseEngine {
             }
         }
 
-        // 今回のチャンクで生成しうる出力フレーム数のおおまかな上限を見積もり、
-        // `out` の再確保回数を減らす(正確な値である必要は無い。ヒントに過ぎない)。
-        out.reserve((chunk_len as u64 * coeffs.l as u64 / coeffs.m as u64 + 2) as usize * CHANNELS);
+        // `self.scratch` と `self.history`/`self.next_out_n` 等は互いに素なフィールドなので、
+        // 別々に借用すれば同時アクセスできる(`decode.rs::NativeReader` のドキュメントと
+        // 同じ考え方)。
+        Self::convolve(
+            coeffs,
+            &self.scratch,
+            chunk_len,
+            &mut self.next_out_n,
+            &mut self.delay_to_skip,
+            &mut self.total_input_fed,
+            &mut self.history,
+            out,
+        );
+    }
+
+    /// ストリーム終端(または一括変換の末尾)を処理する。
+    ///
+    /// 🔴 **レビュー指摘1の修正。** [`Self::process_chunk`] は常に固定長
+    /// `self.chunk_len` の「仮想入力」(実データ `frames` + 無音パディング
+    /// `chunk_len - frames`)しか進めない。畳み込みは `base`(参照する入力位置)が
+    /// `chunk_start + chunk_len - 1` を超えられないため、フィルタの尾
+    /// (`taps_per_phase - 1` サンプルぶんの畳み込み支持域)を出し切るのに必要な無音
+    /// (`taps_per_phase - 1` サンプル)が、その回のパディング(`chunk_len - frames`)
+    /// だけでは足りないことがある(実測: 44.1k→48k でチャンク長 882・`K`=64 のとき、
+    /// 残り実データが 881 フレームだとパディングは 1 サンプルしか無く、63 サンプルぶん
+    /// 不足していた)。
+    ///
+    /// 直し方: `process_chunk` のような固定長チャンクの繰り返しではなく、
+    /// **この呼び出し1回だけ**で「実データ(`frames`)+ 尾を出し切るのに必要な無音
+    /// (`taps_per_phase - 1` サンプル)」ぴったりの長さの仮想入力を組み立てて畳み込む
+    /// (`process_chunk` のように毎回 `chunk_len` ぶんの余分な無音チャンクを繰り返し
+    /// 処理すると、本来必要な尾より遥かに多い「正しくはあるが無駄な」無音出力まで
+    /// 生成してしまい、ストリーミングの総出力が `convert_frame_count` を大きく超えて
+    /// しまう——一度この実装を試して回帰させたため、コメントとして残す)。
+    /// これで `base` がちょうど実データ終端 + `taps_per_phase - 1` まで到達し、
+    /// それ以降の出力は正確に 0 になる(それ以上パディングしても値は変わらない)ため、
+    /// ここで安全に打ち切れる。呼び出し側(`resample_oneshot`)が行う
+    /// `out.resize(target_frames.., 0.0)` は、この時点からは「本当に 0 であるべき」
+    /// フレームだけを埋める形になり、まだ計算し切れていない本物の尾を無音で
+    /// 上書きしてしまうことは無い。
+    ///
+    /// ヒープアロケーションを伴う(`local` の確保・`out.reserve`/`push`)が、
+    /// `flush`/`flush_into` はデコードスレッド(`pump()`)・ロード時一括変換からしか
+    /// 呼ばれず、音声コールバック経路(§5.3)には入らない(`resample.rs` モジュール doc
+    /// 「ブロック境界の連続性」・`decode.rs` モジュール doc 参照)。
+    fn flush(
+        &mut self,
+        coeffs: &PolyphaseCoeffs,
+        remaining_input: &[f32],
+        frames: usize,
+        out: &mut Vec<f32>,
+    ) {
+        let k1 = coeffs.taps_per_phase - 1;
+        // 実データ(frames)+ 尾を出し切るのに必要十分な無音(k1)ぴったりの仮想長。
+        let virtual_len = frames + k1;
+
+        let mut local = vec![vec![0.0f32; k1 + virtual_len]; CHANNELS];
+        for ch in 0..CHANNELS {
+            let (hist_part, rest) = local[ch].split_at_mut(k1);
+            hist_part.copy_from_slice(&self.history[ch]);
+            for (i, slot) in rest[..frames].iter_mut().enumerate() {
+                *slot = sanitize_sample(remaining_input[i * CHANNELS + ch]);
+            }
+            // `rest[frames..]`(尾を出し切るための無音ぶん)は `vec![0.0; ..]` の初期値の
+            // ままでよい。
+        }
+
+        Self::convolve(
+            coeffs,
+            &local,
+            virtual_len,
+            &mut self.next_out_n,
+            &mut self.delay_to_skip,
+            &mut self.total_input_fed,
+            &mut self.history,
+            out,
+        );
+    }
+
+    /// `process_chunk`/`flush` に共通の畳み込み本体。
+    ///
+    /// `scratch`(`history ++ 今回の仮想入力`、長さ `k1 + virtual_len`)を読み、生成できる
+    /// 出力(`base <= self.total_input_fed + virtual_len - 1` を満たす間)を `out` へ積む。
+    /// 呼び出し側のフィールドを個別の引数として受け取る設計にしてあるのは、
+    /// `scratch` が `self.scratch`(定常呼び出し)と `flush` 専用のローカル `Vec`(終端呼び出し)
+    /// のどちらでもよいようにするため——`&mut self` 1本で受けると `self.scratch` を
+    /// 読みながら `self.history` 等を書けず、借用が衝突してしまう
+    /// (`process_chunk` のコメント参照)。
+    #[allow(clippy::too_many_arguments)]
+    fn convolve(
+        coeffs: &PolyphaseCoeffs,
+        scratch: &[Vec<f32>],
+        virtual_len: usize,
+        next_out_n: &mut u64,
+        delay_to_skip: &mut u64,
+        total_input_fed: &mut u64,
+        history: &mut [Vec<f32>],
+        out: &mut Vec<f32>,
+    ) {
+        let k = coeffs.taps_per_phase;
+        let k1 = k - 1;
+        let chunk_start = *total_input_fed;
+
+        // 今回生成しうる出力フレーム数のおおまかな上限を見積もり、`out` の再確保回数を
+        // 減らす(正確な値である必要は無い。ヒントに過ぎない)。
+        out.reserve(
+            (virtual_len as u64 * coeffs.l as u64 / coeffs.m as u64 + 2) as usize * CHANNELS,
+        );
 
         loop {
-            let base = (self.next_out_n * coeffs.m as u64) / coeffs.l as u64;
-            if base > chunk_start + chunk_len as u64 - 1 {
+            let base = (*next_out_n * coeffs.m as u64) / coeffs.l as u64;
+            if base > chunk_start + virtual_len as u64 - 1 {
                 break;
             }
-            // `base >= chunk_start` は不変条件(前回の呼び出しが「これ以上は今回のチャンクでは
-            // 計算できない」という同じ条件で止まっているため)。この不変条件があるおかげで
+            // `base >= chunk_start` は不変条件(前回の呼び出しが「これ以上は今回の仮想入力
+            // では計算できない」という同じ条件で止まっているため)。この不変条件があるおかげで
             // `local_base - j`(`j` は 0..k)が常に `scratch` の範囲内に収まる。
-            let phase = ((self.next_out_n * coeffs.m as u64) % coeffs.l as u64) as usize;
+            let phase = ((*next_out_n * coeffs.m as u64) % coeffs.l as u64) as usize;
             let local_base = (base - chunk_start) as usize + k1;
             let tap_base = phase * k;
 
-            if self.delay_to_skip > 0 {
-                self.delay_to_skip -= 1;
+            if *delay_to_skip > 0 {
+                *delay_to_skip -= 1;
             } else {
-                for ch in 0..CHANNELS {
-                    let s = &self.scratch[ch];
+                for s in scratch.iter() {
                     let mut acc = 0.0f32;
                     for j in 0..k {
                         acc += coeffs.taps[tap_base + j] * s[local_base - j];
@@ -580,14 +734,14 @@ impl PolyphaseEngine {
                     out.push(acc);
                 }
             }
-            self.next_out_n += 1;
+            *next_out_n += 1;
         }
 
         for ch in 0..CHANNELS {
-            let len = self.scratch[ch].len();
-            self.history[ch].copy_from_slice(&self.scratch[ch][len - k1..]);
+            let len = scratch[ch].len();
+            history[ch].copy_from_slice(&scratch[ch][len - k1..]);
         }
-        self.total_input_fed += chunk_len as u64;
+        *total_input_fed += virtual_len as u64;
     }
 }
 
@@ -648,6 +802,10 @@ impl StreamResampler {
     /// 素材側が末尾に到達した(`remaining_input` フレームぶんしか残っていない。
     /// 0 フレームでもよい)ときに一度だけ呼ぶ。残りを無音でパディングして最後の
     /// ブロックを変換し、フィルタの内部履歴に残っていた尾も一緒に吐き出す。
+    ///
+    /// 🔴 実データがチャンク長ぎりぎりのときは1回の呼び出しだけではパディングが足りず
+    /// フィルタの尾が出し切れないことがあるため、内部で必要な回数ぶん無音チャンクを
+    /// 追加で処理する(`PolyphaseEngine::flush` 参照。レビュー指摘1)。
     pub fn flush_into(
         &mut self,
         remaining_input: &[f32],
@@ -655,7 +813,7 @@ impl StreamResampler {
     ) -> Result<(), ResampleError> {
         let valid_frames = remaining_input.len() / CHANNELS;
         self.engine
-            .process_chunk(&self.coeffs, remaining_input, valid_frames, out);
+            .flush(&self.coeffs, remaining_input, valid_frames, out);
         Ok(())
     }
 
@@ -706,13 +864,14 @@ pub fn resample_oneshot(
     }
 
     // 最後の端数(0 フレームのこともある)を無音パディングしつつ処理する。
-    // フィルタに残っていた尾もこの呼び出しで一緒に吐き出される
-    // (`chunk_len` が `taps_per_phase` よりずっと大きいため、1回のパディング呼び出しで
-    // 履歴が完全に流れ切る。`StreamResampler::flush_into` と同じ考え方)。
+    // フィルタに残っていた尾もここで一緒に吐き出す。端数がチャンク長ぎりぎりだと
+    // 1回のパディングだけでは足りないことがあるため、`PolyphaseEngine::flush` が
+    // 必要な回数だけ無音チャンクを追加で処理する(`StreamResampler::flush_into` と
+    // 同じ考え方。レビュー指摘1)。
     let remaining = frames - pos;
     let tail_start = pos * CHANNELS;
     let tail_end = frames * CHANNELS;
-    engine.process_chunk(&coeffs, &input[tail_start..tail_end], remaining, &mut out);
+    engine.flush(&coeffs, &input[tail_start..tail_end], remaining, &mut out);
 
     let target_frames = convert_frame_count(frames as u64, source_rate, output_rate) as usize;
     out.resize(target_frames * CHANNELS, 0.0);
@@ -1023,6 +1182,17 @@ mod tests {
     }
 
     #[test]
+    // 🔴 レビュー指摘4。`make miri-all`(フィルタ無しで `--lib` を丸ごと実行)では
+    // `ONESHOT_TAPS_PER_PHASE`/`STREAM_TAPS_PER_PHASE` が 8 に落ちるため、この
+    // ストップバンド減衰量(dB)そのものを検査するテストは目標減衰量を満たせず
+    // 本物の失敗として落ちる(精度を見るテストであり、Miri のタップ数削減とは
+    // 原理的に両立しない)。CI が呼ぶ `make miri` は `resample::` をフィルタで
+    // 除外しているためこの ignore の影響は受けない。
+    #[cfg_attr(
+        miri,
+        ignore = "Miri はタップ数を8に減らすため目標減衰量(dB)を満たせない。\
+                   make miri(CI)は resample:: をそもそも対象外にしている"
+    )]
     fn oneshot_attenuates_frequencies_above_the_output_nyquist_when_downsampling() {
         // 折り返し(エイリアシング)の抑圧: 出力のナイキストより高い成分は、
         // 折り返し先の周波数にエネルギーを残してはならない。48kHz -> 16kHz
@@ -1202,5 +1372,209 @@ mod tests {
         // レート一致自体を拒否しないこと(呼び出し側の責務であり、ここでは弾かない)
         // だけを回帰として残す。
         assert!(StreamResampler::new(48_000, 48_000).is_ok());
+    }
+
+    // --- レビュー指摘の回帰テスト -------------------------------------------------
+
+    /// 【高】レビュー指摘1: `flush_into` が無音埋めした `process_chunk` を1回しか
+    /// 呼ばないため、残りの実データがチャンク長に近いとフィルタの尾
+    /// (`taps_per_phase - 1` 入力サンプルぶんの畳み込み支持域)が出しきれない。
+    ///
+    /// 実測(修正前): 44.1k→48k で入力長 T=4409 のとき、ストリーミング出力の総フレーム数が
+    /// `convert_frame_count` に届かなかった(T=4410 ではチャンクにちょうど収まるため
+    /// たまたま通っていた——既存テストが割り切れる長さしか試していなかった見逃しの原因)。
+    #[test]
+    fn streaming_flush_delivers_the_full_tail_near_chunk_boundary_lengths() {
+        for &(source_rate, output_rate) in &[
+            (44_100u32, 48_000u32),
+            (48_000, 44_100),
+            (22_050, 48_000),
+            (96_000, 48_000),
+        ] {
+            let need = StreamResampler::new(source_rate, output_rate)
+                .expect("valid rates")
+                .input_frames_needed();
+
+            for &frame_count in &[need - 1, need, need + 1, 2 * need - 1, 2 * need] {
+                let input = sine_wave(500.0, source_rate, frame_count, 0.4);
+                let mut resampler =
+                    StreamResampler::new(source_rate, output_rate).expect("valid rates");
+                let mut out = Vec::new();
+
+                let mut pos = 0usize;
+                while frame_count - pos >= need {
+                    resampler
+                        .process_full_chunk_into(
+                            &input[pos * CHANNELS..(pos + need) * CHANNELS],
+                            &mut out,
+                        )
+                        .expect("must not error");
+                    pos += need;
+                }
+                resampler
+                    .flush_into(&input[pos * CHANNELS..frame_count * CHANNELS], &mut out)
+                    .expect("flush must not error");
+
+                // `resample.rs` モジュール doc「総フレーム数・シーク位置は出力レート基準」の
+                // とおり、ブロック単位でしか出力できないリサンプラは端数ぶん
+                // `convert_frame_count` を超えて生成することがあり、それは呼び出し側
+                // (`WavDecoder` 等)が `total_frames` で打ち切る前提の正常な余剰
+                // (decode.rs::decoder_delivers_exactly_total_frames_near_chunk_boundary_lengths
+                // が実際の打ち切り込みで厳密な一致を検査する)。ここで検査すべきなのは
+                // 「尾が出しきれず不足する」バグ(レビュー指摘1)なので、不足していないこと
+                // (>=)を見る。
+                let expected =
+                    convert_frame_count(frame_count as u64, source_rate, output_rate) as usize;
+                assert!(
+                    out.len() / CHANNELS >= expected,
+                    "{source_rate}->{output_rate}: streaming output must reach at least \
+                     convert_frame_count for input length {frame_count} (chunk_len={need}); \
+                     got {} frames, need >= {expected}",
+                    out.len() / CHANNELS
+                );
+            }
+        }
+    }
+
+    /// 【高】レビュー指摘1(一括変換側)。`resample_oneshot` は同じ `PolyphaseEngine` を
+    /// 使うため、末尾の端数チャンクがちょうど `ONESHOT_CHUNK_FRAMES` の手前だと
+    /// 同じ理由でフィルタの尾が出しきれず、`out.resize(target_frames.., 0.0)` が
+    /// 本来の(DC信号ならほぼ入力振幅の)値の代わりに強制的な無音で埋めてしまう。
+    ///
+    /// 十分な無音(1チャンクぶん以上)を先に足した参照と比べる: フィルタは因果的
+    /// (未来を見ない)ため、参照側の対応する範囲の出力は元の呼び出しと値が変わらない
+    /// はずで、末尾が不正に 0 へ落ちていればここで食い違う。
+    #[test]
+    fn oneshot_does_not_replace_the_true_tail_with_hard_zero_for_a_dc_signal() {
+        const SOURCE_RATE: u32 = 44_100;
+        const OUTPUT_RATE: u32 = 48_000;
+        const AMPLITUDE: f32 = 0.6;
+        // `ONESHOT_CHUNK_FRAMES` のすぐ手前(端数チャンクがほぼ満杯になる境界条件)。
+        let frame_count = ONESHOT_CHUNK_FRAMES - 1;
+
+        let dc = vec![AMPLITUDE; frame_count * CHANNELS];
+        let (out, out_frames) =
+            resample_oneshot(&dc, frame_count, SOURCE_RATE, OUTPUT_RATE).expect("valid rates");
+
+        let mut padded_dc = dc.clone();
+        padded_dc.resize(padded_dc.len() + ONESHOT_CHUNK_FRAMES * CHANNELS, 0.0);
+        let (padded_out, _) = resample_oneshot(
+            &padded_dc,
+            frame_count + ONESHOT_CHUNK_FRAMES,
+            SOURCE_RATE,
+            OUTPUT_RATE,
+        )
+        .expect("valid rates");
+
+        assert!(
+            out_frames * CHANNELS <= padded_out.len(),
+            "padded reference must be at least as long as the original output"
+        );
+        let tail_len = 10.min(out_frames);
+        let tail = &out[(out_frames - tail_len) * CHANNELS..out_frames * CHANNELS];
+        let reference_tail = &padded_out[(out_frames - tail_len) * CHANNELS..out_frames * CHANNELS];
+        for (i, (&got, &reference)) in tail.iter().zip(reference_tail.iter()).enumerate() {
+            assert!(
+                (got - reference).abs() < 1e-4,
+                "tail sample {i} must match the fully-flushed reference (causal filter: \
+                 appending more silence must not change already-computed samples), \
+                 got {got}, reference {reference}"
+            );
+            assert!(
+                got.abs() > AMPLITUDE * 0.5,
+                "tail sample {i} must not have been replaced by hard zero padding, got {got} \
+                 (DC input should stay close to amplitude {AMPLITUDE} in this region)"
+            );
+        }
+    }
+
+    /// 【中】レビュー指摘2: 大きく間引く(`M > L`)ときに全体のタップ数(`K*L`)が
+    /// 素材レートで見て伸びず、可聴域の高域が大きく落ちる。
+    ///
+    /// 実測(修正前、ストリーミング `K=64`): 192k→48k で 16kHz -4.9dB・20kHz -20.4dB、
+    /// 96k→48k で 20kHz -4.9dB(一括変換は `K=256` が元々余裕を持っていたため症状が出ない。
+    /// 音楽ストリーミングで実際に問題になるのはこちら)。
+    #[test]
+    // 🔴 レビュー指摘4と同じ理由(Miri ではタップ数が8まで減るため、間引き時のタップ数
+    // スケーリングを掛けても -1dB 基準を満たせない)で対象外にする。
+    #[cfg_attr(
+        miri,
+        ignore = "Miri はタップ数を8に減らすため-1dB基準を満たせない。\
+                   make miri(CI)は resample:: をそもそも対象外にしている"
+    )]
+    fn streaming_keeps_high_audible_frequencies_within_1db_when_heavily_downsampling() {
+        const AMPLITUDE: f32 = 0.5;
+        let expected_rms = AMPLITUDE / std::f32::consts::SQRT_2;
+
+        for &(source_rate, output_rate, freq_hz) in &[
+            (192_000u32, 48_000u32, 16_000.0f32),
+            (96_000, 48_000, 20_000.0),
+        ] {
+            let frame_count = source_rate as usize / 10; // 100ms
+            let input = sine_wave(freq_hz, source_rate, frame_count, AMPLITUDE);
+
+            let mut resampler =
+                StreamResampler::new(source_rate, output_rate).expect("valid rates");
+            let need = resampler.input_frames_needed();
+            let mut out = Vec::new();
+            let mut pos = 0usize;
+            while frame_count - pos >= need {
+                resampler
+                    .process_full_chunk_into(
+                        &input[pos * CHANNELS..(pos + need) * CHANNELS],
+                        &mut out,
+                    )
+                    .expect("must not error");
+                pos += need;
+            }
+            resampler
+                .flush_into(&input[pos * CHANNELS..frame_count * CHANNELS], &mut out)
+                .expect("flush must not error");
+
+            let measured_rms = rms(&left_channel(&out));
+            let attenuation_db = 20.0 * (measured_rms / expected_rms).log10();
+            assert!(
+                attenuation_db > -1.0,
+                "{source_rate}->{output_rate}: {freq_hz}Hz should be attenuated by less than \
+                 1dB, got {attenuation_db}dB (measured_rms={measured_rms}, \
+                 expected_rms={expected_rms})"
+            );
+        }
+    }
+
+    /// 【低】レビュー指摘3: 群遅延の式が `(K-1)*L/(2M)` になっていた
+    /// (正しくは出力換算 `(K*L-1)/(2M)`)。入力の途中(`i0`)にインパルスを置き、
+    /// 出力側の理想位置 `i0*O/S` から ±0.5フレーム以内にピークが来ることを見る
+    /// (先頭付近に来ることしか見ていなかった既存の
+    /// `delay_is_a_deterministic_function_of_the_rate_pair` より厳密な検査)。
+    #[test]
+    fn oneshot_impulse_peak_lands_within_half_a_frame_of_the_ideal_output_position() {
+        for &(source_rate, output_rate) in
+            &[(8_000u32, 48_000u32), (16_000, 48_000), (44_100, 48_000)]
+        {
+            let frame_count = 4_000usize;
+            let i0 = frame_count / 2;
+            let mut impulse = vec![0.0f32; frame_count * CHANNELS];
+            impulse[i0 * CHANNELS] = 1.0;
+            impulse[i0 * CHANNELS + 1] = 1.0;
+
+            let (out, out_frames) =
+                resample_oneshot(&impulse, frame_count, source_rate, output_rate)
+                    .expect("valid rates");
+            let left = left_channel(&out[..out_frames * CHANNELS]);
+            let (peak_index, _) = left
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.abs().partial_cmp(&b.1.abs()).unwrap())
+                .expect("non-empty output");
+
+            let ideal = i0 as f64 * output_rate as f64 / source_rate as f64;
+            let diff = (peak_index as f64 - ideal).abs();
+            assert!(
+                diff <= 0.5,
+                "{source_rate}->{output_rate}: peak should land within 0.5 frame of the ideal \
+                 position {ideal}, got index {peak_index} (diff {diff})"
+            );
+        }
     }
 }

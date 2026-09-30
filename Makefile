@@ -44,7 +44,7 @@ help:
 	@echo "  make format         - cargo fmt (自動整形)"
 	@echo "  make test           - cargo test --workspace"
 	@echo "  make miri           - unsafe を持つ ring_buffer と、パーサ(wav / decode / stream)のテストを Miri で実行(約2分。CI と同じ範囲)"
-	@echo "  make miri-all       - mw-core の lib の全テストを Miri で実行(約13分。rubato の FFT と seqlock の並行テストは対象外)"
+	@echo "  make miri-all       - mw-core の lib の全テストを Miri で実行(約13分。rubato は ADR-0004 で削除済み。フィルタ無しで全件実行するが、resample:: の精度検査テストの一部は #[cfg_attr(miri, ignore)] で対象外)"
 	@echo "  make fuzz-seeds     - fuzz/corpus/ のシードコーパスを再生成(fuzz/seeds/make_seeds.py)"
 	@echo "  make fuzz-build     - cargo-fuzz のターゲット3本をビルド(wav_decode / wav_decoder_pump / resample)"
 	@echo "  make fuzz-corpus    - 既存コーパスの回帰実行のみ(数秒。CI が呼ぶのはこれ)"
@@ -228,6 +228,13 @@ MIRI_CI_FILTER := ring_buffer wav decode stream
 # リサンプラ自身のテスト(`resample::`。フィルタの `stream` に当たる)と、リサンプラを通して音声を
 # 丸ごと変換するテストは Miri では1件1分前後かかり、CI の範囲が10分を超えるので CI では外し、
 # `miri-all` で回す(リサンプラは unsafe を持たない)。
+# 2026-09-30 レビュー対応で追加した `decoder_delivers_exactly_total_frames_near_chunk_boundary_lengths`
+# も同じ理由でここに追加した(対象レート対を1組に絞ってあるが〔`#[cfg(miri)]`〕、それでも
+# WAV パース + リサンプルを経由する1件は実測20秒かかるため CI の範囲には含めない。
+# `make miri-all` では回る)。同時に追加した `stream::tests::music_voice_reaches_a_natural_end_near_chunk_boundary_lengths`
+# はここではなく `#[cfg_attr(miri, ignore)]` で対象外にしてある(`ring_buffer` 経由の
+# pump/read とリサンプルの組み合わせは、レート対を1組に絞っても実測3分超で完了せず、
+# `make miri-all` の予算にも収まらないため。理由はテスト自身のコメント参照)。
 MIRI_CI_SKIP := \
 	resample:: \
 	resample_preserves_frequency_when_upsampling_44_1k_to_48k \
@@ -236,7 +243,8 @@ MIRI_CI_SKIP := \
 	seek_after_resample_matches_a_fresh_decoder_seeked_to_the_same_position \
 	end_to_end_resamples_a_44_1k_wav_through_pump_and_read_without_error \
 	non_finite_samples_in_a_resampled_wav_do_not_panic_and_read_to_eof \
-	decodes_a_non_48k_wav_by_resampling_to_the_output_rate
+	decodes_a_non_48k_wav_by_resampling_to_the_output_rate \
+	decoder_delivers_exactly_total_frames_near_chunk_boundary_lengths
 
 miri: miri-toolchain
 	cargo +$(MIRI_TOOLCHAIN) miri test -p mw-core --target $(MIRI_TARGET) --lib -- $(MIRI_CI_FILTER) \
@@ -344,8 +352,13 @@ build-macos:
 	@mkdir -p $(PLUGINS_MACOS_DIR)
 	@# install name はビルドした機械の絶対パスになるので、配布物では @rpath に揃える
 	@# (Unity はプラグインをパスで読み込むため、値そのものは読み込みに影響しない)。
+	@# 🔴 各反復の失敗を `|| exit 1` で即座に伝播する: `for ... do ... done` は1本の
+	@# シェルコマンドなので、`set -e` が効かない make のレシピでは1回目の
+	@# install_name_tool が失敗しても(bash が黙って)2回目の反復へ進んでしまい、
+	@# ループ全体の終了ステータスは最後(x86_64)の結果だけになる——1回目の失敗を
+	@# 見逃す(レビュー指摘5)。
 	@for arch in aarch64 x86_64; do \
-		install_name_tool -id @rpath/libmw_ffi.dylib target/$$arch-apple-darwin/release/libmw_ffi.dylib; \
+		install_name_tool -id @rpath/libmw_ffi.dylib target/$$arch-apple-darwin/release/libmw_ffi.dylib || exit 1; \
 	done
 	@lipo -create \
 		target/aarch64-apple-darwin/release/libmw_ffi.dylib \

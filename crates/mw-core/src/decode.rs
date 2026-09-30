@@ -361,6 +361,20 @@ impl WavDecoder {
             }
 
             if self.resample_finished {
+                // 🔴 二重の保険(レビュー指摘1)。`want_frames` は呼び出し元(`read`)が
+                // 既に `total_frames - position_frames` 以下へ切り詰め済みなので、
+                // ここへ来た時点で `frames_written < want_frames` ということは、本来
+                // `total_frames` まで届くはずのリサンプル結果が(何らかの理由で)
+                // 足りていないことを意味する(通常は `resample.rs::PolyphaseEngine::flush`
+                // がフィルタの尾を出し切るため起こらないはずだが、それが機能しなくなると
+                // `WavDecoder` が `total_frames` に到達できず、`MusicVoice` が自然終了
+                // できないままアンダーランを蓄積し続ける——実測した症状そのもの)。
+                // 不足ぶんを無音で埋めて必ず `want_frames` を返すことで、デコーダが
+                // 常に `total_frames` まで到達できるようにする。
+                for slot in out[frames_written * CHANNELS..want_frames * CHANNELS].iter_mut() {
+                    *slot = 0.0;
+                }
+                frames_written = want_frames;
                 break;
             }
             self.refill_resampled_pending()?;
@@ -899,5 +913,57 @@ mod tests {
             got.iter().all(|v| v.is_finite()),
             "decoded output must not contain NaN/inf: {got:?}"
         );
+    }
+
+    /// 【高】レビュー指摘1: `resample.rs::StreamResampler::flush_into` がフィルタの尾を
+    /// 出しきれないと、`WavDecoder` は `total_frames` に到達する前に読み出しが止まる。
+    ///
+    /// 実測(修正前): 44.1k→48k で入力長 T=4409 のとき、`total_frames` は 4799 なのに
+    /// 実際に読めたのは 4766 フレームだけだった(T=4410 は偶然チャンク境界に揃うため
+    /// 通っていた——既存テストが割り切れる長さしか試していなかった見逃しの原因)。
+    /// 割り切れない長さを複数のレート対で確認する。
+    ///
+    /// 🔴 Miri では対象のレート対・長さを1組(実際に不具合が出ていた 44.1k→48k、
+    /// `need-1` のみ)に絞る。WAV バイト列のパースを経由するテスト(`decode.rs` の他の
+    /// `resample_*` テストと同じ種類)は Miri で1件が非常に重く(実測: フル版〔4レート対
+    /// ×4長さ=16組〕は 10 分を超えても1組目すら終わらなかった)、この関数自体も
+    /// `MIRI_CI_SKIP`(`Makefile`)で CI の `make miri` からは除外している
+    /// (`make miri-all` でこの縮小版が回る)。
+    #[cfg(not(miri))]
+    const CHUNK_BOUNDARY_RATE_PAIRS: &[(u32, u32)] = &[
+        (44_100, 48_000),
+        (48_000, 44_100),
+        (22_050, 48_000),
+        (96_000, 48_000),
+    ];
+    #[cfg(miri)]
+    const CHUNK_BOUNDARY_RATE_PAIRS: &[(u32, u32)] = &[(44_100, 48_000)];
+
+    #[test]
+    fn decoder_delivers_exactly_total_frames_near_chunk_boundary_lengths() {
+        for &(source_rate, output_rate) in CHUNK_BOUNDARY_RATE_PAIRS {
+            let need = resample::StreamResampler::new(source_rate, output_rate)
+                .expect("valid rates")
+                .input_frames_needed();
+
+            #[cfg(not(miri))]
+            let frame_counts: &[usize] = &[need - 1, need, need + 1, 2 * need - 1];
+            #[cfg(miri)]
+            let frame_counts: &[usize] = &[need - 1];
+
+            for &frame_count in frame_counts {
+                let bytes = make_sine_wave_wav(source_rate, 500.0, frame_count, 10_000);
+                let mut decoder =
+                    WavDecoder::open(bytes, output_rate).expect("valid wav must open");
+                let expected = decoder.total_frames().expect("wav reports total frames");
+
+                let got = drain_left_channel(&mut decoder, 4_096).len() as u64;
+                assert_eq!(
+                    got, expected,
+                    "{source_rate}->{output_rate}: decoder must deliver exactly total_frames \
+                     for input length {frame_count} (chunk_len={need})"
+                );
+            }
+        }
     }
 }
