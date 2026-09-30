@@ -29,7 +29,8 @@
 
 ### [2026-09-29](history/16-2026-09-29.md)
 
-- macOS 配布 dylib を arm64 + x86_64 の universal に変更(`make build-macos` の `lipo` 結合・検証、install name 維持)
+- (2026-09-30)rubato を自前のポリフェーズ sinc リサンプラへ置き換え(ADR-0004。表記が要る依存 39 → 27)。Miri の CI 範囲から重いリサンプルのテストを外した(40 件 82 秒)。TSan でまれに落ちる楽曲クロックのテストを直した
+- macOS 配布 dylib を arm64 + x86_64 の universal に変更(`make build-macos` の `lipo` 結合・検証、install name は `@rpath` に揃えた)
 - Miri を導入(`make miri` / `miri-all` / CI)。リングバッファの Stacked Borrows 違反を1件修正。rustfft の上流 UB は Linux ターゲットで回避(ADR-0003)
 - cargo-fuzz を導入(3本 + コーパス回帰の CI + 週次)。初回 60 秒で rubato の NaN abort と `resample_oneshot` のレート 0 の巨大確保を発見し、入口で防いだ
 - TSan を導入(`make tsan`。手元専用)。終了時の happens-before の辺をコードに明示し、警告 0 件に

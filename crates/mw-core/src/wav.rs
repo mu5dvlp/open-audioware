@@ -4,7 +4,7 @@
 //! WAVE_FORMAT_EXTENSIBLE 版 / ステレオ・モノラルの wav。モノは等パワーで両ch展開する。
 //! サンプルレートは**出力デバイスのレートに一致しなくてよい** —
 //! `decode` に渡された `output_sample_rate` と異なる場合、ロード時に一括で
-//! `resample.rs::resample_oneshot`(rubato `Async` sinc)へ通して出力レート化する
+//! `resample.rs::resample_oneshot`(自前ポリフェーズ窓付き sinc フィルタ)へ通して出力レート化する
 //! (初期構築仕様『§4.7』: 「SE はロード時に全デコード + 必要ならロード時に
 //! リサンプルして出力レート化(再生時コストゼロ)」)。一致する場合はリサンプラを
 //! 構築すらしない(レート一致時に無用な計算を持ち込まない)。
@@ -1021,17 +1021,18 @@ mod tests {
     }
 
     #[test]
-    // Miri では対象外: rubato(外部クレート)の FFT リサンプラを Miri で解釈すると1本で数分〜十数分かかる。
-    // 検査したいのは自前コードの unsafe(ring_buffer / wav / decode の本体)で、rubato の中身ではない。
-    // rubato を自前化(依存排除のステップ2)したら外して、Miri の対象に戻す。
-    #[cfg_attr(miri, ignore = "rubato(外部)の FFT を Miri で解釈すると数分かかる")]
     fn decodes_a_non_48k_wav_by_resampling_to_the_output_rate() {
         // SE 側(wav.rs)も 48kHz 以外の wav が読めること。
         // あわせて周波数が保たれること・長さが正しいことも見る。
         const SOURCE_RATE: u32 = 44_100;
         const OUTPUT_RATE: u32 = 48_000;
         const FREQ_HZ: f32 = 1_000.0;
+        // Miri では短くする(`resample.rs::STREAM_TAPS_PER_PHASE` のドキュメント参照。
+        // `resample_oneshot` はタップ数を落としても Miri での実行時間がなお長いため)。
+        #[cfg(not(miri))]
         const FRAME_COUNT: usize = 4_410; // 100ms
+        #[cfg(miri)]
+        const FRAME_COUNT: usize = 1_000;
 
         let bytes = make_sine_wave_wav(SOURCE_RATE, FREQ_HZ, FRAME_COUNT, 20_000);
         let sound = decode(&bytes, OUTPUT_RATE).expect("non-48k wav must decode via resampling");

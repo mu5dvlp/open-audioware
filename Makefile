@@ -225,9 +225,22 @@ MIRI_TARGET := x86_64-unknown-linux-gnu
 # mixer / music などは音声を描画するため Miri では1件ずつ数十秒かかり、lib 全体では約13分になるので
 # `miri-all` に分けて手元で回す(依存を自前化した直後や、unsafe を触ったときに1回)。
 MIRI_CI_FILTER := ring_buffer wav decode stream
+# リサンプラ自身のテスト(`resample::`。フィルタの `stream` に当たる)と、リサンプラを通して音声を
+# 丸ごと変換するテストは Miri では1件1分前後かかり、CI の範囲が10分を超えるので CI では外し、
+# `miri-all` で回す(リサンプラは unsafe を持たない)。
+MIRI_CI_SKIP := \
+	resample:: \
+	resample_preserves_frequency_when_upsampling_44_1k_to_48k \
+	resample_produces_the_expected_output_length \
+	resample_block_boundaries_are_seamless \
+	seek_after_resample_matches_a_fresh_decoder_seeked_to_the_same_position \
+	end_to_end_resamples_a_44_1k_wav_through_pump_and_read_without_error \
+	non_finite_samples_in_a_resampled_wav_do_not_panic_and_read_to_eof \
+	decodes_a_non_48k_wav_by_resampling_to_the_output_rate
 
 miri: miri-toolchain
-	cargo +$(MIRI_TOOLCHAIN) miri test -p mw-core --target $(MIRI_TARGET) --lib -- $(MIRI_CI_FILTER)
+	cargo +$(MIRI_TOOLCHAIN) miri test -p mw-core --target $(MIRI_TARGET) --lib -- $(MIRI_CI_FILTER) \
+		$(addprefix --skip ,$(MIRI_CI_SKIP))
 
 # 統合テスト(tests/realtime_safety.rs)は Miri では終わらない(カウンティングアロケータの下で
 # 大量の描画を回すため 40 分を超えても1件目が終わらなかった)ので lib のテストだけにする。

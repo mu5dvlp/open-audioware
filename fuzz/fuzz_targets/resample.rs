@@ -1,9 +1,10 @@
 //! `mw_core::resample` のファズターゲット(ADR-0003 の2段目)。
 //!
-//! `StreamResampler`(楽曲ストリーミング用、`rubato::Fft`)を1周(全チャンク処理 → flush →
-//! reset)ぶん回してからもう1周し、`resample_oneshot`(SE 一括変換用、`rubato::Async` sinc)も
-//! 同じ入力で呼ぶ。狙うのは自前コード(`resample.rs`)と rubato の境界(バッファサイズの
-//! 不整合・NaN/inf の伝播・パニック)であって、rubato 自体の性能検査ではない。
+//! `StreamResampler`(楽曲ストリーミング用、自前ポリフェーズ sinc)を1周(全チャンク処理 →
+//! flush → reset)ぶん回してからもう1周し、`resample_oneshot`(SE 一括変換用、同じ
+//! ポリフェーズ sinc エンジンを高品質な係数で使う)も同じ入力で呼ぶ。狙うのは自前実装
+//! (`resample.rs`)の境界(バッファサイズの不整合・NaN/inf の伝播・パニック・
+//! `MAX_POLYPHASE_FACTOR` 近辺のレート対での確保)。
 //!
 //! レート 0・極端なレート比・NaN/inf/極端な値を含む入力は、いずれも `resample.rs` 自身が
 //! 入口(`validate_rates`/`sanitize_sample`)で弾く・正規化するため、ここでは避けずにそのまま

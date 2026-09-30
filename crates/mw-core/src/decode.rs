@@ -12,7 +12,7 @@
 //! # リサンプル(初期構築仕様『§4.7』, `resample.rs`)
 //!
 //! 出力(デバイス)サンプルレートと素材のレートが一致しない場合、[`WavDecoder`] は
-//! `resample.rs::StreamResampler`(rubato `Fft` ベース)で自動的に変換する。
+//! `resample.rs::StreamResampler`(自前ポリフェーズ窓付き sinc フィルタ)で自動的に変換する。
 //! **レートが一致する場合はリサンプラを構築すらしない**(`resampler: Option<_>` が
 //! `None` のままバイパスする。レート一致時に無用な計算・レイテンシを
 //! 持ち込まない)。
@@ -711,16 +711,19 @@ mod tests {
     // --- ここから先はリサンプル(初期構築仕様『§4.7』)の検証 -------------------------
 
     #[test]
-    // Miri では対象外: rubato(外部クレート)の FFT リサンプラを Miri で解釈すると1本で数分〜十数分かかる。
-    // 検査したいのは自前コードの unsafe(ring_buffer / wav / decode の本体)で、rubato の中身ではない。
-    // rubato を自前化(依存排除のステップ2)したら外して、Miri の対象に戻す。
-    #[cfg_attr(miri, ignore = "rubato(外部)の FFT を Miri で解釈すると数分かかる")]
     fn resample_preserves_frequency_when_upsampling_44_1k_to_48k() {
         // 周波数が保たれること。
         const SOURCE_RATE: u32 = 44_100;
         const OUTPUT_RATE: u32 = 48_000;
         const FREQ_HZ: f32 = 1_000.0;
+        // Miri では短くする(タップ数を落としても畳み込みの絶対回数自体が Miri の
+        // 実行時間を支配するため。`STREAM_TAPS_PER_PHASE` のドキュメント参照)。
+        // 内部チャンク長(このレート対で約882フレーム)の2倍以上を確保し、
+        // 複数チャンクにまたがる経路は引き続き踏む。
+        #[cfg(not(miri))]
         const FRAME_COUNT: usize = 4_410; // 100ms ぶん(1kHz の100周期)。
+        #[cfg(miri)]
+        const FRAME_COUNT: usize = 2_000;
 
         let bytes = make_sine_wave_wav(SOURCE_RATE, FREQ_HZ, FRAME_COUNT, 20_000);
         let mut decoder = WavDecoder::open(bytes, OUTPUT_RATE).expect("valid wav must open");
@@ -734,17 +737,18 @@ mod tests {
     }
 
     #[test]
-    // Miri では対象外: rubato(外部クレート)の FFT リサンプラを Miri で解釈すると1本で数分〜十数分かかる。
-    // 検査したいのは自前コードの unsafe(ring_buffer / wav / decode の本体)で、rubato の中身ではない。
-    // rubato を自前化(依存排除のステップ2)したら外して、Miri の対象に戻す。
-    #[cfg_attr(miri, ignore = "rubato(外部)の FFT を Miri で解釈すると数分かかる")]
     fn resample_produces_the_expected_output_length() {
         // 長さが正しいこと。総フレーム数・実際に読み出せる
         // フレーム数の両方が `convert_frame_count` の換算式ちょうどに一致することを見る
         // (§4.7 設計判断3: 端数超過分は `total_frames` で切り詰める設計にしてある)。
         const SOURCE_RATE: u32 = 44_100;
         const OUTPUT_RATE: u32 = 48_000;
+        // Miri では短くする(`resample_preserves_frequency_when_upsampling_44_1k_to_48k` と
+        // 同じ理由)。
+        #[cfg(not(miri))]
         const FRAME_COUNT: usize = 4_410;
+        #[cfg(miri)]
+        const FRAME_COUNT: usize = 2_000;
 
         let bytes = make_sine_wave_wav(SOURCE_RATE, 1_000.0, FRAME_COUNT, 20_000);
         let mut decoder = WavDecoder::open(bytes, OUTPUT_RATE).expect("valid wav must open");
@@ -757,10 +761,6 @@ mod tests {
     }
 
     #[test]
-    // Miri では対象外: rubato(外部クレート)の FFT リサンプラを Miri で解釈すると1本で数分〜十数分かかる。
-    // 検査したいのは自前コードの unsafe(ring_buffer / wav / decode の本体)で、rubato の中身ではない。
-    // rubato を自前化(依存排除のステップ2)したら外して、Miri の対象に戻す。
-    #[cfg_attr(miri, ignore = "rubato(外部)の FFT を Miri で解釈すると数分かかる")]
     fn resample_block_boundaries_are_seamless() {
         // ブロック境界の連続性。細切れに read() したときと、
         // 一括に近い大きさで read() したときとで、リサンプル結果が完全一致することを見る
@@ -768,7 +768,12 @@ mod tests {
         // 内部オーバーラップ状態が保たれ継ぎ目にプチノイズが出ない設計。`resample.rs` 参照)。
         const SOURCE_RATE: u32 = 44_100;
         const OUTPUT_RATE: u32 = 48_000;
+        // Miri では短くする(`resample_preserves_frequency_when_upsampling_44_1k_to_48k` と
+        // 同じ理由)。
+        #[cfg(not(miri))]
         const FRAME_COUNT: usize = 4_410;
+        #[cfg(miri)]
+        const FRAME_COUNT: usize = 2_000;
 
         let bytes = make_sine_wave_wav(SOURCE_RATE, 1_000.0, FRAME_COUNT, 20_000);
 
@@ -807,10 +812,6 @@ mod tests {
     }
 
     #[test]
-    // Miri では対象外: rubato(外部クレート)の FFT リサンプラを Miri で解釈すると1本で数分〜十数分かかる。
-    // 検査したいのは自前コードの unsafe(ring_buffer / wav / decode の本体)で、rubato の中身ではない。
-    // rubato を自前化(依存排除のステップ2)したら外して、Miri の対象に戻す。
-    #[cfg_attr(miri, ignore = "rubato(外部)の FFT を Miri で解釈すると数分かかる")]
     fn seek_after_resample_matches_a_fresh_decoder_seeked_to_the_same_position() {
         // リサンプル併用時のシーク調停。
         // 「途中まで読んでからシークした場合」と「開いた直後にシークした場合」とで、
@@ -818,7 +819,12 @@ mod tests {
         // オーバーラップ状態を正しく破棄できているかの検証。混ざっていれば食い違う)。
         const SOURCE_RATE: u32 = 44_100;
         const OUTPUT_RATE: u32 = 48_000;
+        // Miri では短くする(`resample_preserves_frequency_when_upsampling_44_1k_to_48k` と
+        // 同じ理由。ウォームアップ 500 フレーム + シーク後 333 フレームぶんの余裕は残す)。
+        #[cfg(not(miri))]
         const FRAME_COUNT: usize = 8_820; // 200ms
+        #[cfg(miri)]
+        const FRAME_COUNT: usize = 3_000;
 
         let bytes = make_sine_wave_wav(SOURCE_RATE, 1_000.0, FRAME_COUNT, 20_000);
         let target = resample::convert_frame_count(2_000, SOURCE_RATE, OUTPUT_RATE);
@@ -842,10 +848,6 @@ mod tests {
     }
 
     #[test]
-    // Miri では対象外: rubato(外部クレート)の FFT リサンプラを Miri で解釈すると1本で数分〜十数分かかる。
-    // 検査したいのは自前コードの unsafe(ring_buffer / wav / decode の本体)で、rubato の中身ではない。
-    // rubato を自前化(依存排除のステップ2)したら外して、Miri の対象に戻す。
-    #[cfg_attr(miri, ignore = "rubato(外部)の FFT を Miri で解釈すると数分かかる")]
     fn end_to_end_resamples_a_44_1k_wav_through_pump_and_read_without_error() {
         // `stream.rs` の pump/read 経路は `stream.rs` 側の
         // end-to-end テストで直接カバーする。ここでは decode.rs 単体として、
@@ -860,14 +862,10 @@ mod tests {
     }
 
     #[test]
-    // Miri では対象外: rubato(外部クレート)の FFT リサンプラを Miri で解釈すると1本で数分〜十数分かかる。
-    // 検査したいのは自前コードの unsafe(ring_buffer / wav / decode の本体)で、rubato の中身ではない。
-    // rubato を自前化(依存排除のステップ2)したら外して、Miri の対象に戻す。
-    #[cfg_attr(miri, ignore = "rubato(外部)の FFT を Miri で解釈すると数分かかる")]
     fn non_finite_samples_in_a_resampled_wav_do_not_panic_and_read_to_eof() {
         // float32 の WAV に NaN / inf / 極端な値を直接埋め込み、レート不一致
-        // (48000 -> 44100、resample.rs::StreamResampler の Fft 経路を通る)でも
-        // 最後まで読み切れること(`resample.rs::sanitize_sample` が rubato へ渡す前に
+        // (48000 -> 44100、resample.rs::StreamResampler のポリフェーズ sinc 経路を通る)
+        // でも最後まで読み切れること(`resample.rs::sanitize_sample` が畳み込みへ渡す前に
         // 正規化していることの回帰)。
         const SOURCE_RATE: u32 = 48_000;
         const OUTPUT_RATE: u32 = 44_100;

@@ -25,7 +25,7 @@ make lint
 
 - `make test` は `cargo test --workspace` を実行します。`mw-core` のオフラインレンダリング、音声コールバック相当経路、FFI 統合テストを含みます。
 - `make lint` は `cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo deny check`、第三者ライセンス表記の鮮度検査、C# ラッパのコンパイル検査を実行します。
-- `make miri` は `mw-core` のテストを Miri(nightly。日付は Makefile の `MIRI_TOOLCHAIN` で固定)で実行し、自前のロックフリーリングバッファやデコーダの unsafe に未定義動作が無いことを検査します。初回は nightly と rust-src の導入で数分かかります。rubato の FFT を使うテストと、seqlock の並行テストは Miri では対象外です(理由はテストの属性に書いてあります)。
+- `make miri` は `mw-core` のテストを Miri(nightly。日付は Makefile の `MIRI_TOOLCHAIN` で固定)で実行し、自前のロックフリーリングバッファやデコーダの unsafe に未定義動作が無いことを検査します。初回は nightly と rust-src の導入で数分かかります。対象は `Makefile` の `MIRI_CI_FILTER` に載っているモジュール(`ring_buffer`/`wav`/`decode`/`stream`)のテストだけで、seqlock の並行テストはこのフィルタの対象外です。リサンプル(`resample.rs`)は依存排除ステップ2で外部クレート(旧 rubato)を自前のポリフェーズ sinc フィルタへ置き換えたため、`decode.rs` 経由でリサンプルを通すテストも Miri の対象になっています。
 - `make fuzz-corpus` は `fuzz/`(ルートの workspace から切り離した cargo-fuzz 専用クレート、ADR-0003)の3ターゲット(`wav_decode`/`wav_decoder_pump`/`resample`)を、既存のシードコーパス(`fuzz/corpus/`)に対して1回ずつ流すだけの回帰実行です(数秒。CI もこれを呼びます)。`make fuzz-run TARGET=<name> SECONDS=<秒数、既定600>` で1ターゲットを指定時間だけ実際にファジングできます(手元での探索・週次ワークフロー用。長時間の実行は push の CI には載せません)。コーパスを追加・更新したら `make fuzz-seeds` で再生成してからコミットしてください。
 - `make tsan` は ThreadSanitizer でワークスペースのテストを実行します(手元専用。ADR-0003 の3段目)。初回は `-Zbuild-std` で std を作り直すため数分かかります。CI には載せません。
 - `make csharp-check` は .NET 8 以降で、通常経路と iOS の `__Internal` 経路を Unity 無しでコンパイルします。

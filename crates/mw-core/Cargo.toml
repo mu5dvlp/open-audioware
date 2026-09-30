@@ -13,12 +13,9 @@ crate-type = ["rlib"]
 [dependencies]
 # SPSC ロックフリーリングバッファは `mw-core::ring_buffer` に実装する。
 # 楽曲は `wav.rs` の自前 PCM パーサでストリーミングデコードする。
-# サンプルレート変換(初期構築仕様 §4.7, M2)。既定 feature(`fft_resampler` のみ)を
-# そのまま使う: 楽曲ストリーミングの `Fft` + `FixedSync::Both`(§7.1 の実装方針どおり依存を
-# 無用に太らせない範囲で、既に必要な feature と一致するため明示的な取捨選択は不要)、
-# SE ロード時一括変換の `Async` sinc はどちらも feature フラグ無しで使える。
-# `resample.rs` の選定理由コメントを参照。
-rubato = "5.0"
+# サンプルレート変換(初期構築仕様 §4.7, M2)も `resample.rs` の自前ポリフェーズ窓付き
+# sinc フィルタで行う(依存排除ステップ2。旧 `rubato` 依存は削除した。ADR-0004)。
+# 外部の音声処理クレートには依存していない。
 
 [dev-dependencies]
 loom = "0.7"

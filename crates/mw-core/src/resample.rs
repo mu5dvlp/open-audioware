@@ -1,49 +1,70 @@
 //! サンプルレート変換(初期構築仕様『§4.7 デコードとリサンプリング』, M2)。
 //!
 //! 素材のサンプルレートと出力デバイスのサンプルレートが一致しない場合に、両者を
-//! **rubato** で吸収する。用途が2つあり、要求される特性が違うため、あえて別のリサンプラを
-//! 選んでいる(用途ごとに必要な特性が異なるため)。
+//! **自前のポリフェーズ窓付き sinc フィルタ**で吸収する(依存排除ステップ2。
+//! `docs/adr/0004-polyphase-sinc-resampler.md` に設計判断の詳細)。
 //!
-//! - **楽曲(ストリーミング・固定ブロック)**: [`StreamResampler`] が
-//!   [`rubato::Fft`] を `FixedSync::Both` で使う。入力・出力とも**固定フレーム数**(サンプルレートの
-//!   比から決まる)で処理できる同期(FFT ベース)リサンプラで、比を実行時に変える必要が
-//!   無い今回の用途(§4.7 は再生速度変更を範囲外としている。MU5 は別機能)に対して
-//!   計算コストが小さい。デコードスレッド上で `pump()` のたびに何度も呼ばれる経路なので、
-//!   非同期 sinc の畳み込みよりこちらを優先した。
-//!   欠点: 内部 FFT サイズは `gcd(source_rate, output_rate)` に依存するため、互いに素に近い
-//!   レート同士(非標準のサンプルレート)だと巨大な FFT になりうる。48kHz/44.1kHz/32kHz/
-//!   22.05kHz/16kHz といった一般的な組み合わせでは gcd が大きく実用上問題にならないが、
-//!   非標準レートの素材を扱うようになった場合はここを見直すこと(判断理由として報告)。
-//! - **SE(ロード時・一括)**: [`resample_oneshot`] が [`rubato::Async`] を `FixedAsync::Input` と
-//!   高品質な sinc 設定で
-//!   (長いシンク長・高いオーバーサンプリング係数)で使う。ロード時の一度きりのコストなので
-//!   計算量よりも品質(ストップバンド減衰・エイリアシング抑制)を優先する。非同期 sinc は
-//!   FFT ベースと違って比が `gcd` に縛られないため、どんなレートの組でも安全に使える
-//!   (SE は楽曲よりゲームプレイに紐づく短い素材が多く、想定外レートの持ち込みも
-//!   起こりやすいため、こちらは頑健さを優先する)。
+//! 用途に関わらず必要な比は **固定の有理数比 L:M**(例: 44.1k↔48k は 147:160)だけであり、
+//! 実行時に比を変える機能は無い(§4.7 は再生速度変更を範囲外としている。MU5 は別機能)。
+//! そのため FFT や可変比補間は不要で、レート対ごとに1回だけ設計した固定のポリフェーズ係数
+//! (`PolyphaseCoeffs`)を、**一括変換([`resample_oneshot`])とストリーミング
+//! ([`StreamResampler`])の両方が同じ [`PolyphaseEngine`] で消費する**。
+//!
+//! # アルゴリズム(補間 L 倍 → デシメーション M 倍)
+//!
+//! 標準的な多重レート信号処理の構成(Crochiere & Rabiner の polyphase interpolator/decimator):
+//! 素材レート `S` を `L` 倍に補間(ゼロ詰め)してから低域フィルタを掛け、`M` 倍に間引く
+//! (`S*L == O*M` となる中間レートを介する)。`L = O/gcd(S,O)`, `M = S/gcd(S,O)`。
+//! ゼロ詰めを実際には行わず、位相 `p = (n_out*M) mod L` ごとに束ねたポリフェーズ部分フィルタ
+//! (タップ数 `K` = [`STREAM_TAPS_PER_PHASE`]/[`ONESHOT_TAPS_PER_PHASE`])を直接、
+//! 入力サンプル `x[base], x[base-1], ..., x[base-(K-1)]`(`base = floor(n_out*M/L)`)へ
+//! 畳み込む。rubato の非同期 sinc(補間テーブルの近似)と違い、**比が固定である前提を使って
+//! 各位相の係数を厳密に事前計算する**ため、位相補間による誤差が原理的に無い。
+//!
+//! # 窓関数とタップ数(ADR-0004)
+//!
+//! Kaiser 窓を使う(目標ストップバンド減衰量からベータを一意に決められ、実効タップ数から
+//! 遷移帯域幅を Kaiser の近似式で見積もれるため。理由・比較した他の窓は ADR 参照)。
+//! - **ストリーミング**([`STREAM_TAPS_PER_PHASE`] = 64、[`STREAM_ATTENUATION_DB`] = 80dB):
+//!   デコードスレッドで `pump()` のたびに何度も評価されるため、CPU コストと遅延を抑える。
+//! - **一括変換**([`ONESHOT_TAPS_PER_PHASE`] = 256、[`ONESHOT_ATTENUATION_DB`] = 100dB):
+//!   ロード時の一度きりのコストなので、計算量よりストップバンド減衰(エイリアシング抑制)を
+//!   優先する。
+//!
+//! カットオフ周波数は「小さい方のレートのナイキスト周波数」を目標に、Kaiser の遷移帯域幅
+//! 近似式(`(A-8) / (2.285 * 2π * N)`, `N` はポリフェーズ展開前の全体タップ数 `K*L`)から
+//! 逆算したガードバンドぶんだけ手前に置く(`PolyphaseCoeffs::design` 参照)。
+//!
+//! # レート比の安全域(`validate_rates`)
+//!
+//! [`MAX_RATE_RATIO`] に加え、`gcd` で約分した `L`/`M` の大きい方が [`MAX_POLYPHASE_FACTOR`]
+//! を超える組み合わせも拒否する。比自体は小さくても(例 48000:48001 ≈ 1.0)、
+//! 互いに素に近いレート同士だと `L`/`M` が数万に達し、`K*L` のタップ表が肥大化して
+//! 構築コスト・メモリが破綻しうるため(rubato `Fft` の「`gcd` が小さいと FFT が巨大化する」
+//! 弱点と同じ種類の懸念。旧実装のモジュール doc にあった注記を引き継ぐ)。
+//!
+//! # 遅延(レイテンシ)の扱い(設計判断2・3にまたがる)
+//!
+//! ポリフェーズ sinc フィルタは対称窓の群遅延ぶん(`(K-1)/2` 入力サンプル。出力レート換算は
+//! `PolyphaseCoeffs::design` の `delay_output_frames`)、出力側に遅延を持つ。
+//! **この遅延は rubato のときと同じく、呼び出し側(`decode.rs`)に一切見せない**:
+//! 生成直後・`reset()` 直後の出力から `delay_output_frames` フレームぶんを内部で読み捨てて
+//! から呼び出し側へ渡す(`PolyphaseEngine::process_chunk` 参照)。旧実装(rubato)からの
+//! 置き換えで遅延の**値**は変わるが、この「呼び出し側には一切見せない」という契約自体は
+//! 変わらない。`convert_frame_count`・FFI のいずれもこの遅延を織り込んでいる箇所は無い
+//! (grep 済み。`mw_get_output_latency_ns` は出力デバイスのレイテンシで、リサンプラの
+//! 群遅延とは無関係)。
 //!
 //! # ブロック境界の連続性
 //!
 //! [`StreamResampler`] はストリーム(1曲)につき1個だけ生成し、`pump()` が呼ばれるたびに
-//! **同じインスタンスを使い回す**。`Fft` はブロックをまたぐオーバーラップを
-//! 内部状態(`overlaps`)として保持しており、これが毎回のブロック処理をまたいで
-//! 引き継がれることで継ぎ目の不連続(プチノイズ)を防いでいる。呼び出し側が
-//! ブロックのたびに新しいリサンプラを作ってしまうとこの保証が崩れるため、
-//! **絶対にやってはいけない**。
+//! **同じインスタンスを使い回す**。直前チャンクの末尾 `K-1` サンプル(`PolyphaseEngine::history`)
+//! を次チャンクの先頭に連結してから畳み込むことで、チャンク境界をまたぐ連続性を保証する
+//! (rubato `Fft` の内部オーバーラップ状態に相当)。呼び出し側がブロックのたびに新しい
+//! リサンプラを作ってしまうとこの保証が崩れるため、**絶対にやってはいけない**。
 //!
-//! シーク(`StreamResampler::reset`)は逆に**意図的な不連続**なので、
-//! オーバーラップ状態を素の 0 へ戻す(rubato 自身が提供する `Resampler::reset()`)。
-//! シーク前後の音を混ぜてしまうバグを避けるための必須ステップ。
-//!
-//! # 遅延(レイテンシ)の扱い(設計判断2・3にまたがる)
-//!
-//! FFT ベース・sinc ベースいずれのリサンプラも、フィルタのウォームアップ分だけ
-//! 出力側に遅延(`Resampler::output_delay()`)を持つ(rubato 公式の
-//! `examples/process_f64.rs` も出力を書き出す際にこの分だけ先頭を捨てている)。
-//! ここでは呼び出し側(`decode.rs`)にこの遅延を一切見せない方針にした: 生成直後・
-//! `reset()` 直後の出力から `output_delay()` フレームぶんを内部で読み捨ててから
-//! 呼び出し側へ渡す。こうすることで「素材の時刻 0 が出力の時刻 0 に対応する」という
-//! 単純な前提を上位層(`decode.rs`・`stream.rs`・`music.rs`)がそのまま使い続けられる。
+//! シーク(`StreamResampler::reset`)は逆に**意図的な不連続**なので、履歴・位相状態を
+//! 素の0へ戻す。シーク前後の音を混ぜてしまうバグを避けるための必須ステップ。
 //!
 //! # 総フレーム数・シーク位置は出力レート基準(設計判断3)
 //!
@@ -57,43 +78,79 @@
 
 use std::fmt;
 
-use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
-use rubato::{
-    Async, Fft, FixedAsync, FixedSync, Indexing, Resampler, SincInterpolationParameters,
-    SincInterpolationType, WindowFunction, calculate_cutoff,
-};
-
 use crate::format::CHANNELS;
 
 /// 楽曲ストリーミング用リサンプラの目標入力チャンク長(フレーム数)。
 ///
-/// 実際の内部 FFT サイズは `gcd(source_rate, output_rate)` の倍数に丸められるため
+/// 実際のチャンク長は `M`(レート比を約分した分母)の倍数に丸められるため
 /// この値そのものにはならないが、一般的なサンプルレートの組み合わせでは
-/// 数十ミリ秒程度のブロックに収まる(モジュール doc 参照)。rubato 自身の例
-/// (`examples/process_f64.rs`)が使っているデフォルト値と揃えてある。
-const STREAM_CHUNK_TARGET_FRAMES: usize = 1024;
+/// 数十ミリ秒程度のブロックに収まる。
+const STREAM_CHUNK_TARGET_FRAMES: u64 = 1024;
 
-/// SE 一括リサンプル用 `Async` sinc の入力チャンク長(フレーム数)。
-/// ロード時の一度きりの処理なので大きめに取って呼び出し回数を減らす。
+/// ストリーミング用ポリフェーズフィルタの1位相あたりのタップ数(`K`)。
+///
+/// デコードスレッドで `pump()` のたびに評価される(§4.7)ため、CPU コストと遅延
+/// (`(K-1)/2` 入力サンプル)を抑える設定にする。64 タップは一般的な「中品質」sinc
+/// リサンプラ(例: libsamplerate の Medium Quality 相当)と同程度で、[`STREAM_ATTENUATION_DB`]
+/// との組み合わせでゲーム音声として十分な折り返し抑圧が得られる(ADR-0004 参照)。
+///
+/// 🔴 **Miri では 8 に落とす**(`decode.rs`/`wav.rs` 経由でリサンプルを通す既存テストの
+/// ために)。係数表のサイズ・畳み込みの繰り返し回数は `K*L`(`L` はレート対から決まる
+/// 補間係数)に比例し、64 タップだと `decode.rs` の単体テスト1本を Miri で解釈するだけで
+/// 数分かかる(ADR-0003 が許容する「Miri では回数を減らす」対応。テストの合否判定に
+/// 使う数値の精度〔`resample.rs::tests` の許容誤差〕はこの定数を直接使わないテスト
+/// (`ring_buffer`/`wav`/`decode`/`stream` を対象にする `make miri` の CI 範囲)には
+/// 影響しない——精度そのものを検査する `resample.rs::tests` は名前がこのフィルタに
+/// 一致しないため Miri の対象外のまま)。
+#[cfg(not(miri))]
+const STREAM_TAPS_PER_PHASE: usize = 64;
+#[cfg(miri)]
+const STREAM_TAPS_PER_PHASE: usize = 8;
+/// ストリーミング用フィルタの目標ストップバンド減衰量(dB)。Kaiser のベータを一意に決める。
+const STREAM_ATTENUATION_DB: f64 = 80.0;
+
+/// SE 一括リサンプル用チャンク長(フレーム数)。ロード時の一度きりの処理なので大きめに
+/// 取って呼び出し回数を減らす。
 const ONESHOT_CHUNK_FRAMES: usize = 4096;
-/// SE 一括リサンプルのシンク長。大きいほど高品質・低速(ロード時のみのコストなので許容)。
-const ONESHOT_SINC_LEN: usize = 256;
-/// SE 一括リサンプルのオーバーサンプリング係数(中間点の細かさ)。
-const ONESHOT_OVERSAMPLING_FACTOR: usize = 256;
-/// SE 一括リサンプルの窓関数。ロールオフより減衰(エイリアシング抑制)を優先する。
-const ONESHOT_WINDOW: WindowFunction = WindowFunction::BlackmanHarris2;
-/// SE 一括リサンプルの補間方式。線形/最近傍より高品質な三次補間を選ぶ。
-const ONESHOT_INTERPOLATION: SincInterpolationType = SincInterpolationType::Cubic;
+/// SE 一括リサンプル用ポリフェーズフィルタの1位相あたりのタップ数(`K`)。
+///
+/// ロード時の一度きりのコストなので、計算量よりストップバンド減衰(エイリアシング抑制)を
+/// 優先し、ストリーミングより大きい値にする(旧 rubato 実装の `sinc_len = 256` を踏襲)。
+///
+/// 🔴 Miri では [`STREAM_TAPS_PER_PHASE`] と同じ理由で 8 に落とす。
+#[cfg(not(miri))]
+const ONESHOT_TAPS_PER_PHASE: usize = 256;
+#[cfg(miri)]
+const ONESHOT_TAPS_PER_PHASE: usize = 8;
+/// SE 一括リサンプル用フィルタの目標ストップバンド減衰量(dB)。
+const ONESHOT_ATTENUATION_DB: f64 = 100.0;
+
+/// カットオフ周波数の下限(小さい方のレートのナイキスト周波数に対する割合)。
+///
+/// `PolyphaseCoeffs::design` が Kaiser の遷移帯域幅からガードバンドを逆算する際の安全弁。
+/// 実際の対応レート(8kHz〜384kHz程度の一般的な組み合わせ)ではガードバンドが
+/// ナイキストの数%程度に収まり、この下限に触れることは無い(触れるのはタップ数に対して
+/// `L` が極端に大きい病的な組み合わせのときだけで、[`MAX_POLYPHASE_FACTOR`] が先に弾く)。
+const MIN_CUTOFF_FRACTION_OF_NYQUIST: f64 = 0.05;
 
 /// 許容するサンプルレート比(大きい方 / 小さい方)の上限。
 ///
-/// `StreamResampler`(`rubato::Fft`、`FixedSync::Both`)は出力側の FFT サイズがおおよそ
-/// `STREAM_CHUNK_TARGET_FRAMES * 比`、`resample_oneshot`(`rubato::Async` sinc、
-/// `FixedAsync::Input`)は出力バッファがおおよそ `ONESHOT_CHUNK_FRAMES * 比` になる。
-/// 比が極端(例: 1Hz と 384,000Hz)だとどちらも確保が破綻するため、`validate_rates` で
-/// リサンプラを構築する前に弾く。現実的な音声のサンプルレート(8kHz〜384kHz程度)の
-/// 組み合わせはこの比に十分収まる。
+/// 比が極端(例: 1Hz と 384,000Hz)だとリサンプラ内部のバッファ確保が比に比例して
+/// 膨れ上がり、OOM やタイムアウトを起こしうるため、`validate_rates` でリサンプラを
+/// 構築する前に弾く。現実的な音声のサンプルレート(8kHz〜384kHz程度)の組み合わせは
+/// この比に十分収まる。
 const MAX_RATE_RATIO: u32 = 256;
+
+/// `gcd(source_rate, output_rate)` で約分した `L`/`M` の大きい方の上限。
+///
+/// ポリフェーズ係数表のサイズは `K * L` に比例する(`K` はタップ数/位相)。比(大きい方/
+/// 小さい方)が小さくても、2つのレートが互いに素に近い(`gcd` が小さい)と `L`/`M` は
+/// 独立に大きくなりうる(例: 44100Hz と 44099Hz は比≈1.0 だが `gcd=1` で `L`/`M` が
+/// 万単位になる)。実在するレート同士(8kHz〜384kHz の一般的な組み合わせ)では `L`/`M` は
+/// 数千に収まる(実測: 11025Hz↔64000Hz で 2560 が最大)ため、8倍の余裕を見た値にしてある。
+/// これを超える組み合わせは壊れたメタデータ等の異常値とみなし拒否する
+/// (`ResampleError::InvalidRates`)。
+const MAX_POLYPHASE_FACTOR: u32 = 8_192;
 
 /// レートの組み合わせが安全かを検査する。`StreamResampler::new` と `resample_oneshot` の
 /// 両方が、リサンプラを構築する・比を計算する前に必ずこれを通す。
@@ -101,6 +158,8 @@ const MAX_RATE_RATIO: u32 = 256;
 /// - どちらかが 0 だと比が定義できない(0 除算、または無限大の比になる)。
 /// - 比が `MAX_RATE_RATIO` を超えると、リサンプラ内部のバッファ確保が比に比例して
 ///   膨れ上がり、OOM やタイムアウトを起こしうる(`MAX_RATE_RATIO` のドキュメント参照)。
+/// - 約分後の `L`/`M` が `MAX_POLYPHASE_FACTOR` を超えると、ポリフェーズ係数表が
+///   肥大化する(`MAX_POLYPHASE_FACTOR` のドキュメント参照)。
 fn validate_rates(source_rate: u32, output_rate: u32) -> Result<(), ResampleError> {
     let invalid = || ResampleError::InvalidRates {
         source_rate,
@@ -117,22 +176,37 @@ fn validate_rates(source_rate: u32, output_rate: u32) -> Result<(), ResampleErro
     if hi / lo > MAX_RATE_RATIO {
         return Err(invalid());
     }
+    let g = gcd_u32(source_rate, output_rate);
+    let l = output_rate / g;
+    let m = source_rate / g;
+    if l.max(m) > MAX_POLYPHASE_FACTOR {
+        return Err(invalid());
+    }
     Ok(())
 }
 
+/// ユークリッドの互除法(`source_rate`/`output_rate` は [`validate_rates`] が
+/// 事前に 0 でないことを保証済み)。
+fn gcd_u32(a: u32, b: u32) -> u32 {
+    let (mut a, mut b) = (a, b);
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
 /// リサンプル処理で発生しうるエラー。
-///
-/// rubato のエラー型(`ResamplerConstructionError`/`ResampleError`)は `Clone`/`PartialEq`
-/// を実装しないため、`decode.rs::DecodeError`/`wav.rs::WavError` と同じ流儀で文字列化して
-/// 保持する。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResampleError {
     /// リサンプラの構築に失敗した(サンプルレートが 0 等。通常の入力では起こらない)。
     Construction(String),
     /// 変換処理そのものが失敗した(バッファサイズ不一致等。通常の入力では起こらない)。
     Processing(String),
-    /// レートの組み合わせが不正(どちらかが 0、または比〔大きい方 / 小さい方〕が
-    /// `MAX_RATE_RATIO` を超える)。`validate_rates` がリサンプラの構築より前に弾く。
+    /// レートの組み合わせが不正(どちらかが 0、比〔大きい方 / 小さい方〕が
+    /// `MAX_RATE_RATIO` を超える、または約分後の `L`/`M` が `MAX_POLYPHASE_FACTOR` を
+    /// 超える)。`validate_rates` がリサンプラの構築より前に弾く。
     InvalidRates { source_rate: u32, output_rate: u32 },
 }
 
@@ -147,7 +221,8 @@ impl fmt::Display for ResampleError {
             } => write!(
                 f,
                 "invalid resample rates (source: {source_rate} Hz, output: {output_rate} Hz): \
-                 both must be > 0 and their ratio must not exceed {MAX_RATE_RATIO}x"
+                 both must be > 0, their ratio must not exceed {MAX_RATE_RATIO}x, and their \
+                 reduced ratio must not exceed {MAX_POLYPHASE_FACTOR}x"
             ),
         }
     }
@@ -205,8 +280,8 @@ mod display_tests {
                 ResampleError::Construction(detail) | ResampleError::Processing(detail) => {
                     assert!(
                         message.contains(detail.as_str()),
-                        "{error:?} must print the underlying detail ({detail}) so the device \
-                         log says what was actually wrong: {message}"
+                        "{error:?} must print the underlying detail ({detail}) so the device log \
+                         says what was actually wrong: {message}"
                     );
                 }
                 ResampleError::InvalidRates {
@@ -240,19 +315,18 @@ pub fn convert_frame_count(frames: u64, from_rate: u32, to_rate: u32) -> u64 {
     ((numerator + denominator / 2) / denominator) as u64
 }
 
-/// rubato へ渡す入力サンプルの絶対値上限。
+/// リサンプラへ渡す入力サンプルの絶対値上限。
 ///
-/// rubato の `Fft`(realfft 経由)は NaN / inf や極端に大きい値を含む入力に対して、
-/// 内部の `unwrap()` で abort することがある(戻り値の `Result` では受け止められない)。
-/// 音声として意味のある値はこの範囲に収まるため、rubato へ渡す前にここで正規化する。
+/// 非有限(NaN / ±inf)や極端に大きい値をそのまま畳み込むと、フィルタの出力も
+/// 非有限・極端になり呼び出し側(音声パス)へ伝播する。音声として意味のある値は
+/// この範囲に収まるため、畳み込みの前にここで正規化する(fuzz が発見した回帰。
+/// `51b5853` で rubato 向けに導入した入口ガードを自前実装でも同じ契約のまま維持する)。
 const MAX_ABS_INPUT_SAMPLE: f32 = 1.0e4;
 
-/// rubato へ渡す前にサンプル1個を正規化する(`deinterleave` からのみ呼ぶ)。
+/// 畳み込みへ渡す前にサンプル1個を正規化する。
 ///
 /// 非有限(NaN / ±inf)は無音(0.0)へ、有限でも [`MAX_ABS_INPUT_SAMPLE`] を超える値は
-/// その範囲へ clamp する。rubato の `Fft` が内部の `unwrap()` で abort するのを防ぐための
-/// 唯一の正規化ポイント(`process_full_chunk_into`/`flush_into`/`resample_oneshot` の
-/// いずれも入力はここを通ってから rubato へ渡る)。
+/// その範囲へ clamp する。`PolyphaseEngine::process_chunk` の唯一の入力正規化ポイント。
 fn sanitize_sample(value: f32) -> f32 {
     if value.is_finite() {
         value.clamp(-MAX_ABS_INPUT_SAMPLE, MAX_ABS_INPUT_SAMPLE)
@@ -261,85 +335,301 @@ fn sanitize_sample(value: f32) -> f32 {
     }
 }
 
-/// インターリーブ PCM を平面(チャンネルごとの `Vec`)へ書き出す。
-/// `planar` の各要素は少なくとも `frames` フレームぶんの長さを持っていること。
+/// 変形ベッセル関数 `I0(x)` の級数展開(Kaiser 窓の計算に使う)。
 ///
-/// rubato へ渡す入力はすべてこの関数を経由するため、[`sanitize_sample`] による正規化を
-/// ここで一括して行う(呼び出し側ごとに個別の正規化パスを増やさない)。
-fn deinterleave(input: &[f32], frames: usize, planar: &mut [Vec<f32>]) {
-    debug_assert_eq!(planar.len(), CHANNELS);
-    for i in 0..frames {
-        for (ch, plane) in planar.iter_mut().enumerate() {
-            plane[i] = sanitize_sample(input[i * CHANNELS + ch]);
+/// `beta`(本モジュールが使う範囲では最大でも 15 程度、ADR-0004 参照)に対し、
+/// 64 項もあれば f64 の精度で収束する(項の相対値が `1e-16` を下回った時点で打ち切る)。
+fn bessel_i0(x: f64) -> f64 {
+    let mut sum = 1.0;
+    let mut term = 1.0;
+    let half_x = x / 2.0;
+    for k in 1..=64u32 {
+        term *= (half_x / k as f64).powi(2);
+        sum += term;
+        if term < sum * 1e-16 {
+            break;
+        }
+    }
+    sum
+}
+
+/// 目標ストップバンド減衰量(dB)から Kaiser 窓のベータを求める近似式
+/// (Kaiser 自身の式。Oppenheim & Schafer 等の標準的な教科書に載る経験式)。
+fn kaiser_beta(attenuation_db: f64) -> f64 {
+    if attenuation_db > 50.0 {
+        0.1102 * (attenuation_db - 8.7)
+    } else if attenuation_db >= 21.0 {
+        0.5842 * (attenuation_db - 21.0).powf(0.4) + 0.07886 * (attenuation_db - 21.0)
+    } else {
+        0.0
+    }
+}
+
+/// Kaiser 窓の `k` 番目(`0..n`)の値。
+///
+/// `bessel_i0_beta` は分母 `bessel_i0(beta)`(`k` に依存せずループ全体で一定)を
+/// 呼び出し側が1回だけ計算して渡す。タップ数ぶん(数千〜数万回)呼ばれるため、
+/// ループの内側で毎回計算し直すと無駄な `bessel_i0` 呼び出しが倍になる。
+fn kaiser_window(k: usize, n: usize, beta: f64, bessel_i0_beta: f64) -> f64 {
+    if n <= 1 {
+        return 1.0;
+    }
+    let center = (n - 1) as f64 / 2.0;
+    let ratio = (k as f64 - center) / center;
+    let arg = (1.0 - ratio * ratio).max(0.0).sqrt();
+    bessel_i0(beta * arg) / bessel_i0_beta
+}
+
+/// 固定有理数比 `L:M` のポリフェーズ窓付き sinc フィルタ係数。
+///
+/// レート対ごとに構築時へ1回だけ設計する(`PolyphaseCoeffs::design`)。以降の畳み込みは
+/// この係数表を読むだけで、比の再計算やフィルタの再設計は一切発生しない。
+struct PolyphaseCoeffs {
+    /// 補間係数(`output_rate / gcd(source_rate, output_rate)`)。
+    l: u32,
+    /// 間引き係数(`source_rate / gcd(source_rate, output_rate)`)。
+    m: u32,
+    /// 1位相あたりのタップ数(`K`)。
+    taps_per_phase: usize,
+    /// `[phase * taps_per_phase + tap]` へフラット化した係数表。長さ `l * taps_per_phase`。
+    taps: Vec<f32>,
+    /// 出力レート基準の群遅延(丸め済み)。モジュール doc「遅延の扱い」参照。
+    delay_output_frames: u64,
+}
+
+impl PolyphaseCoeffs {
+    /// `source_rate`/`output_rate` は [`validate_rates`] を通過済みであること
+    /// (0 除算・`L`/`M` の暴走を防ぐ前提)。
+    fn design(
+        source_rate: u32,
+        output_rate: u32,
+        taps_per_phase: usize,
+        attenuation_db: f64,
+    ) -> Self {
+        let g = gcd_u32(source_rate, output_rate);
+        let l = output_rate / g;
+        let m = source_rate / g;
+        let n_total = taps_per_phase * l as usize;
+
+        let beta = kaiser_beta(attenuation_db);
+        // 中間レート(補間後・間引き前。S*L == O*M)に対する正規化周波数(サイクル/サンプル)
+        // で遷移帯域幅を Kaiser の近似式から見積もり、カットオフをナイキスト目標の手前へ
+        // 置く(モジュール doc「窓関数とタップ数」参照)。
+        let f_int = source_rate as f64 * l as f64;
+        let delta_f_norm =
+            (attenuation_db - 8.0) / (2.285 * 2.0 * std::f64::consts::PI * n_total as f64);
+        let delta_f_hz = delta_f_norm * f_int;
+        let nyquist_target_hz = source_rate.min(output_rate) as f64 / 2.0;
+        let min_cutoff_hz = nyquist_target_hz * MIN_CUTOFF_FRACTION_OF_NYQUIST;
+        let cutoff_hz = (nyquist_target_hz - delta_f_hz / 2.0).max(min_cutoff_hz);
+        let fc_norm = cutoff_hz / f_int;
+
+        let center = (n_total - 1) as f64 / 2.0;
+        let bessel_i0_beta = bessel_i0(beta);
+        let mut raw = vec![0.0f64; n_total];
+        let mut sum = 0.0f64;
+        for (k, slot) in raw.iter_mut().enumerate() {
+            let x = k as f64 - center;
+            let ideal = if x.abs() < 1e-9 {
+                2.0 * fc_norm
+            } else {
+                (2.0 * std::f64::consts::PI * fc_norm * x).sin() / (std::f64::consts::PI * x)
+            };
+            let h = ideal * kaiser_window(k, n_total, beta, bessel_i0_beta);
+            *slot = h;
+            sum += h;
+        }
+        // DC ゲインを `L` に正規化する(補間のゼロ詰めで生じる 1/L の振幅損失を打ち消す。
+        // `M=1`〔純粋な補間〕なら `L` そのもの、`L=1`〔純粋な間引き〕なら 1 になり、
+        // どちらの極端でも標準的な多重レートフィルタの正規化と一致する)。
+        let scale = l as f64 / sum;
+
+        let mut taps = vec![0.0f32; l as usize * taps_per_phase];
+        for (k, &h) in raw.iter().enumerate() {
+            let phase = k % l as usize;
+            let tap = k / l as usize;
+            taps[phase * taps_per_phase + tap] = (h * scale) as f32;
+        }
+
+        // 群遅延 = (K-1)/2 入力サンプル。出力レート基準に換算し四捨五入する
+        // (`convert_frame_count` と同じ「分母の半分を足してから整数除算する」丸め方)。
+        let numerator = (taps_per_phase as u64 - 1) * l as u64;
+        let delay_output_frames = (numerator + m as u64) / (2 * m as u64);
+
+        Self {
+            l,
+            m,
+            taps_per_phase,
+            taps,
+            delay_output_frames,
         }
     }
 }
 
-/// 平面バッファの `[skip, n_out)` 区間をインターリーブしながら `out` へ積む
-/// (`skip` はリサンプラの起動直後の遅延を読み捨てるための量。モジュール doc 参照)。
-fn append_resampled_output(
-    planar: &[Vec<f32>],
-    n_out: usize,
-    delay_to_skip: &mut usize,
-    out: &mut Vec<f32>,
-) {
-    let skip = (*delay_to_skip).min(n_out);
-    *delay_to_skip -= skip;
-    out.reserve((n_out - skip) * CHANNELS);
-    for i in skip..n_out {
-        for plane in planar {
-            out.push(plane[i]);
+/// [`PolyphaseCoeffs`] を消費する畳み込みエンジン。
+///
+/// [`StreamResampler`]・[`resample_oneshot`] のどちらも、この構造体の
+/// `process_chunk` だけを呼ぶ(一括変換とストリーミングを1実装で賄う、という要件の核)。
+/// 相違点は「同じインスタンスを使い回すか(ストリーミング)」「毎回作り直すか(一括、実質は
+/// 同じインスタンスをループで使い回す)」の呼び出し方だけで、畳み込みロジックは共有する。
+///
+/// 🔴 **構築後の呼び出し(`process_chunk`/`reset`)はヒープ確保・ロックを一切行わない**
+/// (`history`/`scratch` は構築時に固定長で確保し、以後は書き換えるだけ)。
+/// `mw-core/CLAUDE.md`「依存」に記載のとおり、このモジュールの呼び出し元
+/// (ゲームスレッドのロード時・デコードスレッドの `pump()` 内)は音声コールバック経路
+/// そのものではないため §5.3 のアロケーション禁止規約が直接は及ばないが、
+/// デコードスレッドは楽曲バッファの供給を途切れさせない実時間性が要る経路であり、
+/// 呼び出しのたびに確保が発生するとジッタの原因になる。既存(rubato)実装も
+/// 固定長バッファを使い回す設計だったため、同じ特性を維持する。
+struct PolyphaseEngine {
+    /// 直前チャンクの末尾 `taps_per_phase - 1` サンプル(チャンネルごと)。
+    history: Vec<Vec<f32>>,
+    /// `history ++ 今回の入力(不足分は0埋め)` を保持する作業領域。長さは常に
+    /// `(taps_per_phase - 1) + chunk_len` で固定。
+    scratch: Vec<Vec<f32>>,
+    /// 次に生成する出力サンプルの通し番号(`reset()` で 0 に戻す)。
+    next_out_n: u64,
+    /// これまでに(このチャンクを含めず)投入した入力サンプル数の通し番号。
+    total_input_fed: u64,
+    /// 起動直後・`reset()` 直後にまだ読み捨てていない遅延フレーム数。
+    delay_to_skip: u64,
+    /// 1回の `process_chunk` が扱う新規入力フレーム数(構築後は不変)。
+    chunk_len: usize,
+}
+
+impl PolyphaseEngine {
+    fn new(coeffs: &PolyphaseCoeffs, chunk_len: usize) -> Self {
+        let k1 = coeffs.taps_per_phase - 1;
+        Self {
+            history: vec![vec![0.0f32; k1]; CHANNELS],
+            scratch: vec![vec![0.0f32; k1 + chunk_len]; CHANNELS],
+            next_out_n: 0,
+            total_input_fed: 0,
+            delay_to_skip: coeffs.delay_output_frames,
+            chunk_len,
         }
+    }
+
+    /// シーク直後に呼ぶ。履歴・位相状態を素の0へ戻す(モジュール doc
+    /// 「ブロック境界の連続性」: シークは意図的な不連続であり、直前までの履歴を
+    /// 引き継ぐとシーク前後の音が混ざってしまうため、必ずリセットする)。
+    fn reset(&mut self, coeffs: &PolyphaseCoeffs) {
+        for channel in &mut self.history {
+            channel.iter_mut().for_each(|v| *v = 0.0);
+        }
+        self.next_out_n = 0;
+        self.total_input_fed = 0;
+        self.delay_to_skip = coeffs.delay_output_frames;
+    }
+
+    /// `input` の先頭 `frames` フレームぶん(`frames <= self.chunk_len`)を実データとして
+    /// 畳み込み、残り(`self.chunk_len - frames`)は無音として扱う。`frames == self.chunk_len`
+    /// が通常の呼び出し、`frames < self.chunk_len` がストリーム終端のフラッシュ
+    /// (`StreamResampler::flush_into`)・一括変換の末尾ブロックに相当する。
+    ///
+    /// 出力(出力レート基準のインターリーブ PCM)は `out` の末尾へ積む。
+    fn process_chunk(
+        &mut self,
+        coeffs: &PolyphaseCoeffs,
+        input: &[f32],
+        frames: usize,
+        out: &mut Vec<f32>,
+    ) {
+        let k = coeffs.taps_per_phase;
+        let k1 = k - 1;
+        let chunk_start = self.total_input_fed;
+        let chunk_len = self.chunk_len;
+
+        for ch in 0..CHANNELS {
+            let (hist_part, new_part) = self.scratch[ch].split_at_mut(k1);
+            hist_part.copy_from_slice(&self.history[ch]);
+            for (i, slot) in new_part.iter_mut().enumerate() {
+                *slot = if i < frames {
+                    sanitize_sample(input[i * CHANNELS + ch])
+                } else {
+                    0.0
+                };
+            }
+        }
+
+        // 今回のチャンクで生成しうる出力フレーム数のおおまかな上限を見積もり、
+        // `out` の再確保回数を減らす(正確な値である必要は無い。ヒントに過ぎない)。
+        out.reserve((chunk_len as u64 * coeffs.l as u64 / coeffs.m as u64 + 2) as usize * CHANNELS);
+
+        loop {
+            let base = (self.next_out_n * coeffs.m as u64) / coeffs.l as u64;
+            if base > chunk_start + chunk_len as u64 - 1 {
+                break;
+            }
+            // `base >= chunk_start` は不変条件(前回の呼び出しが「これ以上は今回のチャンクでは
+            // 計算できない」という同じ条件で止まっているため)。この不変条件があるおかげで
+            // `local_base - j`(`j` は 0..k)が常に `scratch` の範囲内に収まる。
+            let phase = ((self.next_out_n * coeffs.m as u64) % coeffs.l as u64) as usize;
+            let local_base = (base - chunk_start) as usize + k1;
+            let tap_base = phase * k;
+
+            if self.delay_to_skip > 0 {
+                self.delay_to_skip -= 1;
+            } else {
+                for ch in 0..CHANNELS {
+                    let s = &self.scratch[ch];
+                    let mut acc = 0.0f32;
+                    for j in 0..k {
+                        acc += coeffs.taps[tap_base + j] * s[local_base - j];
+                    }
+                    out.push(acc);
+                }
+            }
+            self.next_out_n += 1;
+        }
+
+        for ch in 0..CHANNELS {
+            let len = self.scratch[ch].len();
+            self.history[ch].copy_from_slice(&self.scratch[ch][len - k1..]);
+        }
+        self.total_input_fed += chunk_len as u64;
     }
 }
 
-/// 楽曲ストリーミング用のリサンプラ(`Fft` + `FixedSync::Both` ベース)。
+/// 楽曲ストリーミング用のリサンプラ(固定比ポリフェーズ sinc ベース)。
 ///
 /// `decode.rs::WavDecoder` が1曲につき1個だけ保持し、`pump()` の呼び出しを
 /// またいで使い回す(モジュール doc「ブロック境界の連続性」)。
 pub struct StreamResampler {
-    inner: Fft<f32>,
-    /// 素材レートの入力を書き込む平面バッファ(固定長 = `inner.input_frames_next()`)。
-    chan_in: Vec<Vec<f32>>,
-    /// 出力レートの結果を受け取る平面バッファ(固定長 = `inner.output_frames_max()`)。
-    chan_out: Vec<Vec<f32>>,
-    /// 起動直後・`reset()` 直後にまだ読み捨てていない遅延フレーム数。
-    delay_to_skip: usize,
+    coeffs: PolyphaseCoeffs,
+    engine: PolyphaseEngine,
 }
 
 impl StreamResampler {
     /// `source_rate != output_rate` のときだけ呼ぶこと(一致する場合は
     /// `decode.rs` 側でバイパスし、このリサンプラ自体を作らない)。
     ///
-    /// レートが 0、または比(大きい方 / 小さい方)が `MAX_RATE_RATIO` を超える場合は
-    /// `ResampleError::InvalidRates` を返す([`validate_rates`] 参照)。
+    /// レートが 0、比(大きい方 / 小さい方)が `MAX_RATE_RATIO` を超える、または約分後の
+    /// `L`/`M` が `MAX_POLYPHASE_FACTOR` を超える場合は `ResampleError::InvalidRates` を
+    /// 返す([`validate_rates`] 参照)。
     pub fn new(source_rate: u32, output_rate: u32) -> Result<Self, ResampleError> {
         validate_rates(source_rate, output_rate)?;
-        let inner = Fft::<f32>::new(
-            source_rate as usize,
-            output_rate as usize,
-            STREAM_CHUNK_TARGET_FRAMES,
-            CHANNELS,
-            FixedSync::Both,
-        )
-        .map_err(|e| ResampleError::Construction(e.to_string()))?;
-
-        let chan_in = vec![vec![0.0; inner.input_frames_next()]; CHANNELS];
-        let chan_out = vec![vec![0.0; inner.output_frames_max()]; CHANNELS];
-        let delay_to_skip = inner.output_delay();
-
-        Ok(Self {
-            inner,
-            chan_in,
-            chan_out,
-            delay_to_skip,
-        })
+        let coeffs = PolyphaseCoeffs::design(
+            source_rate,
+            output_rate,
+            STREAM_TAPS_PER_PHASE,
+            STREAM_ATTENUATION_DB,
+        );
+        // 入力チャンク長は `M`(約分した分母)の倍数にする —— こうすると比の性質上、
+        // 定常状態では毎回ちょうど `chunk_len * L / M` フレームの出力が得られる
+        // (`M` 個の新規入力を消費すると必ず `L` 個の出力が生成される、という
+        // 有理数比ならではの厳密な関係。モジュール doc 参照)。倍率は
+        // `STREAM_CHUNK_TARGET_FRAMES` に最も近くなるよう選ぶ(最低1倍)。
+        let multiplier = (STREAM_CHUNK_TARGET_FRAMES / coeffs.m as u64).max(1);
+        let chunk_len = (multiplier * coeffs.m as u64) as usize;
+        let engine = PolyphaseEngine::new(&coeffs, chunk_len);
+        Ok(Self { coeffs, engine })
     }
 
     /// 次の [`Self::process_full_chunk_into`] が要求する、素材レートの入力フレーム数。
-    /// `Fft` を `FixedSync::Both` で構築しているため、ストリーム全体を通じて一定の値を返す。
+    /// 構築時に決まる固定値で、ストリーム全体を通じて一定([`StreamResampler::new`] 参照)。
     pub fn input_frames_needed(&self) -> usize {
-        self.inner.input_frames_next()
+        self.engine.chunk_len
     }
 
     /// `input_frames_needed()` フレームぶんの素材レート PCM(インターリーブ)を変換し、
@@ -349,65 +639,33 @@ impl StreamResampler {
         input: &[f32],
         out: &mut Vec<f32>,
     ) -> Result<(), ResampleError> {
-        let need = self.input_frames_needed();
+        let need = self.engine.chunk_len;
         debug_assert_eq!(input.len(), need * CHANNELS);
-        deinterleave(input, need, &mut self.chan_in);
-
-        let input = SequentialSliceOfVecs::new(&self.chan_in, CHANNELS, need)
-            .map_err(|e| ResampleError::Processing(e.to_string()))?;
-        let output_frames = self.inner.output_frames_max();
-        let mut output =
-            SequentialSliceOfVecs::new_mut(&mut self.chan_out, CHANNELS, output_frames)
-                .map_err(|e| ResampleError::Processing(e.to_string()))?;
-        let (_, n_out) = self
-            .inner
-            .process_into_buffer(&input, &mut output, None)
-            .map_err(|e| ResampleError::Processing(e.to_string()))?;
-        append_resampled_output(&self.chan_out, n_out, &mut self.delay_to_skip, out);
+        self.engine.process_chunk(&self.coeffs, input, need, out);
         Ok(())
     }
 
     /// 素材側が末尾に到達した(`remaining_input` フレームぶんしか残っていない。
     /// 0 フレームでもよい)ときに一度だけ呼ぶ。残りを無音でパディングして最後の
-    /// ブロックを変換し、リサンプラの内部に残っていたオーバーラップの尾も
-    /// 一緒に吐き出す(rubato 5 の `Indexing::partial_len` の契約。モジュール doc 参照)。
+    /// ブロックを変換し、フィルタの内部履歴に残っていた尾も一緒に吐き出す。
     pub fn flush_into(
         &mut self,
         remaining_input: &[f32],
         out: &mut Vec<f32>,
     ) -> Result<(), ResampleError> {
         let valid_frames = remaining_input.len() / CHANNELS;
-        if valid_frames != 0 {
-            deinterleave(remaining_input, valid_frames, &mut self.chan_in);
-        }
-        // `partial_len = Some(0)` は rubato 5 の契約で「入力を全て無音として
-        // パディングする」を表す。旧 API の `None` 入力相当であり、空のスライスを
-        // 毎回組み立てる必要がない。
-        let input = SequentialSliceOfVecs::new(&self.chan_in, CHANNELS, self.input_frames_needed())
-            .map_err(|e| ResampleError::Processing(e.to_string()))?;
-        let output_frames = self.inner.output_frames_max();
-        let mut output =
-            SequentialSliceOfVecs::new_mut(&mut self.chan_out, CHANNELS, output_frames)
-                .map_err(|e| ResampleError::Processing(e.to_string()))?;
-        let indexing = Indexing::new().partial_len(valid_frames);
-        let (_, n_out) = self
-            .inner
-            .process_into_buffer(&input, &mut output, Some(&indexing))
-            .map_err(|e| ResampleError::Processing(e.to_string()))?;
-        append_resampled_output(&self.chan_out, n_out, &mut self.delay_to_skip, out);
+        self.engine
+            .process_chunk(&self.coeffs, remaining_input, valid_frames, out);
         Ok(())
     }
 
-    /// シーク直後に呼ぶ。オーバーラップ状態を 0 へ戻し、遅延読み捨てをやり直す
-    /// (モジュール doc「ブロック境界の連続性」: シークは意図的な不連続であり、
-    /// 直前までの重なりを引き継ぐと無関係な音が混ざってしまう)。
+    /// シーク直後に呼ぶ(モジュール doc「ブロック境界の連続性」参照)。
     pub fn reset(&mut self) {
-        self.inner.reset();
-        self.delay_to_skip = self.inner.output_delay();
+        self.engine.reset(&self.coeffs);
     }
 }
 
-/// SE ロード時の一括リサンプル(`Async` sinc ベース)。
+/// SE ロード時の一括リサンプル(固定比ポリフェーズ sinc ベース)。
 ///
 /// `source_rate != output_rate` のときだけ呼ぶこと(一致する場合は `wav.rs` 側で
 /// バイパスする。設計判断4)。戻り値は `(出力レートのインターリーブ PCM, 出力フレーム数)`。
@@ -415,9 +673,10 @@ impl StreamResampler {
 /// (末尾のブロック丸めによる超過分は切り詰め、逆に不足することがあれば無音で埋める。
 /// `SoundData::frames == interleaved.len() / CHANNELS` の不変条件を壊さないため)。
 ///
-/// レートが 0、または比(大きい方 / 小さい方)が `MAX_RATE_RATIO` を超える場合は
-/// `ResampleError::InvalidRates` を返す([`validate_rates`] 参照。`source_rate == 0` を
-/// 検査せず比を計算すると無限大になり、後段のバッファ確保が破綻するため必須)。
+/// レートが 0、比(大きい方 / 小さい方)が `MAX_RATE_RATIO` を超える、または約分後の
+/// `L`/`M` が `MAX_POLYPHASE_FACTOR` を超える場合は `ResampleError::InvalidRates` を返す
+/// ([`validate_rates`] 参照。`source_rate == 0` を検査せず比を計算すると無限大になり、
+/// 後段のバッファ確保が破綻するため必須)。
 pub fn resample_oneshot(
     input: &[f32],
     frames: usize,
@@ -425,78 +684,35 @@ pub fn resample_oneshot(
     output_rate: u32,
 ) -> Result<(Vec<f32>, usize), ResampleError> {
     validate_rates(source_rate, output_rate)?;
-    let ratio = output_rate as f64 / source_rate as f64;
-    let f_cutoff = calculate_cutoff::<f32>(ONESHOT_SINC_LEN, ONESHOT_WINDOW);
-    let params = SincInterpolationParameters {
-        sinc_len: ONESHOT_SINC_LEN,
-        f_cutoff: Some(f_cutoff),
-        interpolation: ONESHOT_INTERPOLATION,
-        oversampling_factor: ONESHOT_OVERSAMPLING_FACTOR,
-        window: ONESHOT_WINDOW,
-    };
-    // max_relative_ratio: SE ロード時に比を変える機能は無い(MU5 のエディタ再生速度変更は
-    // 別機能・別スコープ)ため、構築時の比のまま固定してよい最小値の 1.0 を渡す。
-    let mut resampler = Async::<f32>::new_sinc(
-        ratio,
-        1.0,
-        &params,
-        ONESHOT_CHUNK_FRAMES,
-        CHANNELS,
-        FixedAsync::Input,
-    )
-    .map_err(|e| ResampleError::Construction(e.to_string()))?;
+    let coeffs = PolyphaseCoeffs::design(
+        source_rate,
+        output_rate,
+        ONESHOT_TAPS_PER_PHASE,
+        ONESHOT_ATTENUATION_DB,
+    );
+    let chunk_len = ONESHOT_CHUNK_FRAMES;
+    let mut engine = PolyphaseEngine::new(&coeffs, chunk_len);
 
-    let mut chan_in = vec![vec![0.0f32; ONESHOT_CHUNK_FRAMES]; CHANNELS];
-    let mut chan_out = vec![vec![0.0; resampler.output_frames_max()]; CHANNELS];
-    let mut delay_to_skip = resampler.output_delay();
     let mut out = Vec::with_capacity(
         convert_frame_count(frames as u64, source_rate, output_rate) as usize * CHANNELS,
     );
 
     let mut pos = 0usize;
-    while frames - pos >= ONESHOT_CHUNK_FRAMES {
-        let chunk_start = pos * CHANNELS;
-        let chunk_end = (pos + ONESHOT_CHUNK_FRAMES) * CHANNELS;
-        deinterleave(
-            &input[chunk_start..chunk_end],
-            ONESHOT_CHUNK_FRAMES,
-            &mut chan_in,
-        );
-        let input = SequentialSliceOfVecs::new(&chan_in, CHANNELS, ONESHOT_CHUNK_FRAMES)
-            .map_err(|e| ResampleError::Processing(e.to_string()))?;
-        let output_frames = resampler.output_frames_max();
-        let mut output = SequentialSliceOfVecs::new_mut(&mut chan_out, CHANNELS, output_frames)
-            .map_err(|e| ResampleError::Processing(e.to_string()))?;
-        let (_, n_out) = resampler
-            .process_into_buffer(&input, &mut output, None)
-            .map_err(|e| ResampleError::Processing(e.to_string()))?;
-        append_resampled_output(&chan_out, n_out, &mut delay_to_skip, &mut out);
-        pos += ONESHOT_CHUNK_FRAMES;
+    while frames - pos >= chunk_len {
+        let start = pos * CHANNELS;
+        let end = (pos + chunk_len) * CHANNELS;
+        engine.process_chunk(&coeffs, &input[start..end], chunk_len, &mut out);
+        pos += chunk_len;
     }
 
-    // 最後の端数(0 フレームのこともある)。`partial_len` が内部で無音パディングした
-    // うえで、リサンプラに残っていた尾も一緒に吐き出す。
+    // 最後の端数(0 フレームのこともある)を無音パディングしつつ処理する。
+    // フィルタに残っていた尾もこの呼び出しで一緒に吐き出される
+    // (`chunk_len` が `taps_per_phase` よりずっと大きいため、1回のパディング呼び出しで
+    // 履歴が完全に流れ切る。`StreamResampler::flush_into` と同じ考え方)。
     let remaining = frames - pos;
-    let valid_frames = if remaining == 0 {
-        0
-    } else {
-        deinterleave(
-            &input[pos * CHANNELS..frames * CHANNELS],
-            remaining,
-            &mut chan_in,
-        );
-        remaining
-    };
-    let input = SequentialSliceOfVecs::new(&chan_in, CHANNELS, ONESHOT_CHUNK_FRAMES)
-        .map_err(|e| ResampleError::Processing(e.to_string()))?;
-    let output_frames = resampler.output_frames_max();
-    let mut output = SequentialSliceOfVecs::new_mut(&mut chan_out, CHANNELS, output_frames)
-        .map_err(|e| ResampleError::Processing(e.to_string()))?;
-    let indexing = Indexing::new().partial_len(valid_frames);
-    let (_, n_out) = resampler
-        .process_into_buffer(&input, &mut output, Some(&indexing))
-        .map_err(|e| ResampleError::Processing(e.to_string()))?;
-    append_resampled_output(&chan_out, n_out, &mut delay_to_skip, &mut out);
+    let tail_start = pos * CHANNELS;
+    let tail_end = frames * CHANNELS;
+    engine.process_chunk(&coeffs, &input[tail_start..tail_end], remaining, &mut out);
 
     let target_frames = convert_frame_count(frames as u64, source_rate, output_rate) as usize;
     out.resize(target_frames * CHANNELS, 0.0);
@@ -591,13 +807,24 @@ mod tests {
     }
 
     #[test]
-    // Miri では対象外: rubato(外部クレート)の FFT リサンプラの構築を Miri で解釈すると数分かかる。
-    // 検査したいのは自前コードの unsafe(ring_buffer / wav / decode の本体)で、rubato の中身ではない。
-    // rubato を自前化(依存排除のステップ2)したら外して、Miri の対象に戻す。
-    #[cfg_attr(miri, ignore = "rubato(外部)の FFT を Miri で解釈すると数分かかる")]
     fn stream_resampler_new_accepts_rate_ratio_at_the_limit() {
-        // 25600 / 100 = 256 == MAX_RATE_RATIO。境界は許容する。
+        // 25600 / 100 = 256 == MAX_RATE_RATIO。gcd=100 なので L=256, M=1
+        // (MAX_POLYPHASE_FACTOR にも十分収まる)。境界は許容する。
         assert!(StreamResampler::new(25_600, 100).is_ok());
+    }
+
+    #[test]
+    fn stream_resampler_new_rejects_near_coprime_rates_beyond_the_polyphase_factor_limit() {
+        // 比はほぼ 1.0(MAX_RATE_RATIO には掛からない)だが、44100 と 44101 は互いに素
+        // (gcd=1)なので L=44101, M=44100 となり MAX_POLYPHASE_FACTOR(8192)を超える。
+        assert_stream_resampler_new_err(
+            44_100,
+            44_101,
+            ResampleError::InvalidRates {
+                source_rate: 44_100,
+                output_rate: 44_101,
+            },
+        );
     }
 
     #[test]
@@ -637,10 +864,6 @@ mod tests {
     }
 
     #[test]
-    // Miri では対象外: rubato(外部クレート)の FFT リサンプラを Miri で解釈すると1本で数分〜十数分かかる。
-    // 検査したいのは自前コードの unsafe(ring_buffer / wav / decode の本体)で、rubato の中身ではない。
-    // rubato を自前化(依存排除のステップ2)したら外して、Miri の対象に戻す。
-    #[cfg_attr(miri, ignore = "rubato(外部)の FFT を Miri で解釈すると数分かかる")]
     fn stream_resampler_sanitizes_non_finite_and_extreme_input_upsampling() {
         let mut resampler = StreamResampler::new(44_100, 48_000).expect("valid rates");
         let need = resampler.input_frames_needed();
@@ -663,10 +886,6 @@ mod tests {
     }
 
     #[test]
-    // Miri では対象外: rubato(外部クレート)の FFT リサンプラを Miri で解釈すると1本で数分〜十数分かかる。
-    // 検査したいのは自前コードの unsafe(ring_buffer / wav / decode の本体)で、rubato の中身ではない。
-    // rubato を自前化(依存排除のステップ2)したら外して、Miri の対象に戻す。
-    #[cfg_attr(miri, ignore = "rubato(外部)の FFT を Miri で解釈すると数分かかる")]
     fn stream_resampler_sanitizes_non_finite_and_extreme_input_downsampling() {
         let mut resampler = StreamResampler::new(48_000, 44_100).expect("valid rates");
         let need = resampler.input_frames_needed();
@@ -689,13 +908,6 @@ mod tests {
     }
 
     #[test]
-    // Miri では対象外: rubato(外部クレート)の sinc リサンプラを Miri で解釈すると数分かかる。
-    // 検査したいのは自前コードの unsafe(ring_buffer / wav / decode の本体)で、rubato の中身ではない。
-    // rubato を自前化(依存排除のステップ2)したら外して、Miri の対象に戻す。
-    #[cfg_attr(
-        miri,
-        ignore = "rubato(外部)の sinc リサンプラを Miri で解釈すると数分かかる"
-    )]
     fn resample_oneshot_sanitizes_non_finite_and_extreme_input() {
         let input = adversarial_samples();
         let frames = input.len() / CHANNELS;
@@ -707,5 +919,288 @@ mod tests {
             out.iter().all(|v| v.is_finite()),
             "output must not contain NaN/inf: {out:?}"
         );
+    }
+
+    // --- ここから先はフィルタそのものの特性(現在の仕様)の固定 --------------------
+
+    /// 正弦波を生成する(インターリーブ・両ch同一)。
+    fn sine_wave(freq_hz: f32, sample_rate: u32, frames: usize, amplitude: f32) -> Vec<f32> {
+        let mut out = Vec::with_capacity(frames * CHANNELS);
+        for i in 0..frames {
+            let t = i as f32 / sample_rate as f32;
+            let v = amplitude * (2.0 * std::f32::consts::PI * freq_hz * t).sin();
+            for _ in 0..CHANNELS {
+                out.push(v);
+            }
+        }
+        out
+    }
+
+    /// ゼロ交差から周波数を推定する(前後10%ずつ除いてフィルタの端の影響を避ける)。
+    fn estimate_frequency_hz(signal: &[f32], sample_rate: u32) -> f32 {
+        let margin = signal.len() / 10;
+        let core = &signal[margin..signal.len() - margin];
+        let mut crossings = 0usize;
+        for w in core.windows(2) {
+            if (w[0] <= 0.0 && w[1] > 0.0) || (w[0] >= 0.0 && w[1] < 0.0) {
+                crossings += 1;
+            }
+        }
+        let cycles = crossings as f32 / 2.0;
+        let duration_s = core.len() as f32 / sample_rate as f32;
+        cycles / duration_s
+    }
+
+    /// 実効値(RMS)を求める(前後10%ずつ除いて端の影響を避ける)。
+    fn rms(signal: &[f32]) -> f32 {
+        let margin = signal.len() / 10;
+        let core = &signal[margin..signal.len() - margin];
+        if core.is_empty() {
+            return 0.0;
+        }
+        (core.iter().map(|v| v * v).sum::<f32>() / core.len() as f32).sqrt()
+    }
+
+    /// `resample_oneshot` の左ch(インターリーブの偶数インデックス)だけ抜き出す。
+    fn left_channel(interleaved: &[f32]) -> Vec<f32> {
+        interleaved.iter().step_by(CHANNELS).copied().collect()
+    }
+
+    #[test]
+    fn oneshot_preserves_frequency_and_amplitude_when_upsampling() {
+        const SOURCE_RATE: u32 = 44_100;
+        const OUTPUT_RATE: u32 = 48_000;
+        const FREQ_HZ: f32 = 1_000.0;
+        const AMPLITUDE: f32 = 0.5;
+        const FRAME_COUNT: usize = 4_410; // 100ms
+
+        let input = sine_wave(FREQ_HZ, SOURCE_RATE, FRAME_COUNT, AMPLITUDE);
+        let (out, out_frames) =
+            resample_oneshot(&input, FRAME_COUNT, SOURCE_RATE, OUTPUT_RATE).expect("valid rates");
+        let left = left_channel(&out[..out_frames * CHANNELS]);
+
+        let estimated_freq = estimate_frequency_hz(&left, OUTPUT_RATE);
+        assert!(
+            (estimated_freq - FREQ_HZ).abs() / FREQ_HZ < 0.02,
+            "frequency should be preserved within 2%, got {estimated_freq} Hz"
+        );
+
+        let output_rms = rms(&left);
+        let expected_rms = AMPLITUDE / std::f32::consts::SQRT_2;
+        assert!(
+            (output_rms - expected_rms).abs() / expected_rms < 0.05,
+            "passband amplitude should be preserved within 5%, got rms={output_rms}, \
+             expected~={expected_rms}"
+        );
+    }
+
+    #[test]
+    fn oneshot_preserves_frequency_and_amplitude_when_downsampling() {
+        const SOURCE_RATE: u32 = 48_000;
+        const OUTPUT_RATE: u32 = 44_100;
+        const FREQ_HZ: f32 = 1_000.0;
+        const AMPLITUDE: f32 = 0.5;
+        const FRAME_COUNT: usize = 4_800; // 100ms
+
+        let input = sine_wave(FREQ_HZ, SOURCE_RATE, FRAME_COUNT, AMPLITUDE);
+        let (out, out_frames) =
+            resample_oneshot(&input, FRAME_COUNT, SOURCE_RATE, OUTPUT_RATE).expect("valid rates");
+        let left = left_channel(&out[..out_frames * CHANNELS]);
+
+        let estimated_freq = estimate_frequency_hz(&left, OUTPUT_RATE);
+        assert!(
+            (estimated_freq - FREQ_HZ).abs() / FREQ_HZ < 0.02,
+            "frequency should be preserved within 2%, got {estimated_freq} Hz"
+        );
+
+        let output_rms = rms(&left);
+        let expected_rms = AMPLITUDE / std::f32::consts::SQRT_2;
+        assert!(
+            (output_rms - expected_rms).abs() / expected_rms < 0.05,
+            "passband amplitude should be preserved within 5%, got rms={output_rms}, \
+             expected~={expected_rms}"
+        );
+    }
+
+    #[test]
+    fn oneshot_attenuates_frequencies_above_the_output_nyquist_when_downsampling() {
+        // 折り返し(エイリアシング)の抑圧: 出力のナイキストより高い成分は、
+        // 折り返し先の周波数にエネルギーを残してはならない。48kHz -> 16kHz
+        // (出力ナイキスト8kHz)へ 14kHz のトーンを通し、出力の実効値が
+        // 入力よりはるかに小さいこと(通過帯域を通した場合との比較で「ほぼ無音」)を見る。
+        const SOURCE_RATE: u32 = 48_000;
+        const OUTPUT_RATE: u32 = 16_000;
+        const AMPLITUDE: f32 = 0.5;
+        const FRAME_COUNT: usize = 4_800; // 100ms
+
+        let passband = sine_wave(1_000.0, SOURCE_RATE, FRAME_COUNT, AMPLITUDE);
+        let (passband_out, passband_frames) =
+            resample_oneshot(&passband, FRAME_COUNT, SOURCE_RATE, OUTPUT_RATE)
+                .expect("valid rates");
+        let passband_rms = rms(&left_channel(&passband_out[..passband_frames * CHANNELS]));
+
+        let aliased = sine_wave(14_000.0, SOURCE_RATE, FRAME_COUNT, AMPLITUDE);
+        let (aliased_out, aliased_frames) =
+            resample_oneshot(&aliased, FRAME_COUNT, SOURCE_RATE, OUTPUT_RATE).expect("valid rates");
+        let aliased_rms = rms(&left_channel(&aliased_out[..aliased_frames * CHANNELS]));
+
+        // 通過帯域(1kHz)は振幅がほぼ保たれ、遮断帯域外(14kHz)は
+        // フィルタの目標減衰量(80dB以上、ADR-0004)に見合うだけ小さくなっているはず。
+        // 数値誤差・窓の裾を見込んで -40dB(1/100)を要求する。
+        assert!(
+            aliased_rms < passband_rms * 0.01,
+            "aliased content must be suppressed by at least 40dB relative to passband: \
+             passband_rms={passband_rms}, aliased_rms={aliased_rms}"
+        );
+    }
+
+    #[test]
+    fn stream_resampler_output_has_no_discontinuity_at_chunk_boundaries() {
+        // ブロック境界の連続性: 複数チャンクにまたがる定常正弦波を処理したとき、
+        // チャンク境界(`PolyphaseEngine::history` の引き継ぎが起きる位置)で
+        // 不連続(プチノイズ)が出ないことを見る。定常正弦波の隣接サンプル差分は
+        // どこでもほぼ一定のはずなので、境界だけ突出していれば継ぎ目が壊れている。
+        const SOURCE_RATE: u32 = 44_100;
+        const OUTPUT_RATE: u32 = 48_000;
+        const TOTAL_CHUNKS: usize = 6;
+
+        let mut resampler = StreamResampler::new(SOURCE_RATE, OUTPUT_RATE).expect("valid rates");
+        let need = resampler.input_frames_needed();
+        let total_frames = need * TOTAL_CHUNKS;
+        let input = sine_wave(1_000.0, SOURCE_RATE, total_frames, 0.5);
+
+        let mut out = Vec::new();
+        for i in 0..TOTAL_CHUNKS {
+            let chunk = &input[i * need * CHANNELS..(i + 1) * need * CHANNELS];
+            resampler
+                .process_full_chunk_into(chunk, &mut out)
+                .expect("must not error");
+        }
+        let left = left_channel(&out);
+
+        let diffs: Vec<f32> = left.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
+        // 先頭・末尾(フィルタのウォームアップ・まだ届いていない未来入力の影響が残る領域)を
+        // 除いた定常領域だけを見る。
+        let margin = diffs.len() / 10;
+        let steady = &diffs[margin..diffs.len() - margin];
+        let max_diff = steady.iter().copied().fold(0.0f32, f32::max);
+        let mean_diff = steady.iter().sum::<f32>() / steady.len() as f32;
+        assert!(
+            max_diff < mean_diff * 5.0,
+            "output should not show a boundary discontinuity: max_diff={max_diff}, \
+             mean_diff={mean_diff}"
+        );
+    }
+
+    #[test]
+    fn stream_resampler_reset_discards_history_like_a_fresh_instance() {
+        // シーク相当の不連続性: ウォームアップしてから `reset()` した場合と、
+        // 新規構築した場合とで、以降の出力が完全一致することを見る
+        // (`PolyphaseEngine::history`/位相状態が正しく初期化されることの回帰)。
+        const SOURCE_RATE: u32 = 44_100;
+        const OUTPUT_RATE: u32 = 48_000;
+
+        let warm_input = sine_wave(1_000.0, SOURCE_RATE, 8_820, 0.5);
+        let probe_input = sine_wave(500.0, SOURCE_RATE, 4_410, 0.3);
+
+        let mut warmed = StreamResampler::new(SOURCE_RATE, OUTPUT_RATE).expect("valid rates");
+        let need = warmed.input_frames_needed();
+        let mut scratch = Vec::new();
+        let mut pos = 0usize;
+        while pos + need <= warm_input.len() / CHANNELS {
+            warmed
+                .process_full_chunk_into(
+                    &warm_input[pos * CHANNELS..(pos + need) * CHANNELS],
+                    &mut scratch,
+                )
+                .expect("must not error");
+            pos += need;
+        }
+        warmed.reset();
+
+        let mut warmed_out = Vec::new();
+        let mut fresh = StreamResampler::new(SOURCE_RATE, OUTPUT_RATE).expect("valid rates");
+        let mut fresh_out = Vec::new();
+        let mut pos = 0usize;
+        while pos + need <= probe_input.len() / CHANNELS {
+            let chunk = &probe_input[pos * CHANNELS..(pos + need) * CHANNELS];
+            warmed
+                .process_full_chunk_into(chunk, &mut warmed_out)
+                .expect("must not error");
+            fresh
+                .process_full_chunk_into(chunk, &mut fresh_out)
+                .expect("must not error");
+            pos += need;
+        }
+
+        assert!(!warmed_out.is_empty());
+        assert_eq!(
+            warmed_out, fresh_out,
+            "reset() must fully discard prior state regardless of playback history"
+        );
+    }
+
+    #[test]
+    fn oneshot_output_length_matches_convert_frame_count_for_common_rate_pairs() {
+        for &(source_rate, output_rate) in &[
+            (44_100u32, 48_000u32),
+            (48_000, 44_100),
+            (32_000, 48_000),
+            (22_050, 48_000),
+            (16_000, 48_000),
+        ] {
+            let frame_count = 2_000usize;
+            let input = sine_wave(500.0, source_rate, frame_count, 0.4);
+            let (out, out_frames) = resample_oneshot(&input, frame_count, source_rate, output_rate)
+                .expect("valid rates");
+            let expected = convert_frame_count(frame_count as u64, source_rate, output_rate);
+            assert_eq!(
+                out_frames, expected as usize,
+                "{source_rate}->{output_rate}: output frame count must match convert_frame_count"
+            );
+            assert_eq!(out.len(), out_frames * CHANNELS);
+        }
+    }
+
+    #[test]
+    fn delay_is_a_deterministic_function_of_the_rate_pair() {
+        // 遅延(内部でのみ読み捨てる群遅延)が、レート対に対して決定的であることを固定する。
+        // インパルス応答のピーク位置は「起動直後に読み捨てたフレーム数(群遅延)」の
+        // 直後に来るはずなので、ピークが常に出力の先頭に来ること
+        // (= 群遅延の読み捨てが機能していること)を、複数のレート対で確認する。
+        for &(source_rate, output_rate) in
+            &[(44_100u32, 48_000u32), (48_000, 44_100), (32_000, 48_000)]
+        {
+            let frame_count = 2_000usize;
+            let mut impulse = vec![0.0f32; frame_count * CHANNELS];
+            impulse[0] = 1.0;
+            impulse[1] = 1.0;
+            let (out, out_frames) =
+                resample_oneshot(&impulse, frame_count, source_rate, output_rate)
+                    .expect("valid rates");
+            let left = left_channel(&out[..out_frames * CHANNELS]);
+            let (peak_index, _) = left
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.abs().partial_cmp(&b.1.abs()).unwrap())
+                .expect("non-empty output");
+            // 群遅延はここでは呼び出し側に一切見えない(モジュール doc)ので、
+            // インパルス応答のピークは出力の先頭付近(数フレーム以内)に来るはずである。
+            assert!(
+                peak_index < 8,
+                "{source_rate}->{output_rate}: impulse response peak should appear near the \
+                 start of the output once the internal group delay has been skipped, got index \
+                 {peak_index}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_rate_pair_is_never_constructed_by_callers() {
+        // `StreamResampler`/`resample_oneshot` はレート一致時に呼ばれない設計
+        // (`decode.rs`/`wav.rs` がバイパスする)。ここでは `validate_rates` が
+        // レート一致自体を拒否しないこと(呼び出し側の責務であり、ここでは弾かない)
+        // だけを回帰として残す。
+        assert!(StreamResampler::new(48_000, 48_000).is_ok());
     }
 }

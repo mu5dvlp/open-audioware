@@ -16,7 +16,7 @@
 | Rust | stable(最新)、edition 2024 | MSRV は「最新 stable」で開始し、公開時に固定を検討 |
 | cpal | 出力バックエンド | M6。全ターゲットを1系統で |
 | mw-core 内製 WAV デコーダ | デコード(WAV PCM 8/16/24/32bit、IEEE float 32/64bit、WAVE_FORMAT_EXTENSIBLE) | M7 |
-| rubato | リサンプリング | §4.7 |
+| mw-core 内製 resample | リサンプリング(固定比ポリフェーズ窓付き sinc フィルタ) | §4.7 |
 | mw-core 内製 ring_buffer | SPSC ロックフリーリングバッファ | コマンド / イベント / PCM 供給 |
 | csbindgen | C# バインディング生成 | M2。IL2CPP 実績あり |
 | cargo-ndk | Android ビルド | .so 生成 |
