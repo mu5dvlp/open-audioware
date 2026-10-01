@@ -183,6 +183,8 @@ use std::sync::atomic::AtomicU64;
 
 use mw_core::EventQueue;
 
+use crate::cpal_backend::StreamHandle;
+
 /// 割り込みからの復帰を表す状態機械(OS API 呼び出しを一切含まない、純粋な値型)。
 ///
 /// 実機の割り込みそのものは自動テストで再現できないが、遷移ロジックはここに切り出す
@@ -566,8 +568,8 @@ impl Watcher {
     /// `CpalBackend::open` から、ストリームを `play()` した直後に呼ぶこと
     /// (`cpal_backend.rs` 参照)。
     #[cfg(any(target_os = "ios", target_os = "tvos"))]
-    pub fn new(
-        stream: Arc<cpal::Stream>,
+    pub(crate) fn new(
+        stream: Arc<StreamHandle>,
         events: Arc<EventQueue>,
         callback_ticks: Arc<AtomicU64>,
     ) -> Self {
@@ -578,8 +580,8 @@ impl Watcher {
 
     /// iOS / tvOS 以外では何もしない。
     #[cfg(not(any(target_os = "ios", target_os = "tvos")))]
-    pub fn new(
-        _stream: Arc<cpal::Stream>,
+    pub(crate) fn new(
+        _stream: Arc<StreamHandle>,
         _events: Arc<EventQueue>,
         _callback_ticks: Arc<AtomicU64>,
     ) -> Self {
@@ -597,7 +599,6 @@ mod imp {
     use std::time::Duration;
 
     use block2::RcBlock;
-    use cpal::traits::StreamTrait;
     use mw_core::{Event, EventQueue};
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
@@ -611,7 +612,7 @@ mod imp {
 
     use super::{
         InterruptionState, OutputStallDetector, RECOVERY_WAIT_SCHEDULE_MS, RouteChangeReason,
-        WATCHDOG_POLL_INTERVAL_MS, confirm_recovery_progress,
+        StreamHandle, WATCHDOG_POLL_INTERVAL_MS, confirm_recovery_progress,
     };
 
     /// ウォッチドッグの待機を刻む単位(ms)。[`WATCHDOG_POLL_INTERVAL_MS`] をこの粒度で
@@ -637,7 +638,7 @@ mod imp {
 
     impl Watcher {
         pub(super) fn new(
-            stream: Arc<cpal::Stream>,
+            stream: Arc<StreamHandle>,
             events: Arc<EventQueue>,
             callback_ticks: Arc<AtomicU64>,
         ) -> Self {
@@ -836,7 +837,7 @@ mod imp {
     fn handle_interruption_notification(
         notif: &NSNotification,
         state: &Arc<Mutex<InterruptionState>>,
-        stream: &Arc<cpal::Stream>,
+        stream: &Arc<StreamHandle>,
         events: &Arc<EventQueue>,
         callback_ticks: &Arc<AtomicU64>,
     ) {
@@ -915,7 +916,7 @@ mod imp {
     /// `DidBecomeActive` 安全網の前提が崩れていたケース」の観測性節参照)。
     fn handle_became_active(
         state: &Arc<Mutex<InterruptionState>>,
-        stream: &Arc<cpal::Stream>,
+        stream: &Arc<StreamHandle>,
         events: &Arc<EventQueue>,
         callback_ticks: &Arc<AtomicU64>,
     ) {
@@ -942,7 +943,7 @@ mod imp {
     fn handle_route_change_notification(
         notif: &NSNotification,
         state: &Arc<Mutex<InterruptionState>>,
-        stream: &Arc<cpal::Stream>,
+        stream: &Arc<StreamHandle>,
         events: &Arc<EventQueue>,
         callback_ticks: &Arc<AtomicU64>,
     ) {
@@ -1048,7 +1049,7 @@ mod imp {
     /// 既存の復帰経路はそのまま動く(`ios_session::configure` と同じ「失敗は記録して続行」)。
     fn spawn_output_stall_watchdog(
         state: Arc<Mutex<InterruptionState>>,
-        stream: Arc<cpal::Stream>,
+        stream: Arc<StreamHandle>,
         events: Arc<EventQueue>,
         callback_ticks: Arc<AtomicU64>,
         shutdown: Arc<AtomicBool>,
@@ -1192,7 +1193,7 @@ mod imp {
     /// この観測性は変わらない(ログを出す場所が別スレッドになるだけ)。
     fn attempt_recovery(
         state: &Arc<Mutex<InterruptionState>>,
-        stream: &Arc<cpal::Stream>,
+        stream: &Arc<StreamHandle>,
         events: &Arc<EventQueue>,
         callback_ticks: &Arc<AtomicU64>,
         trigger: RecoveryTrigger,

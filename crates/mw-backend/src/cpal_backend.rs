@@ -4,6 +4,7 @@
 //! 計測後、必要なら Android を oboe 直叩き、iOS を RemoteIO 直叩きに置換する可能性がある
 //! (その際もこの `Backend` trait 経由で差し替えられるようにしてある)。
 
+use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -16,6 +17,44 @@ use crate::backend::{Backend, BackendError};
 use crate::ios_interruption;
 use crate::underrun::OutputUnderrunTracker;
 
+/// 出力ストリームのハンドル。`cpal::Stream` をこのファイル1本に閉じ込めるための自前の
+/// ラッパで、`ios_interruption`(iOS の割り込み復帰)が `pause()`/`play()` を呼び直す
+/// ためだけに外へ渡す。cpal の型そのもの(`cpal::Stream`/`cpal::PauseStreamError`/
+/// `cpal::PlayStreamError`)はこの構造体の外へは一切出てこない。
+pub(crate) struct StreamHandle(cpal::Stream);
+
+impl StreamHandle {
+    fn new(stream: cpal::Stream) -> Self {
+        Self(stream)
+    }
+
+    /// 出力ストリームを一時停止する。cpal 側のエラーは文言化して
+    /// [`StreamControlError`] に詰め替える(cpal の型を呼び出し元へ漏らさない)。
+    pub(crate) fn pause(&self) -> Result<(), StreamControlError> {
+        self.0
+            .pause()
+            .map_err(|e| StreamControlError(e.to_string()))
+    }
+
+    /// 出力ストリームを再開する。
+    pub(crate) fn play(&self) -> Result<(), StreamControlError> {
+        self.0.play().map_err(|e| StreamControlError(e.to_string()))
+    }
+}
+
+/// [`StreamHandle::pause`]/[`StreamHandle::play`] が返すエラー。cpal の内部エラー型
+/// (`cpal::PauseStreamError`/`cpal::PlayStreamError`)を文言だけ保持して包み直したもの。
+#[derive(Debug)]
+pub(crate) struct StreamControlError(String);
+
+impl fmt::Display for StreamControlError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for StreamControlError {}
+
 /// 既定の出力デバイスに f32 ステレオストリームを開く `Backend` 実装。
 ///
 /// デバイスが無い環境(CI・ヘッドレスマシン等)では `open` が
@@ -26,8 +65,9 @@ pub struct CpalBackend {
     /// OS 通知ハンドラ(非リアルタイムスレッド)から同じストリームの `pause()`/`play()`
     /// を呼び直せるよう、参照を共有する必要があるため(`ios_interruption.rs` の
     /// モジュール doc「実装方針」参照)。iOS / tvOS 以外では単なる所有権共有としてのみ
-    /// 使う(`Watcher` は no-op)。
-    stream: Option<Arc<cpal::Stream>>,
+    /// 使う(`Watcher` は no-op)。[`StreamHandle`] 経由で持つことで、cpal の型
+    /// (`cpal::Stream`)自体は `ios_interruption.rs` に一切出てこない。
+    stream: Option<Arc<StreamHandle>>,
     /// iOS / tvOS: `AVAudioSessionInterruptionNotification` /
     /// `UIApplicationDidBecomeActiveNotification` の監視・復帰処理(M3)。
     /// それ以外の OS では no-op(`ios_interruption.rs` 参照)。`stream` と1対1で
@@ -217,6 +257,7 @@ impl Backend for CpalBackend {
             Arc::clone(&events),
             underrun_tracker,
         )?;
+        let stream = StreamHandle::new(stream);
         stream
             .play()
             .map_err(|e| BackendError::PlayStreamFailed(e.to_string()))?;
