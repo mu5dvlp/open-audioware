@@ -29,6 +29,7 @@
 
 ### [2026-09-29](history/16-2026-09-29.md)
 
+- (2026-10-01)依存排除の 4-0(バックエンドの feature・cpal の型を1ファイルへ)/ 5-1 libc / 5-2 mach2 を自前の宣言へ。Miri の全範囲 224 件・UB なし
 - (2026-09-30)rubato を自前のポリフェーズ sinc リサンプラへ置き換え(ADR-0004。表記が要る依存 39 → 27)。Miri の CI 範囲から重いリサンプルのテストを外した(40 件 82 秒)。TSan でまれに落ちる楽曲クロックのテストを直した
 - macOS 配布 dylib を arm64 + x86_64 の universal に変更(`make build-macos` の `lipo` 結合・検証、install name は `@rpath` に揃えた)
 - Miri を導入(`make miri` / `miri-all` / CI)。リングバッファの Stacked Borrows 違反を1件修正。rustfft の上流 UB は Linux ターゲットで回避(ADR-0003)
