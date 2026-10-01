@@ -88,13 +88,17 @@ pub fn host_time_ns() -> u64 {
 
 /// POSIX `clock_gettime` が書き込む `timespec`(C ABI 互換の自前宣言、ステップ5-1)。
 ///
-/// このプロジェクトが対象とする Android(aarch64, LP64)と Linux(x86_64, LP64。
-/// CI 専用)はどちらも `time_t`/`long` が 64bit なので `tv_sec`/`tv_nsec` を `i64` で表せる。
+/// `tv_sec`/`tv_nsec` の実体は C の `long`(`time_t`/`suseconds_t` 相当)——bionic
+/// (Android)は 32bit ターゲット(armv7/i686)でも `long` が 32bit のままであり、
+/// time64 化していない glibc も同様。`i64` 固定だと ABI 上のフィールド幅が実際の
+/// `long` とずれ、32bit ターゲットでは呼び出し自体が壊れた値を返す。`core::ffi::c_long`
+/// を使えば、ターゲットごとの実際の `long` 幅(64bit ターゲットは 64bit、32bit
+/// ターゲットは 32bit)にそのまま追従する。
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 #[repr(C)]
 struct Timespec {
-    tv_sec: i64,
-    tv_nsec: i64,
+    tv_sec: core::ffi::c_long,
+    tv_nsec: core::ffi::c_long,
 }
 
 /// `<time.h>` の `CLOCK_MONOTONIC`(Linux / Android どちらも値は 1)。
