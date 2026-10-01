@@ -148,7 +148,7 @@ jobs:
         run: cp -R unity /tmp/unity-src
 
       - name: ビルド成果物をダウンロードする
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           path: /tmp/artifacts
 
