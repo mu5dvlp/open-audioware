@@ -64,6 +64,29 @@ pub fn host_time_ns() -> u64 {
     }
 }
 
+/// POSIX `clock_gettime` が書き込む `timespec`(C ABI 互換の自前宣言、ステップ5-1)。
+///
+/// このプロジェクトが対象とする Android(aarch64, LP64)と Linux(x86_64, LP64。
+/// CI 専用)はどちらも `time_t`/`long` が 64bit なので `tv_sec`/`tv_nsec` を `i64` で表せる。
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+#[repr(C)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+/// `<time.h>` の `CLOCK_MONOTONIC`(Linux / Android どちらも値は 1)。
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+const CLOCK_MONOTONIC: i32 = 1;
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+unsafe extern "C" {
+    /// `std` が既にリンク済みの libc(Linux は glibc、Android は bionic)が提供する
+    /// シンボルを直接呼ぶ。**直接依存の `libc` クレートだけを外す**ための自前宣言
+    /// (ステップ5-1)——`std` 自体のリンクは変わらないので、新たな動的リンクは増えない。
+    fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
+}
+
 /// ホスト単調時刻をナノ秒で返す(Android / Linux)。
 ///
 /// cpal 0.18.2 `src/host/aaudio/convert.rs::now_stream_instant` と同じ式
@@ -73,14 +96,14 @@ pub fn host_time_ns() -> u64 {
 /// `cargo test --workspace` を通す。
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 pub fn host_time_ns() -> u64 {
-    let mut ts = libc::timespec {
+    let mut ts = Timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    // SAFETY: `ts` はスタック上の有効な `timespec`。`clock_gettime` はこれへ
+    // SAFETY: `ts` はスタック上の有効な `Timespec`。`clock_gettime` はこれへ
     // 書き込むだけで、他の副作用は無い。
     unsafe {
-        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+        clock_gettime(CLOCK_MONOTONIC, &mut ts);
     }
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }

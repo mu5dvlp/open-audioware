@@ -48,12 +48,6 @@ version = "0.6"
 [target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))'.dependencies]
 mach2 = "0.6"
 
-# `host_time::host_time_ns` が `clock_gettime(CLOCK_MONOTONIC)` を呼ぶために使う
-# (Android / Linux。cpal の AAudio 実装〔`now_stream_instant`〕と同じ式)。
-# `libc` は cpal 自身も依存しているクレートなので、依存ツリーは増えない。
-[target.'cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))'.dependencies]
-libc = "0.2"
-
 # Android では cpal(AAudio 実装)が Java 側の AudioManager を参照するため、
 # JavaVM / Context を ndk_context へ登録する必要がある(src/android_context.rs 参照)。
 # どちらも cpal 0.18 の Android 実装が既に依存しているクレートなので、依存ツリーは増えない。
