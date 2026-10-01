@@ -1292,20 +1292,57 @@ pub fn with_instance<T>(handle: u64, f: impl FnOnce(&Instance) -> T) -> Option<T
     }
 }
 
-/// バックエンドを1つ作る唯一の口。本番は常に [`CpalBackend`]。
+/// バックエンドを1つ作る唯一の口。本番は既定(`backend-cpal` feature)では常に
+/// [`CpalBackend`]。
+///
+/// 🔴 **AUDIOWARE-DEPS-PLAN.md ステップ4-0 の切替点。** バックエンドの選択をここ1箇所に
+/// 集約してあるので、ステップ4-1〜4-3 で自前バックエンド(`backend-native` feature)を
+/// 実装したあとも、`backend-cpal` feature を有効にするだけで即座に cpal 実装へ
+/// 切り戻せる(段階ごとに壊していないことを確かめるための退路)。`backend-native` は
+/// 現時点では未実装の「口だけ」——選んだ場合はコンパイルエラーになる(既定ビルドには
+/// 影響しない)。
 ///
 /// 🔴 テストビルドでのみ、テストダブルを差し込めるようにしてある —— CI にもこの環境にも
 /// 実デバイスが無く、`CpalBackend::open()` が必ず失敗するため、再オープンの段2・段3
 /// (`run_reopen_worker` / `finalize_reopen_success` / `teardown_orphaned_reopen`)へ
 /// 実際に到達させる手段が他に無い(`crates/mw-ffi/src/test_backend.rs` 参照)。
-#[cfg(not(test))]
+#[cfg(all(not(test), feature = "backend-cpal"))]
 fn make_backend() -> Box<dyn Backend + Send> {
     Box::new(CpalBackend::new())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "backend-cpal"))]
 fn make_backend() -> Box<dyn Backend + Send> {
     crate::test_backend::take_from_factory().unwrap_or_else(|| Box::new(CpalBackend::new()))
+}
+
+// `backend-native` だけが有効(`backend-cpal` 無効)なビルドの受け皿。
+//
+// AUDIOWARE-DEPS-PLAN.md ステップ4-1〜4-3(macOS/iOS 自前 AudioUnit・Android 自前
+// AAudio)がまだ実装されていないため、選んだ時点で明確にコンパイルを止める
+// (実行時に初めて失敗する「黙って cpal にフォールバック」はしない)。
+// `compile_error!` を独立した item として発行し、`unreachable!()`(型は `!`、どの戻り型
+// にも合致する)で関数の型だけ合わせておくことで、本質と無関係な型不一致エラーが
+// 道連れで出るのを避けている。
+#[cfg(all(not(feature = "backend-cpal"), feature = "backend-native"))]
+compile_error!(
+    "backend-native はまだ実装されていない(AUDIOWARE-DEPS-PLAN.md ステップ4-1〜4-3 未着手)。\
+     backend-cpal を有効にしてビルドすること"
+);
+
+#[cfg(all(not(feature = "backend-cpal"), feature = "backend-native"))]
+fn make_backend() -> Box<dyn Backend + Send> {
+    unreachable!("backend-native はまだ実装されていない")
+}
+
+// backend-cpal / backend-native のどちらも無効なビルド(cargo build --no-default-features)
+// も同様に明確なエラーで止める。
+#[cfg(not(any(feature = "backend-cpal", feature = "backend-native")))]
+compile_error!("backend-cpal か backend-native のどちらかの feature を有効にすること");
+
+#[cfg(not(any(feature = "backend-cpal", feature = "backend-native")))]
+fn make_backend() -> Box<dyn Backend + Send> {
+    unreachable!("backend-cpal も backend-native も有効になっていない")
 }
 
 pub enum InitOutcome {
