@@ -35,6 +35,28 @@
 //! `Time.realtimeSinceStartupAsDouble` の両方を1回ずつサンプリングし、その差を
 //! 定数オフセットとして保持する**——以後はそのオフセットを介して変換する。
 
+/// Mach の `mach_timebase_info`(C ABI 互換の自前宣言、ステップ5-2)。
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+#[repr(C)]
+#[derive(Default)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
+/// `<mach/kern_return.h>` の `KERN_SUCCESS`。
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+const KERN_SUCCESS: i32 = 0;
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+unsafe extern "C" {
+    /// `std` が既にリンク済みの libSystem(Mach カーネル API)が提供するシンボルを
+    /// 直接呼ぶ。**直接依存の `mach2` クレートだけを外す**ための自前宣言
+    /// (ステップ5-2)——`std` 自体のリンクは変わらないので、新たな動的リンクは増えない。
+    fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+}
+
 /// ホスト単調時刻をナノ秒で返す。
 ///
 /// リアルタイム安全: アロケーション・ロックを一切行わない(単純なシステムコール
@@ -51,10 +73,10 @@ pub fn host_time_ns() -> u64 {
     // 変数への有効なポインタのみ。エラー時も未初期化メモリを読まない
     // (`mach_timebase_info` が失敗した場合は下の `KERN_SUCCESS` チェックで弾く)。
     unsafe {
-        let ticks = mach2::mach_time::mach_absolute_time();
-        let mut info = mach2::mach_time::mach_timebase_info::default();
-        let status = mach2::mach_time::mach_timebase_info(&mut info);
-        if status != mach2::kern_return::KERN_SUCCESS || info.denom == 0 {
+        let ticks = mach_absolute_time();
+        let mut info = MachTimebaseInfo::default();
+        let status = mach_timebase_info(&mut info);
+        if status != KERN_SUCCESS || info.denom == 0 {
             // 失敗しても致命傷にはしない(§4.8 の思想と同じ)。実機の CoreAudio では
             // まず失敗しない経路(cpal 自身もこれを事実上想定していない)だが、
             // 保険として raw tick をそのまま返す(単調性だけは保たれる)。

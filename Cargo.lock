@@ -381,7 +381,6 @@ dependencies = [
  "block2",
  "cpal",
  "jni",
- "mach2 0.6.0",
  "mw-core",
  "ndk-context",
  "objc2",
