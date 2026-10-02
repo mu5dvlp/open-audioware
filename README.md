@@ -59,7 +59,7 @@ Unity のバージョンは **6000.4.1f1** で検証しています。
 `Packages/manifest.json` に1行足すだけです:
 
 ```json
-"com.mu5dvlp.open-audioware": "https://github.com/mu5dvlp/open-audioware.git?path=unity#upm/v0.1.0"
+"com.mu5dvlp.open-audioware": "https://github.com/mu5dvlp/open-audioware.git?path=unity#upm/v0.2.0"
 ```
 
 - `upm/vX.Y.Z` はビルド済みネイティブライブラリ(iOS: `xcframework` / Android: `.so` /
