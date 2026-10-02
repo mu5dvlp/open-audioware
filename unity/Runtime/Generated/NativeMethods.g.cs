@@ -73,7 +73,9 @@ namespace Mw.Native.Generated
         ///  (初期構築仕様 §5.5, §4.2, §5.2)。
         ///
         ///  - `mode = 0`(SE): wav を全デコードしてメモリ常駐させる(M1)。対応フォーマットは
-        ///    16bit PCM / モノラルまたはステレオの wav のみ(`crates/mw-core/src/wav.rs`)。
+        ///    PCM 8/16/24/32bit、IEEE float 32/64bit、および対応する
+        ///    WAVE_FORMAT_EXTENSIBLE / モノラルまたはステレオの wav
+        ///    (`crates/mw-core/src/wav.rs`)。
         ///    サンプルレートは出力デバイスと一致しなくてよい(一致しない場合はロード時に
         ///    一括でリサンプルする。初期構築仕様『§4.7』)。非対応の場合は原因に応じた
         ///    エラーコードを返す。
@@ -246,7 +248,7 @@ namespace Mw.Native.Generated
         ///  渡すと `MwResult::ErrInvalidSoundId` を返す——`crate::handle::MUSIC_ID_FLAG` に
         ///  よる ID 空間分離が効いている)。
         ///
-        ///  デコーダ(`mw_core::SymphoniaDecoder::open`)は**この呼び出しの中、ゲームスレッドで
+        ///  デコーダ(`mw_core::WavDecoder::open`)は**この呼び出しの中、ゲームスレッドで
         ///  開く**。ヘッダ読み取りでアロケーションが発生するが、ここはゲームスレッド経路
         ///  なので初期構築仕様『§5.3』のリアルタイム安全性規約には抵触しない(デコード
         ///  スレッドへは構築済みのデコーダをそのまま渡すだけで、以後の実際のデコード作業
@@ -260,7 +262,7 @@ namespace Mw.Native.Generated
         ///  ## 曲の切り替えで前曲の PCM が漏れる問題への対処
         ///
         ///  リングバッファに前曲の PCM が残ったまま新しい曲が始まると、曲頭に前の曲が
-        ///  数フレーム鳴ってしまう(`rtrb` は**消費側しか pop できない**ため、生産側
+        ///  数フレーム鳴ってしまう(リングバッファは**消費側しか pop できない**ため、生産側
         ///  (デコードスレッド)は自分でリングバッファを掃除できない)。M2-3 で入れた
         ///  シーク調停(エポック ack 方式、`mw_core::stream` モジュール doc「シークの
         ///  調停」参照)がそのまま使えるため、次の順序を**必ず**守って処理する:
@@ -750,7 +752,7 @@ namespace Mw.Native.Generated
         /// </summary>
         ErrUnsupportedSampleRate = -8,
         /// <summary>
-        ///  wav が 16bit PCM でない、またはチャンネル数がモノ/ステレオでない。
+        ///  wav のフォーマットまたはチャンネル数が対応範囲外だった。
         /// </summary>
         ErrUnsupportedFormat = -9,
         /// <summary>
