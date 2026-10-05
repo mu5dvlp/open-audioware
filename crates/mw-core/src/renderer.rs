@@ -183,6 +183,13 @@ impl Renderer {
     pub fn se_schedule_overflow_counter(&self) -> Arc<AtomicU64> {
         self.mixer.se_schedule_overflow_counter()
     }
+
+    /// 音楽クロックの発行ハンドルへの複製を返す
+    /// ([`crate::mixer::Mixer::music_clock_handle`] への委譲。同じ理由で
+    /// 🔴 `Backend::open` へこの `Renderer` をムーブする**前に**取ること)。
+    pub fn music_clock_handle(&self) -> Arc<MusicClockPublisher> {
+        self.mixer.music_clock_handle()
+    }
 }
 
 #[cfg(test)]
@@ -284,6 +291,35 @@ mod tests {
         assert_eq!(
             first.load(std::sync::atomic::Ordering::Relaxed),
             renderer.se_schedule_overflow_count()
+        );
+    }
+
+    /// 🔴 <b>`music_clock_handle` が返す `Arc` が、`Renderer::build` の戻り値
+    /// (ゲームスレッド側ハンドル)と同一のオブジェクトであること。</b>
+    /// ⚠️ ここが別物になると、`mw-backend::AppleBackend` がこれ経由で呼ぶ
+    /// `bump_generation`(補正項の変化を世代へ反映する経路)が、ゲームスレッドが
+    /// 実際に読む `MusicClockPublisher` とは違うインスタンスに対して空振りする——
+    /// 「世代が進んだように見えるが、読み手には一切伝わらない」という発見しづらい
+    /// 事故になる(`se_schedule_overflow_counter_is_the_same_object_the_renderer_counts_with`
+    /// と同じ理由)。
+    #[test]
+    fn music_clock_handle_is_the_same_object_the_build_caller_received() {
+        let (mut renderer, _sender, _reclaim, _music_producer, music_clock, _events, _bgm) =
+            Renderer::build(Config::default(), 48_000);
+
+        let handle = renderer.music_clock_handle();
+        assert!(
+            Arc::ptr_eq(&music_clock, &handle),
+            "別の Arc を返しています(Mixer 内部の music_clock と食い違う)"
+        );
+
+        let mut buffer = vec![0.0_f32; 4 * CHANNELS];
+        renderer.render(&mut buffer, 0);
+
+        assert_eq!(
+            handle.snapshot().host_time_ns,
+            music_clock.snapshot().host_time_ns,
+            "同一の Arc なら render の結果が両方から同じように見えるはず"
         );
     }
 

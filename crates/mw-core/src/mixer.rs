@@ -819,6 +819,21 @@ impl Mixer {
         Arc::clone(&self.se_schedule_overflow_count)
     }
 
+    /// 音楽クロックの発行ハンドルへの複製を返す(`Backend::open` へムーブする**前に**
+    /// 取っておくこと —— ムーブ後は `Mixer` に触れない。`se_schedule_overflow_counter`
+    /// と同じ理由)。
+    ///
+    /// 想定利用者は `mw-backend` の各バックエンド実装——`Mixer::render` の外側
+    /// (音声スレッド上の別経路、例: iOS/tvOS のルート変化監視が補正項を書き換えた直後)
+    /// から [`MusicClockPublisher::bump_generation`] を呼んで世代を進めるために使う。
+    /// **呼び出し側は音声スレッドからのみ `bump_generation` を呼ぶこと**——
+    /// `MusicClockPublisher` の seqlock は単一書き手前提(`clock.rs` のモジュール doc)で、
+    /// `Mixer::render` 自身も同じ音声スレッドから書くため、両者が別スレッドになると
+    /// 書き込みが競合する。
+    pub fn music_clock_handle(&self) -> Arc<MusicClockPublisher> {
+        Arc::clone(&self.music_clock)
+    }
+
     /// 現在キューに残っている予約 SE の件数(診断・テスト用)。
     #[cfg(test)]
     fn se_schedule_len(&self) -> usize {

@@ -86,7 +86,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use mw_core::{CHANNELS, EventQueue, Renderer};
+use mw_core::{CHANNELS, EventQueue, MusicClockPublisher, Renderer};
 
 use crate::backend::{Backend, BackendError};
 use crate::host_time::mach_ticks_to_ns;
@@ -595,6 +595,30 @@ struct CallbackContext {
     /// [`compute_timestamps`] の「相関点」(このコールバックの `AudioTimeStamp.
     /// mHostTime`)とは別に持つ——音声コールバックは毎回 `Relaxed` で読むだけ。
     device_extra_latency_ns: Arc<AtomicU64>,
+    /// `render_proc` がこのコールバックの直前までに観測していた
+    /// `device_extra_latency_ns` の値。**音声スレッド専用**(他スレッドからは一切
+    /// 触らない単純なフィールドで、atomic にしていない——単一の書き手である
+    /// `render_proc` 自身が毎コールバック読み書きするだけなので § 5.3 の対象にはならない)。
+    ///
+    /// レビュー【高】の修正: 補正項(`device_extra_latency_ns`)は iOS/tvOS では
+    /// `IosOutputLatencyWatcher` がルート変化のたびに別スレッドから書き換える
+    /// (`AppleBackend::open` のドキュメント参照)。`render_proc` はこの値を毎コールバック
+    /// 読んで [`compute_timestamps`] の「補正項」として使うが、変化を検知しないまま
+    /// 使うと `host_time_ns` が同じ世代のまま飛んでしまい、`clock.rs::
+    /// MusicClockSnapshot` の契約(「世代を跨いだ外挿をしてはならない」)に反する。
+    /// この直前値と毎コールバック比較し、変化していれば [`MusicClockPublisher::
+    /// bump_generation`] を呼んでから新しい補正項で `buffer_start_host_time_ns` を
+    /// 計算する(`render_proc` 本体参照)。macOS はここが実質的に no-op——
+    /// `device_extra_latency_ns` は `open()` 時に1度書いたあと固定なので、この値と
+    /// 毎回一致し続け、世代は一度も進まない(4-1 の既知の差分は変えない)。
+    last_device_extra_latency_ns: u64,
+    /// 音楽クロックの発行ハンドル(`Mixer::music_clock_handle` と同じ `Arc` を指す)。
+    /// `render_proc` が補正項の変化を検知したときに [`MusicClockPublisher::
+    /// bump_generation`] を呼ぶためだけに使う——`renderer.render()` 自身が内部で
+    /// 行う `bump_generation` 呼び出し(シーク等)と同じ音声スレッドから呼ぶので、
+    /// seqlock の単一書き手前提は崩れない([`Mixer::music_clock_handle`] のドキュメント
+    /// 参照)。
+    music_clock: Arc<MusicClockPublisher>,
     underrun_tracker: OutputUnderrunTracker,
     /// [`AppleBackend::callback_frames`] へ渡す `Arc`。
     callback_frames: Arc<AtomicU32>,
@@ -669,9 +693,25 @@ unsafe extern "C" fn render_proc(
             .map(|ts| mach_ticks_to_ns(ts.host_time))
             .unwrap_or(0);
 
+        let device_extra_latency_ns = context.device_extra_latency_ns.load(Ordering::Relaxed);
+        if device_extra_latency_ns != context.last_device_extra_latency_ns {
+            // 補正項が変わった(iOS/tvOS: `IosOutputLatencyWatcher` が別スレッドで
+            // ルート変化を検知し、書き換えた)。新しい相関点(このすぐ下の
+            // `compute_timestamps`)が確定する前に世代を進める——`MusicClockPublisher::
+            // bump_generation` のドキュメント「新しい相関点が確定する前に世代を進める」と
+            // 同じ順序(`Mixer::render` 内部が discontinuity を処理する順序とも揃える)。
+            // 閾値は設けていない: この値は `IosOutputLatencyWatcher` が実際にルート変化を
+            // 検知して読み直した結果だけが書き込む(毎コールバック揺れる値ではない)ため、
+            // 変化がどれだけ小さくても、それを同じ世代のまま跨いで外挿すると
+            // `MusicClockSnapshot` の契約違反になる(`CallbackContext::
+            // last_device_extra_latency_ns` のドキュメント参照)。
+            context.music_clock.bump_generation();
+            context.last_device_extra_latency_ns = device_extra_latency_ns;
+        }
+
         let (buffer_start_host_time_ns, output_latency_ns) = compute_timestamps(
             callback_host_time_ns,
-            context.device_extra_latency_ns.load(Ordering::Relaxed),
+            device_extra_latency_ns,
             in_number_frames,
             context.sample_rate,
         );
@@ -685,9 +725,11 @@ unsafe extern "C" fn render_proc(
             context.sample_rate,
         );
 
-        // 音声スレッド上で呼ぶのは `Renderer::render` のみに保つ(`mw-backend/CLAUDE.md`
-        // の設計意図。上の数行は CoreAudio が渡した構造体を読んでアトミックストアする
-        // だけで、mw-core の別関数を追加で呼んではいない)。
+        // 音声スレッド上で呼ぶ mw-core 側の経路は `Renderer::render` と、直前の
+        // `MusicClockPublisher::bump_generation`(呼ぶのはこのコールバック自身、つまり
+        // 音声スレッドからのみ)に限る(`mw-backend/CLAUDE.md` の設計意図)。
+        // いずれもロック・アロケーションを伴わない atomic ストアのみで、
+        // リアルタイム安全性規約(§5.3)に抵触しない。
         context.renderer.render(output, buffer_start_host_time_ns);
 
         context.render_completions.fetch_add(1, Ordering::Release);
@@ -833,6 +875,12 @@ impl Backend for AppleBackend {
             return Err(BackendError::NoSupportedStreamConfig);
         }
 
+        // `renderer` をムーブする**前に**音楽クロックの発行ハンドルを取る
+        // (`Mixer::music_clock_handle` のドキュメント「ムーブする前に取ること」どおり。
+        // `se_schedule_overflow_counter` を mw-ffi 側が同じ理由で先取りしているのと同じ
+        // パターン)。
+        let music_clock = renderer.music_clock_handle();
+
         let context = Box::new(CallbackContext {
             renderer,
             sample_rate: sample_rate as u32,
@@ -840,6 +888,12 @@ impl Backend for AppleBackend {
             // `self.device_extra_latency_ns` と同じ `Arc` なので、以後の書き込みは
             // この `context_ptr` を経由しない(`self` 側の `Arc` へ直接 `store` する)。
             device_extra_latency_ns: Arc::clone(&self.device_extra_latency_ns),
+            // 実際の初期値は `device_extra_latency_ns` と同じタイミングでは確定できない
+            // (後述の算出は `AudioUnitInitialize` の後にしか行えない。macOS の
+            // `query_device_extra_latency_frames` のドキュメント参照)——いったん 0 で置き、
+            // 確定した直後に `context_ptr` 経由で書き直す(下記)。
+            last_device_extra_latency_ns: 0,
+            music_clock,
             underrun_tracker: OutputUnderrunTracker::new(
                 Arc::clone(&self.output_underrun_count),
                 Arc::clone(&self.last_output_underrun_host_time_ns),
@@ -908,10 +962,34 @@ impl Backend for AppleBackend {
         let device_extra_latency_ns = query_ios_output_latency_ns();
         self.device_extra_latency_ns
             .store(device_extra_latency_ns, Ordering::Relaxed);
+        // SAFETY: `AudioOutputUnitStart` を呼ぶ前なので、レンダーコールバックは一度も
+        // 起動していない(直後の SAFETY コメントと同じ前提)——`context_ptr` はまだ
+        // この関数が排他的に所有している。ここで書くのは `render_proc` が最初の
+        // コールバックで比較する基準値(`CallbackContext::last_device_extra_latency_ns`
+        // のドキュメント参照)。0 のまま残すと、ルート変化が一度も起きていなくても
+        // 最初のコールバックで「補正項が変わった」と誤検知し、無意味な世代の繰り上げが
+        // 1回起きてしまう。
+        unsafe {
+            (*context_ptr).last_device_extra_latency_ns = device_extra_latency_ns;
+        }
+
+        // レビュー【低】の修正: ルート変化監視(iOS/tvOS)は `AudioOutputUnitStart` より
+        // **前**に組み立てる——レンダーコールバックが実際に動き出す前に監視を始めることで、
+        // 「Start した直後、監視がまだ無い間にルート変化が来て取り逃す」窓を塞ぐ
+        // (macOS では `IosOutputLatencyWatcher::new` 自体が no-op なのでコストは無い)。
+        // `close()` は依然これを一番最初に止める(逆順で対称)。
+        self.ios_output_latency_watcher = Some(IosOutputLatencyWatcher::new(Arc::clone(
+            &self.device_extra_latency_ns,
+        )));
 
         // SAFETY: `unit` は初期化済み。
         let status = unsafe { AudioOutputUnitStart(unit) };
         if status != NO_ERR {
+            // 直前に組み立てた監視を手放す——`open()` 自体が失敗して返るため、
+            // `self.unit`/`self.context_ptr` は `None` のままで `is_open()` も
+            // `false` のままになる(= 開いていない状態の一部として監視も無い状態に
+            // 揃える)。
+            self.ios_output_latency_watcher = None;
             // SAFETY: `AudioUnitInitialize` は成功したが `AudioOutputUnitStart` が
             // 失敗したため、レンダーコールバックは一度も呼ばれていない
             // (`context_ptr` はまだ排他的にこの関数が所有している)。
@@ -934,14 +1012,6 @@ impl Backend for AppleBackend {
             CHANNELS,
             device_extra_latency_ns as f64 / 1_000_000.0,
         );
-
-        // iOS/tvOS: ルート変化のたびに補正項を最新化する(モジュール doc「タイムスタンプの
-        // 扱い」、HANDOFF 0f の統合)。macOS では no-op(`IosOutputLatencyWatcher::new`
-        // のドキュメント参照)。ストリーム始動後に作る——`close()` が逆順(先に破棄)で
-        // 対称になるようにする。
-        self.ios_output_latency_watcher = Some(IosOutputLatencyWatcher::new(Arc::clone(
-            &self.device_extra_latency_ns,
-        )));
 
         self.unit = Some(unit);
         self.context_ptr = Some(context_ptr);
@@ -1417,12 +1487,14 @@ mod tests {
 
     /// テスト専用: `render_proc` を直接呼ぶための最小の `CallbackContext`。
     fn test_callback_context(sample_rate: u32) -> *mut CallbackContext {
-        let (renderer, _sender, _reclaim, _music_producer, _music_clock, _events, _bgm) =
+        let (renderer, _sender, _reclaim, _music_producer, music_clock, _events, _bgm) =
             mw_core::Renderer::build(mw_core::Config::default(), sample_rate);
         Box::into_raw(Box::new(CallbackContext {
             renderer,
             sample_rate,
             device_extra_latency_ns: Arc::new(AtomicU64::new(0)),
+            last_device_extra_latency_ns: 0,
+            music_clock,
             underrun_tracker: OutputUnderrunTracker::new(
                 Arc::new(AtomicU64::new(0)),
                 Arc::new(AtomicU64::new(0)),
@@ -1540,6 +1612,130 @@ mod tests {
         );
         let context = unsafe { &*context_ptr };
         assert_eq!(context.callback_frames.load(Ordering::Relaxed), 4);
+
+        drop(unsafe { Box::from_raw(context_ptr) });
+    }
+
+    /// レビュー【高】の再現: `device_extra_latency_ns`(補正項)が書き換わっても、
+    /// `render_proc` は現状これを検知せず、`MusicClockPublisher` の世代(generation)が
+    /// 進まないまま次のコールバックで `host_time_ns` だけが飛ぶ。これは `clock.rs::
+    /// MusicClockSnapshot` の契約(「世代を跨いだ外挿をしてはならない」)に反する——
+    /// iOS/tvOS では `IosOutputLatencyWatcher` がルート変化のたびにこの値を書き換える
+    /// (`AppleBackend::open` のドキュメント参照)。
+    #[test]
+    fn render_proc_bumps_music_clock_generation_when_the_latency_correction_changes() {
+        let context_ptr = test_callback_context(48_000);
+
+        let mut buffer = [0.0f32; 8]; // 4 frames * 2ch
+        let mut buffer_list = AudioBufferList {
+            number_buffers: 1,
+            buffers: [AudioBuffer {
+                number_channels: 2,
+                data_byte_size: (buffer.len() * std::mem::size_of::<f32>()) as u32,
+                data: buffer.as_mut_ptr().cast(),
+            }],
+        };
+        let time_stamp = dummy_time_stamp(1_000);
+
+        let status = unsafe {
+            render_proc(
+                context_ptr.cast(),
+                std::ptr::null_mut(),
+                &time_stamp,
+                0,
+                4,
+                &mut buffer_list,
+            )
+        };
+        assert_eq!(status, NO_ERR);
+
+        let generation_before = unsafe { (*context_ptr).renderer.music_clock_handle() }
+            .snapshot()
+            .generation;
+
+        // ルート変化を模す: 監視スレッド(`IosOutputLatencyWatcher`)が補正項を書き換える
+        // 想定の再現。ここでは `render_proc` を直接呼ぶテストなので、同じスレッドから
+        // store するだけで「検知すべき変化」自体は忠実に再現できる(検知ロジックは
+        // この値を読むだけで、どのスレッドが書いたかを区別しない)。
+        unsafe {
+            (*context_ptr)
+                .device_extra_latency_ns
+                .store(80_000_000, Ordering::Relaxed) // 80ms(例: A2DP への切替)
+        };
+
+        let status = unsafe {
+            render_proc(
+                context_ptr.cast(),
+                std::ptr::null_mut(),
+                &time_stamp,
+                0,
+                4,
+                &mut buffer_list,
+            )
+        };
+        assert_eq!(status, NO_ERR);
+
+        let generation_after = unsafe { (*context_ptr).renderer.music_clock_handle() }
+            .snapshot()
+            .generation;
+
+        assert_ne!(
+            generation_before, generation_after,
+            "補正項が変わったのに世代が進んでいない(MusicClockSnapshot の契約違反)"
+        );
+
+        drop(unsafe { Box::from_raw(context_ptr) });
+    }
+
+    /// 上のテストと対になる固定化: 補正項が**変わらない**限り、世代は進まないはず
+    /// (`AppleBackend::open` が最初のコールバックより前に `last_device_extra_latency_ns`
+    /// を実際の初期値で埋めておく修正の固定化——ここを 0 のまま放置すると、ルート変化が
+    /// 一度も起きていない macOS/通常運用でも最初のコールバックで無意味な世代の繰り上げが
+    /// 起きてしまう)。複数回のコールバックをまたいでも成り立つことを確認する。
+    #[test]
+    fn render_proc_does_not_bump_music_clock_generation_when_the_latency_correction_is_unchanged() {
+        let context_ptr = test_callback_context(48_000);
+        // `test_callback_context` と同じ初期値(0)で明示的に揃えておく——以後一度も
+        // 書き換えない。
+        unsafe {
+            (*context_ptr)
+                .device_extra_latency_ns
+                .store(0, Ordering::Relaxed);
+            (*context_ptr).last_device_extra_latency_ns = 0;
+        }
+
+        let mut buffer = [0.0f32; 8]; // 4 frames * 2ch
+        let mut buffer_list = AudioBufferList {
+            number_buffers: 1,
+            buffers: [AudioBuffer {
+                number_channels: 2,
+                data_byte_size: (buffer.len() * std::mem::size_of::<f32>()) as u32,
+                data: buffer.as_mut_ptr().cast(),
+            }],
+        };
+        let time_stamp = dummy_time_stamp(1_000);
+
+        for _ in 0..3 {
+            let status = unsafe {
+                render_proc(
+                    context_ptr.cast(),
+                    std::ptr::null_mut(),
+                    &time_stamp,
+                    0,
+                    4,
+                    &mut buffer_list,
+                )
+            };
+            assert_eq!(status, NO_ERR);
+        }
+
+        let generation = unsafe { (*context_ptr).renderer.music_clock_handle() }
+            .snapshot()
+            .generation;
+        assert_eq!(
+            generation, 0,
+            "補正項が一度も変わっていないのに世代が進んでいる(誤検知)"
+        );
 
         drop(unsafe { Box::from_raw(context_ptr) });
     }
