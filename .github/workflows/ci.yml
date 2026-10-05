@@ -136,7 +136,7 @@ jobs:
           key: miri
 
       - name: Cache the Miri sysroot
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/miri
           key: miri-sysroot-${{ runner.os }}-${{ hashFiles('Makefile') }}
