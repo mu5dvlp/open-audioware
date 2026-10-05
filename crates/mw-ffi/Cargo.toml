@@ -21,8 +21,9 @@ csbindgen = "1.9"
 # AUDIOWARE-DEPS-PLAN.md ステップ4-0: バックエンドの切替点(`src/handle.rs::make_backend`)
 # を feature で選べるようにする。`backend-cpal`(既定 ON)は今まで通り cpal を使う。
 # `backend-native` はステップ4-1〜4-3(macOS/iOS 自前 AudioUnit, Android 自前 AAudio)で
-# 実装する自前バックエンドの受け皿で、現時点では未実装(`make_backend` がコンパイル
-# エラーにする——既定ビルド〔backend-cpal〕には影響しない)。
+# 実装する自前バックエンドの受け皿。ステップ4-1(2026-10-05)で macOS だけ実装済みになった
+# (`mw_backend::NativeBackend` = AUHAL 直叩き)。iOS/Android で選ぶと `make_backend` が
+# 引き続きコンパイルエラーにする——既定ビルド〔backend-cpal〕には影響しない。
 [features]
 default = ["backend-cpal"]
 backend-cpal = []

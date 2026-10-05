@@ -102,6 +102,24 @@
   `CpalBackend::log_new_output_underruns`(ゲームスレッド専用、`log_output_latency_once`
   と同じ配線)が新規検知分だけ日和見的にログへ出す。
 
+- `native_backend::apple::AppleBackend`(AUDIOWARE-DEPS-PLAN.md ステップ4-1、macOS のみ)—
+  macOS の既定出力デバイスへ AudioUnit(AUHAL、`kAudioUnitSubType_DefaultOutput`)で
+  直接出力する `Backend` 実装。新しい外部クレートは追加していない——AudioToolbox
+  フレームワークの C API を自前の `extern "C"` 宣言で直接叩く(`objc2-audio-toolbox` 等は
+  使わない。それらは `objc2`/`objc2-foundation` を引き込むため依存排除の到達点に反する)。
+  手順は `AudioComponentFindNext` → `AudioComponentInstanceNew` →
+  `AudioUnitSetProperty`(StreamFormat / SetRenderCallback)→ `AudioUnitInitialize` →
+  `AudioOutputUnitStart`。タイムスタンプは `AudioTimeStamp.mHostTime` を
+  `host_time::mach_ticks_to_ns`(cpal 版の `host_time_ns` と同じ式)で ns 化し、
+  `compute_timestamps`(`apple.rs`)でバッファ長 + `kAudioUnitProperty_Latency` を
+  加えたものを `Renderer::render` の `buffer_start_host_time_ns` として渡す。
+  `OutputUnderrunTracker` は cpal 版と共用。**既知の差分**: デバイス切断・既定出力の
+  変更を監視する `AudioObjectPropertyListener` は未実装のため、`Backend::open` が
+  受け取る `events` は使わず `StreamError` イベントは発行しない(macOS Editor 専用の
+  開発機バックエンドという 4-1 の前提で許容——4-2 で `ios_interruption` 統合に合わせて
+  再検討する)。`mw-ffi` の切替口(`handle.rs::make_backend`)が `backend-native` feature
+  (macOS のみ)で選ぶ。既定の `backend-cpal` では選ばれない。
+
 ## 設計意図
 
 - 初期構築仕様 M6(【仮】): 立ち上げは cpal で macOS Editor / iOS / Android を1系統に揃える。

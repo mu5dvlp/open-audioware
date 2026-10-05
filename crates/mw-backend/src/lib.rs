@@ -11,9 +11,12 @@ pub mod cpal_backend;
 pub mod host_time;
 pub mod ios_interruption;
 pub mod ios_session;
+pub mod native_backend;
 pub mod platform_log;
 pub mod underrun;
 
 pub use backend::{Backend, BackendError};
 pub use cpal_backend::CpalBackend;
 pub use host_time::host_time_ns;
+#[cfg(target_os = "macos")]
+pub use native_backend::NativeBackend;

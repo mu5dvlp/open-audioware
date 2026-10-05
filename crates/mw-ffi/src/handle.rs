@@ -23,7 +23,15 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
-use mw_backend::{Backend, BackendError, CpalBackend};
+#[cfg(feature = "backend-cpal")]
+use mw_backend::CpalBackend;
+#[cfg(all(
+    not(feature = "backend-cpal"),
+    feature = "backend-native",
+    target_os = "macos"
+))]
+use mw_backend::NativeBackend;
+use mw_backend::{Backend, BackendError};
 use mw_core::{
     BUS_COUNT, BgmStatePublisher, BusId, Command, CommandSender, Config, EventQueue,
     MusicClockPublisher, MusicClockSnapshot, MusicDecoder, MusicState, ReclaimReceiver, Renderer,
@@ -1298,14 +1306,22 @@ pub fn with_instance<T>(handle: u64, f: impl FnOnce(&Instance) -> T) -> Option<T
 /// 🔴 **AUDIOWARE-DEPS-PLAN.md ステップ4-0 の切替点。** バックエンドの選択をここ1箇所に
 /// 集約してあるので、ステップ4-1〜4-3 で自前バックエンド(`backend-native` feature)を
 /// 実装したあとも、`backend-cpal` feature を有効にするだけで即座に cpal 実装へ
-/// 切り戻せる(段階ごとに壊していないことを確かめるための退路)。`backend-native` は
-/// 現時点では未実装の「口だけ」——選んだ場合はコンパイルエラーになる(既定ビルドには
-/// 影響しない)。
+/// 切り戻せる(段階ごとに壊していないことを確かめるための退路)。
+///
+/// 🔴 **ステップ4-1(2026-10-05)で macOS だけ `backend-native` が実装済みになった**
+/// (`mw_backend::NativeBackend` = `native_backend::apple::AppleBackend`、AUHAL を
+/// 自前の `extern "C"` 宣言で直接叩く)。iOS/Android(4-2/4-3)はまだ「口だけ」——
+/// macOS 以外で `backend-native` を選んだ場合は引き続きコンパイルエラーになる
+/// (既定ビルド〔`backend-cpal`〕には影響しない)。
 ///
 /// 🔴 テストビルドでのみ、テストダブルを差し込めるようにしてある —— CI にもこの環境にも
-/// 実デバイスが無く、`CpalBackend::open()` が必ず失敗するため、再オープンの段2・段3
-/// (`run_reopen_worker` / `finalize_reopen_success` / `teardown_orphaned_reopen`)へ
-/// 実際に到達させる手段が他に無い(`crates/mw-ffi/src/test_backend.rs` 参照)。
+/// 実デバイスが無く、`CpalBackend::open()`/`NativeBackend::open()` が必ず失敗するため、
+/// 再オープンの段2・段3(`run_reopen_worker` / `finalize_reopen_success` /
+/// `teardown_orphaned_reopen`)へ実際に到達させる手段が他に無い
+/// (`crates/mw-ffi/src/test_backend.rs` 参照)。**実デバイスが実在する手元の macOS では
+/// 既存の `backend-cpal` と同じく、ファクトリ未設定時は本物の `NativeBackend` が
+/// 実際に鳴る**(`init_se_lifecycle_then_shutdown_or_gracefully_reports_no_device` が
+/// `backend-cpal` で既にそうしているのと同じ前提)。
 #[cfg(all(not(test), feature = "backend-cpal"))]
 fn make_backend() -> Box<dyn Backend + Send> {
     Box::new(CpalBackend::new())
@@ -1316,23 +1332,51 @@ fn make_backend() -> Box<dyn Backend + Send> {
     crate::test_backend::take_from_factory().unwrap_or_else(|| Box::new(CpalBackend::new()))
 }
 
-// `backend-native` だけが有効(`backend-cpal` 無効)なビルドの受け皿。
+// `backend-native` だけが有効(`backend-cpal` 無効)な macOS ビルド(ステップ4-1)。
+#[cfg(all(
+    not(test),
+    not(feature = "backend-cpal"),
+    feature = "backend-native",
+    target_os = "macos"
+))]
+fn make_backend() -> Box<dyn Backend + Send> {
+    Box::new(NativeBackend::new())
+}
+
+#[cfg(all(
+    test,
+    not(feature = "backend-cpal"),
+    feature = "backend-native",
+    target_os = "macos"
+))]
+fn make_backend() -> Box<dyn Backend + Send> {
+    crate::test_backend::take_from_factory().unwrap_or_else(|| Box::new(NativeBackend::new()))
+}
+
+// `backend-native` だけが有効(`backend-cpal` 無効)な macOS 以外のビルドの受け皿。
 //
-// AUDIOWARE-DEPS-PLAN.md ステップ4-1〜4-3(macOS/iOS 自前 AudioUnit・Android 自前
-// AAudio)がまだ実装されていないため、選んだ時点で明確にコンパイルを止める
-// (実行時に初めて失敗する「黙って cpal にフォールバック」はしない)。
-// `compile_error!` を独立した item として発行し、`unreachable!()`(型は `!`、どの戻り型
-// にも合致する)で関数の型だけ合わせておくことで、本質と無関係な型不一致エラーが
-// 道連れで出るのを避けている。
-#[cfg(all(not(feature = "backend-cpal"), feature = "backend-native"))]
+// AUDIOWARE-DEPS-PLAN.md ステップ4-2〜4-3(iOS 自前 AudioUnit・Android 自前 AAudio)が
+// まだ実装されていないため、選んだ時点で明確にコンパイルを止める(実行時に初めて
+// 失敗する「黙って cpal にフォールバック」はしない)。`compile_error!` を独立した item
+// として発行し、`unreachable!()`(型は `!`、どの戻り型にも合致する)で関数の型だけ
+// 合わせておくことで、本質と無関係な型不一致エラーが道連れで出るのを避けている。
+#[cfg(all(
+    not(feature = "backend-cpal"),
+    feature = "backend-native",
+    not(target_os = "macos")
+))]
 compile_error!(
-    "backend-native はまだ実装されていない(AUDIOWARE-DEPS-PLAN.md ステップ4-1〜4-3 未着手)。\
-     backend-cpal を有効にしてビルドすること"
+    "backend-native は macOS のみ実装済み(AUDIOWARE-DEPS-PLAN.md ステップ4-2〜4-3: \
+     iOS/Android は未着手)。iOS/Android では backend-cpal を有効にしてビルドすること"
 );
 
-#[cfg(all(not(feature = "backend-cpal"), feature = "backend-native"))]
+#[cfg(all(
+    not(feature = "backend-cpal"),
+    feature = "backend-native",
+    not(target_os = "macos")
+))]
 fn make_backend() -> Box<dyn Backend + Send> {
-    unreachable!("backend-native はまだ実装されていない")
+    unreachable!("backend-native は macOS 以外ではまだ実装されていない")
 }
 
 // backend-cpal / backend-native のどちらも無効なビルド(cargo build --no-default-features)

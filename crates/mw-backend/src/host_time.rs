@@ -57,6 +57,45 @@ unsafe extern "C" {
     fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
 }
 
+/// `mach_timebase_info` の numer/denom を使って raw tick 数を ns へ変換する純関数部分
+/// (`denom == 0` は呼び出し側〔`mach_ticks_to_ns`〕が失敗として raw tick を返す規約で、
+/// ここでは防御的に同じ扱いにしておく)。
+///
+/// FFI(`mach_timebase_info` の実際のシステムコール)から分離してあるので、
+/// 実機・ハードウェア無しでも計算式だけを固定できる(下の `tests` 参照)。
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+fn ticks_to_ns_with_timebase(ticks: u64, numer: u32, denom: u32) -> u64 {
+    if denom == 0 {
+        return ticks;
+    }
+    (ticks as u128 * numer as u128 / denom as u128) as u64
+}
+
+/// Mach の tick 値(`mach_absolute_time()` の戻り値、または `AudioTimeStamp::mHostTime`
+/// のような同じ時計源の値)を ns へ変換する。
+///
+/// [`host_time_ns`] 自身もこれに委譲する。`native_backend::apple` のレンダーコールバックが
+/// `AudioTimeStamp.mHostTime` を同じ式で ns 化するためにも使う(cpal 0.18.2 の
+/// `host_time_to_stream_instant` と同じ式。モジュール doc 参照)——`OutputCallbackInfo` の
+/// デバイスタイムスタンプと直接比較可能な ns 値を得るには、どちらも同じ変換式を通す必要がある。
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+pub(crate) fn mach_ticks_to_ns(ticks: u64) -> u64 {
+    // SAFETY: スタック上のローカル変数への有効なポインタを渡すだけの単純な問い合わせ。
+    // エラー時も未初期化メモリを読まない(`mach_timebase_info` が失敗した場合は
+    // `ticks_to_ns_with_timebase` 側の `denom == 0` 相当のチェックで弾く)。
+    unsafe {
+        let mut info = MachTimebaseInfo::default();
+        let status = mach_timebase_info(&mut info);
+        if status != KERN_SUCCESS {
+            // 失敗しても致命傷にはしない(§4.8 の思想と同じ)。実機の CoreAudio では
+            // まず失敗しない経路(cpal 自身もこれを事実上想定していない)だが、
+            // 保険として raw tick をそのまま返す(単調性だけは保たれる)。
+            return ticks;
+        }
+        ticks_to_ns_with_timebase(ticks, info.numer, info.denom)
+    }
+}
+
 /// ホスト単調時刻をナノ秒で返す。
 ///
 /// リアルタイム安全: アロケーション・ロックを一切行わない(単純なシステムコール
@@ -69,21 +108,8 @@ pub fn host_time_ns() -> u64 {
     // 完全に同じ式(mach_absolute_time の raw tick 数 × timebase の numer/denom → ns)。
     // 同じ式で読む以上、`OutputCallbackInfo::timestamp()` が返す `StreamInstant` と
     // 単位・原点・レートのいずれもずれようがない。
-    // SAFETY: どちらも Mach カーネルへの単純な問い合わせで、引数はスタック上のローカル
-    // 変数への有効なポインタのみ。エラー時も未初期化メモリを読まない
-    // (`mach_timebase_info` が失敗した場合は下の `KERN_SUCCESS` チェックで弾く)。
-    unsafe {
-        let ticks = mach_absolute_time();
-        let mut info = MachTimebaseInfo::default();
-        let status = mach_timebase_info(&mut info);
-        if status != KERN_SUCCESS || info.denom == 0 {
-            // 失敗しても致命傷にはしない(§4.8 の思想と同じ)。実機の CoreAudio では
-            // まず失敗しない経路(cpal 自身もこれを事実上想定していない)だが、
-            // 保険として raw tick をそのまま返す(単調性だけは保たれる)。
-            return ticks;
-        }
-        (ticks as u128 * info.numer as u128 / info.denom as u128) as u64
-    }
+    // SAFETY: 引数を取らない単純なシステムコール。
+    unsafe { mach_ticks_to_ns(mach_absolute_time()) }
 }
 
 /// POSIX `clock_gettime` が書き込む `timespec`(C ABI 互換の自前宣言、ステップ5-1)。
@@ -151,5 +177,22 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         let b = host_time_ns();
         assert!(b > a, "a={a}, b={b}");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+    #[test]
+    fn ticks_to_ns_with_timebase_scales_by_numer_over_denom() {
+        // Apple Silicon の実機値(numer=denom=1、tick がそのまま ns)。
+        assert_eq!(ticks_to_ns_with_timebase(1_000, 1, 1), 1_000);
+        // numer/denom = 1/2(tick がそのまま ns の半分)。
+        assert_eq!(ticks_to_ns_with_timebase(1_000, 1, 2), 500);
+        // 典型的な Intel Mac の値に近い比(numer/denom = 125/3)。
+        assert_eq!(ticks_to_ns_with_timebase(24, 125, 3), 1_000);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+    #[test]
+    fn ticks_to_ns_with_timebase_falls_back_to_raw_ticks_when_denom_is_zero() {
+        assert_eq!(ticks_to_ns_with_timebase(12_345, 7, 0), 12_345);
     }
 }
