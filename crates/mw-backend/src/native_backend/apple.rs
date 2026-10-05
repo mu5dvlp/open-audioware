@@ -1,7 +1,7 @@
 //! macOS 用の自前 AudioUnit(AUHAL)バックエンド(AUDIOWARE-DEPS-PLAN.md ステップ4-1)。
 //!
-//! **新しい外部クレートは追加していない。** AudioToolbox フレームワークの C API を
-//! 自前の `extern "C"` 宣言(下の「AudioToolbox の FFI 宣言」節)で直接呼ぶ——
+//! **新しい外部クレートは追加していない。** AudioToolbox / CoreAudio フレームワークの
+//! C API を自前の `extern "C"` 宣言(下の「AudioToolbox の FFI 宣言」節)で直接呼ぶ——
 //! `objc2-audio-toolbox` 等は使わない(計画書 §4 の決定どおり。それらは `objc2`/
 //! `objc2-foundation` を引き込むため、依存排除の到達点〔表記ゼロ〕に反する)。
 //!
@@ -129,6 +129,16 @@ struct AudioBufferList {
     buffers: [AudioBuffer; 1],
 }
 
+/// `AudioObjectPropertyAddress`(`AudioHardwareBase.h`、CoreAudio フレームワーク)。
+/// [`AudioObjectGetPropertyData`] でデバイス側のプロパティ(出力遅延の見積もり、
+/// [`query_device_extra_latency_frames`] 参照)を読むためだけに使う。
+#[repr(C)]
+struct AudioObjectPropertyAddress {
+    selector: u32,
+    scope: u32,
+    element: u32,
+}
+
 /// `AURenderCallback`(`AUComponent.h`)。戻り値は `OSStatus`。
 type AURenderCallback = unsafe extern "C" fn(
     *mut c_void,
@@ -155,8 +165,11 @@ const AUDIO_UNIT_SCOPE_INPUT: u32 = 1;
 const AUDIO_UNIT_SCOPE_OUTPUT: u32 = 2;
 
 const AUDIO_UNIT_PROPERTY_STREAM_FORMAT: u32 = 8;
-const AUDIO_UNIT_PROPERTY_LATENCY: u32 = 12;
 const AUDIO_UNIT_PROPERTY_SET_RENDER_CALLBACK: u32 = 23;
+/// `kAudioOutputUnitProperty_CurrentDevice`(`AudioUnitProperties.h`)。この AUHAL が
+/// 実際に使っている `AudioDeviceID`(スコープ Global、値型 `AudioObjectID`)を読む——
+/// [`query_device_extra_latency_frames`] がデバイス側のプロパティを読むために使う。
+const AUDIO_OUTPUT_UNIT_PROPERTY_CURRENT_DEVICE: u32 = 2000;
 
 const AUDIO_FORMAT_LINEAR_PCM: u32 = 0x6c70_636d; // 'lpcm'
 const AUDIO_FORMAT_FLAG_IS_FLOAT: u32 = 1 << 0;
@@ -164,6 +177,15 @@ const AUDIO_FORMAT_FLAG_IS_PACKED: u32 = 1 << 3;
 
 /// `<MacTypes.h>` の `noErr`。
 const NO_ERR: i32 = 0;
+
+// `AudioObjectGetPropertyData` で読むデバイス側のプロパティ(`AudioHardwareBase.h`、
+// CoreAudio フレームワーク)。cpal 0.18.1 の `get_device_extra_latency_frames`
+// (`cpal::host::coreaudio::macos::device`)が読んでいるのと同じ2つ——
+// [`query_device_extra_latency_frames`] のドキュメント参照。
+const AUDIO_DEVICE_PROPERTY_LATENCY: u32 = 0x6c74_6e63; // 'ltnc'
+const AUDIO_DEVICE_PROPERTY_SAFETY_OFFSET: u32 = 0x7361_6674; // 'saft'
+const AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT: u32 = 0x6f75_7470; // 'outp'
+const AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN: u32 = 0;
 
 #[allow(non_snake_case)] // シンボル名は AudioToolbox の実際の C API 名そのまま
 #[link(name = "AudioToolbox", kind = "framework")]
@@ -203,6 +225,22 @@ unsafe extern "C" {
     fn AudioOutputUnitStop(ci: AudioUnit) -> i32;
 }
 
+// デバイス(`AudioObject`)側のプロパティを読むためだけの別フレームワーク
+// (`AudioObjectGetPropertyData` は CoreAudio.framework が export する——AudioToolbox
+// ではない。`nm` で確認済み)。
+#[allow(non_snake_case)]
+#[link(name = "CoreAudio", kind = "framework")]
+unsafe extern "C" {
+    fn AudioObjectGetPropertyData(
+        in_object_id: u32,
+        in_address: *const AudioObjectPropertyAddress,
+        in_qualifier_data_size: u32,
+        in_qualifier_data: *const c_void,
+        io_data_size: *mut u32,
+        out_data: *mut c_void,
+    ) -> i32;
+}
+
 // ============================================================================
 // 純関数部分(ハードウェア無しで単体テストできる)
 // ============================================================================
@@ -233,10 +271,25 @@ fn stereo_f32_asbd(sample_rate: f64) -> AudioStreamBasicDescription {
 }
 
 /// レンダーコールバックが受け取った `AudioBuffer` へ安全に書き込める要素数(f32 の個数)を
-/// 返す。null ポインタ・サイズ不足はいずれも `None`(呼び出し側は書き込みをスキップし、
-/// 音声スレッドを絶対にパニックさせない。§4.8 の思想)。
-fn validated_sample_count(frames: u32, data_is_null: bool, data_byte_size: u32) -> Option<usize> {
-    if data_is_null {
+/// 返す。null ポインタ・サイズ不足・0 フレーム・非アラインポインタはいずれも `None`
+/// (呼び出し側は書き込みをスキップし、音声スレッドを絶対にパニックさせない。§4.8 の思想)。
+///
+/// `data` はポインタそのものを受け取る(値は読まない——アドレス値の null/アラインメント
+/// チェックのみに使う。安全性は呼び出し側〔`render_proc`〕が呼ぶまで保たれる)。
+///
+/// 0 フレームは `data` の値を一切見ずに早期 `None` にする——書き込むものが無い以上、
+/// 後続の `slice::from_raw_parts_mut`(ゼロ長でも非 null・アラインメント済みを要求する)
+/// へその条件を満たしているか確認する必要すら無い。非 0 フレームでは、CoreAudio が通常
+/// 16byte 境界に揃えて渡す前提はあるものの、契約違反(ダングリング・非アラインポインタ)を
+/// 機械的にも弾いておく。
+fn validated_sample_count(frames: u32, data: *mut c_void, data_byte_size: u32) -> Option<usize> {
+    if frames == 0 {
+        return None;
+    }
+    if data.is_null() {
+        return None;
+    }
+    if !(data as usize).is_multiple_of(std::mem::align_of::<f32>()) {
         return None;
     }
     let samples = (frames as usize).checked_mul(CHANNELS)?;
@@ -256,14 +309,16 @@ fn validated_sample_count(frames: u32, data_is_null: bool, data_byte_size: u32) 
 /// デバイスの実バッファ長 + 追加レイテンシから見積もっている。AUHAL の
 /// `AURenderCallback` は `mHostTime` をコールバック起動の基準時刻として渡してくるだけで
 /// 予測出力時刻そのものは返さないため、ここでは **(1) このバッファの再生に要る時間
-/// (`frames / sample_rate`)+ (2) `AudioUnit` 自身が申告する処理レイテンシ
-/// (`kAudioUnitProperty_Latency` を `open()` 時に1度だけ読んだ `unit_latency_ns`)**
+/// (`frames / sample_rate`)+ (2) デバイス側が申告する追加レイテンシ
+/// (`open()` 時に1度だけ [`query_device_extra_latency_frames`] で読んだ
+/// `device_extra_latency_ns`。cpal 0.18.1 の `get_device_extra_latency_frames` が読む
+/// のと同じ `kAudioDevicePropertyLatency` + `kAudioDevicePropertySafetyOffset` の合計)**
 /// を足したものを予測出力時刻として扱う——cpal が「デバイスの実バッファ長を取れない
 /// ときはこのコールバックのフレーム数へフォールバックする」のと同じ考え方
 /// (`cpal_backend.rs::build_output_stream` のコメント参照)。
 fn compute_timestamps(
     callback_host_time_ns: u64,
-    unit_latency_ns: u64,
+    device_extra_latency_ns: u64,
     frames: u32,
     sample_rate: u32,
 ) -> (u64, u64) {
@@ -272,9 +327,20 @@ fn compute_timestamps(
     } else {
         0
     };
-    let output_latency_ns = unit_latency_ns.saturating_add(buffer_duration_ns);
+    let output_latency_ns = device_extra_latency_ns.saturating_add(buffer_duration_ns);
     let buffer_start_host_time_ns = callback_host_time_ns.saturating_add(output_latency_ns);
     (buffer_start_host_time_ns, output_latency_ns)
+}
+
+/// frame 数を ns へ変換する(cpal 0.18.1 `host::frames_to_duration` と同じ式——
+/// 分母が立たない場合〔`sample_rate == 0`〕は 0 を返すのも含めて一致させてある)。
+/// 純関数——ハードウェア不要で単体テストできる。[`query_device_extra_latency_frames`]
+/// が返す frame 数を ns 化するために使う。
+fn extra_latency_frames_to_ns(frames: u32, sample_rate: u32) -> u64 {
+    if sample_rate == 0 {
+        return 0;
+    }
+    (frames as u64 * 1_000_000_000) / sample_rate as u64
 }
 
 // ============================================================================
@@ -310,29 +376,82 @@ fn query_output_sample_rate(unit: AudioUnit) -> f64 {
     }
 }
 
-/// `kAudioUnitProperty_Latency`(秒)を読んで ns へ変換する。取得できなければ 0
-/// (`compute_timestamps` はこれを「申告なし」として扱い、バッファ長ぶんの見積もりだけ
-/// 使う)。**`AudioUnitInitialize` の後**に呼ぶこと(この値は初期化済みのユニットの
-/// 処理レイテンシを表すプロパティ)。
-fn query_unit_latency_ns(unit: AudioUnit) -> u64 {
-    let mut latency_seconds: f64 = 0.0;
-    let mut size = std::mem::size_of::<f64>() as u32;
-    // SAFETY: `unit` は呼び出し元が初期化済みの有効なインスタンス。
+/// AUHAL が実際に使っている `AudioDeviceID`(`kAudioOutputUnitProperty_CurrentDevice`、
+/// スコープ Global)を読む。取得できなければ `None`
+/// ([`query_device_extra_latency_frames`] はこれを「申告なし」として extra latency を
+/// 0 にする)。
+fn query_current_device_id(unit: AudioUnit) -> Option<u32> {
+    let mut device_id: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    // SAFETY: `unit` は呼び出し元が生成した有効なインスタンス。`device_id`/`size` は
+    // スタック上の有効な書き込み先で、`size` は `device_id` の実サイズと一致する。
     let status = unsafe {
         AudioUnitGetProperty(
             unit,
-            AUDIO_UNIT_PROPERTY_LATENCY,
+            AUDIO_OUTPUT_UNIT_PROPERTY_CURRENT_DEVICE,
             AUDIO_UNIT_SCOPE_GLOBAL,
             0,
-            &mut latency_seconds as *mut f64 as *mut c_void,
+            &mut device_id as *mut _ as *mut c_void,
             &mut size,
         )
     };
-    if status == NO_ERR && latency_seconds.is_finite() && latency_seconds >= 0.0 {
-        (latency_seconds * 1_000_000_000.0) as u64
+    if status == NO_ERR {
+        Some(device_id)
     } else {
-        0
+        None
     }
+}
+
+/// `device_id` の device-level プロパティ(frame 数)を `AudioObjectGetPropertyData` で
+/// 読む。スコープは常に出力側(`AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT`)。取得できなければ
+/// 0(cpal 0.18.1 の `get_device_extra_latency_frames` が `.unwrap_or(0)` にしているのと
+/// 同じ扱い)。
+fn query_device_property_frames(device_id: u32, selector: u32) -> u32 {
+    let address = AudioObjectPropertyAddress {
+        selector,
+        scope: AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+        element: AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    };
+    let mut value: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    // SAFETY: `address`/`value`/`size` はスタック上の有効な値。`AudioObjectGetPropertyData`
+    // はこれらを読み書きするだけで、所有権の移動は無い。`size` は `value` の実サイズと
+    // 一致する。
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            device_id,
+            &address,
+            0,
+            std::ptr::null(),
+            &mut size,
+            &mut value as *mut _ as *mut c_void,
+        )
+    };
+    if status == NO_ERR { value } else { 0 }
+}
+
+/// cpal 0.18.1 の `get_device_extra_latency_frames`
+/// (`cpal::host::coreaudio::macos::device`、`~/.cargo/registry/src/*/cpal-0.18.1/
+/// src/host/coreaudio/macos/device.rs`)と**同じ2プロパティの合計**
+/// (`kAudioDevicePropertyLatency` + `kAudioDevicePropertySafetyOffset`、いずれも
+/// 出力側 = `kAudioObjectPropertyScopeOutput`)を返す。cpal はこれを AUHAL の
+/// `AudioUnitGetProperty` へ device-level のプロパティ ID のまま渡している(AUHAL が
+/// アドレス変換して実デバイスへ転送する挙動に乗っている)が、ここでは
+/// `kAudioOutputUnitProperty_CurrentDevice` で実デバイスの `AudioObjectID` を取り、
+/// それへ直接 `AudioObjectGetPropertyData` を呼ぶ——読む対象のプロパティは同じなので
+/// 値は一致するはずだが、AUHAL の転送という間接層を経由しない分、より素直に対応づけられる。
+///
+/// **`AudioUnitInitialize` の後**に呼ぶこと(`kAudioOutputUnitProperty_CurrentDevice` は
+/// 初期化前は未確定の場合がある)。取得できなければ 0(致命傷にしない。§4.8 の思想)。
+fn query_device_extra_latency_frames(unit: AudioUnit) -> u32 {
+    let Some(device_id) = query_current_device_id(unit) else {
+        return 0;
+    };
+    let device_latency_frames =
+        query_device_property_frames(device_id, AUDIO_DEVICE_PROPERTY_LATENCY);
+    let safety_offset_frames =
+        query_device_property_frames(device_id, AUDIO_DEVICE_PROPERTY_SAFETY_OFFSET);
+    device_latency_frames.saturating_add(safety_offset_frames)
 }
 
 // ============================================================================
@@ -347,9 +466,10 @@ struct CallbackContext {
     renderer: Renderer,
     /// オープン時に確定したサンプルレート(オープン中は変わらない)。
     sample_rate: u32,
-    /// `open()` が `AudioUnitInitialize` の直後に1度だけ読んだ
-    /// `kAudioUnitProperty_Latency`(ns)。[`compute_timestamps`] 参照。
-    unit_latency_ns: u64,
+    /// `open()` が `AudioUnitInitialize` の直後に1度だけ
+    /// [`query_device_extra_latency_frames`] で読み、ns 化した値。
+    /// [`compute_timestamps`] 参照。
+    device_extra_latency_ns: u64,
     underrun_tracker: OutputUnderrunTracker,
     /// [`AppleBackend::callback_frames`] へ渡す `Arc`。
     callback_frames: Arc<AtomicU32>,
@@ -392,16 +512,18 @@ unsafe extern "C" fn render_proc(
         let Some(io_data) = (unsafe { io_data.as_mut() }) else {
             return;
         };
-        if io_data.number_buffers == 0 {
+        // インターリーブ形式(`kAudioFormatFlagIsNonInterleaved` を立てない、
+        // `stereo_f32_asbd` 参照)なので `number_buffers` は常に1のはず。1以外は
+        // (0 を含め)前提が崩れているとみなし、`buffers[0]` には一切触れずに書き込みを
+        // スキップする。
+        if io_data.number_buffers != 1 {
             return;
         }
         let buffer_data = io_data.buffers[0].data;
         let buffer_data_byte_size = io_data.buffers[0].data_byte_size;
-        let Some(sample_count) = validated_sample_count(
-            in_number_frames,
-            buffer_data.is_null(),
-            buffer_data_byte_size,
-        ) else {
+        let Some(sample_count) =
+            validated_sample_count(in_number_frames, buffer_data, buffer_data_byte_size)
+        else {
             return;
         };
         // SAFETY: `validated_sample_count` が `sample_count * size_of::<f32>() <=
@@ -424,7 +546,7 @@ unsafe extern "C" fn render_proc(
 
         let (buffer_start_host_time_ns, output_latency_ns) = compute_timestamps(
             callback_host_time_ns,
-            context.unit_latency_ns,
+            context.device_extra_latency_ns,
             in_number_frames,
             context.sample_rate,
         );
@@ -571,7 +693,7 @@ impl Backend for AppleBackend {
             sample_rate: sample_rate as u32,
             // `AudioUnitInitialize` の後でないと意味のある値を返さないため、
             // いったん 0 にしておき、初期化が成功した直後に確定させる(下記)。
-            unit_latency_ns: 0,
+            device_extra_latency_ns: 0,
             underrun_tracker: OutputUnderrunTracker::new(
                 Arc::clone(&self.output_underrun_count),
                 Arc::clone(&self.last_output_underrun_host_time_ns),
@@ -626,11 +748,13 @@ impl Backend for AppleBackend {
             )));
         }
 
-        let unit_latency_ns = query_unit_latency_ns(unit);
+        let device_extra_latency_frames = query_device_extra_latency_frames(unit);
+        let device_extra_latency_ns =
+            extra_latency_frames_to_ns(device_extra_latency_frames, sample_rate as u32);
         // SAFETY: `context_ptr` はまだレンダースレッドから触られていない
         // (`AudioOutputUnitStart` を呼ぶ前なので、単独の書き手としてここで確定させる)。
         unsafe {
-            (*context_ptr).unit_latency_ns = unit_latency_ns;
+            (*context_ptr).device_extra_latency_ns = device_extra_latency_ns;
         }
 
         // SAFETY: `unit` は初期化済み。
@@ -653,10 +777,10 @@ impl Backend for AppleBackend {
 
         crate::mw_log!(
             "[mw-backend] (native/apple) output stream started: sample_rate={} Hz, channels={}, \
-             unit_latency={:.3} ms",
+             device_extra_latency={:.3} ms",
             sample_rate,
             CHANNELS,
-            unit_latency_ns as f64 / 1_000_000.0,
+            device_extra_latency_ns as f64 / 1_000_000.0,
         );
 
         self.unit = Some(unit);
@@ -736,8 +860,8 @@ impl Backend for AppleBackend {
         self.logged_output_latency.store(true, Ordering::Relaxed);
         let latency_ms = latency_ns as f64 / 1_000_000.0;
         crate::mw_log!(
-            "[mw-backend] (native/apple) output latency (measured, buffer duration + AudioUnit \
-             latency): {latency_ns} ns = {latency_ms:.3} ms"
+            "[mw-backend] (native/apple) output latency (measured, buffer duration + device \
+             latency + safety offset): {latency_ns} ns = {latency_ms:.3} ms"
         );
     }
 
@@ -795,27 +919,63 @@ mod tests {
         assert_eq!(asbd.reserved, 0);
     }
 
+    /// 実際に書き込んでよい、4byte アラインされた有効なバッファ(テスト用)。
+    fn aligned_test_buffer() -> [f32; 4096] {
+        [0.0; 4096]
+    }
+
     #[test]
     fn validated_sample_count_accepts_an_exactly_sized_buffer() {
+        let mut buf = aligned_test_buffer();
         assert_eq!(
-            validated_sample_count(512, false, 512 * 2 * 4),
+            validated_sample_count(512, buf.as_mut_ptr().cast(), 512 * 2 * 4),
             Some(512 * 2)
         );
     }
 
     #[test]
     fn validated_sample_count_rejects_a_null_buffer() {
-        assert_eq!(validated_sample_count(512, true, 512 * 2 * 4), None);
+        assert_eq!(
+            validated_sample_count(512, std::ptr::null_mut(), 512 * 2 * 4),
+            None
+        );
     }
 
     #[test]
     fn validated_sample_count_rejects_an_undersized_buffer() {
-        assert_eq!(validated_sample_count(512, false, 512 * 2 * 4 - 1), None);
+        let mut buf = aligned_test_buffer();
+        assert_eq!(
+            validated_sample_count(512, buf.as_mut_ptr().cast(), 512 * 2 * 4 - 1),
+            None
+        );
     }
 
     #[test]
-    fn validated_sample_count_accepts_zero_frames() {
-        assert_eq!(validated_sample_count(0, false, 0), Some(0));
+    fn validated_sample_count_rejects_zero_frames_even_with_a_valid_buffer() {
+        let mut buf = aligned_test_buffer();
+        assert_eq!(validated_sample_count(0, buf.as_mut_ptr().cast(), 0), None);
+    }
+
+    /// 再現テスト(レビュー指摘2): 0 フレームのとき `data` の値を一切見ずに弾くはず
+    /// だが、現状はアラインメントを見ないまま `Some(0)` を返してしまう。呼び出し側は
+    /// それを基に(0 要素とはいえ)`slice::from_raw_parts_mut` を呼ぶため、ダングリング・
+    /// 非アラインポインタでも前提違反になる。このポインタは一切 dereference しない
+    /// (アドレス値の検査だけ)ので、作るだけなら未定義動作ではない。
+    #[test]
+    fn validated_sample_count_rejects_zero_frames_with_a_dangling_unaligned_pointer() {
+        let dangling_unaligned = std::ptr::dangling_mut::<c_void>();
+        assert_eq!(validated_sample_count(0, dangling_unaligned, 0), None);
+    }
+
+    /// 再現テスト(レビュー指摘2、非 0 フレーム側): アラインメント検査が無いため、
+    /// 1byte しかずれていない non-null ポインタでもサイズ条件さえ満たせば
+    /// 通ってしまう。
+    #[test]
+    fn validated_sample_count_rejects_a_misaligned_nonzero_buffer() {
+        let mut buf = aligned_test_buffer();
+        // 1byte ずらす(f32 のアラインメントは4byte なので非アライン化できる)。
+        let misaligned = unsafe { buf.as_mut_ptr().cast::<u8>().add(1) }.cast::<c_void>();
+        assert_eq!(validated_sample_count(4, misaligned, 4 * 2 * 4), None);
     }
 
     #[test]
@@ -838,6 +998,22 @@ mod tests {
         let (buffer_start, latency) = compute_timestamps(u64::MAX, u64::MAX, 512, 48_000);
         assert_eq!(buffer_start, u64::MAX);
         assert!(latency > 0);
+    }
+
+    #[test]
+    fn extra_latency_frames_to_ns_converts_using_the_sample_rate() {
+        // 48 frames @ 48kHz = 1ms。
+        assert_eq!(extra_latency_frames_to_ns(48, 48_000), 1_000_000);
+    }
+
+    #[test]
+    fn extra_latency_frames_to_ns_is_zero_when_sample_rate_is_unknown() {
+        assert_eq!(extra_latency_frames_to_ns(48, 0), 0);
+    }
+
+    #[test]
+    fn extra_latency_frames_to_ns_is_zero_for_zero_frames() {
+        assert_eq!(extra_latency_frames_to_ns(0, 48_000), 0);
     }
 
     /// ハードウェア不要の構築テスト: `AppleBackend::new()` はまだ閉じている。
@@ -881,5 +1057,134 @@ mod tests {
 
         backend.close().expect("close should succeed");
         assert!(!backend.is_open());
+    }
+
+    /// テスト専用: `render_proc` を直接呼ぶための最小の `CallbackContext`。
+    fn test_callback_context(sample_rate: u32) -> *mut CallbackContext {
+        let (renderer, _sender, _reclaim, _music_producer, _music_clock, _events, _bgm) =
+            mw_core::Renderer::build(mw_core::Config::default(), sample_rate);
+        Box::into_raw(Box::new(CallbackContext {
+            renderer,
+            sample_rate,
+            device_extra_latency_ns: 0,
+            underrun_tracker: OutputUnderrunTracker::new(
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU32::new(0)),
+            ),
+            callback_frames: Arc::new(AtomicU32::new(0)),
+            output_latency_ns: Arc::new(AtomicU64::new(0)),
+            render_completions: Arc::new(AtomicU64::new(0)),
+        }))
+    }
+
+    /// ハードウェア不要・ダミー `AudioTimeStamp`(host_time 以外は読まれないので 0 で良い)。
+    fn dummy_time_stamp(host_time: u64) -> AudioTimeStamp {
+        AudioTimeStamp {
+            sample_time: 0.0,
+            host_time,
+            rate_scalar: 1.0,
+            word_clock_time: 0,
+            smpte_time: SmpteTime {
+                subframes: 0,
+                subframe_divisor: 0,
+                counter: 0,
+                time_type: 0,
+                flags: 0,
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            flags: 0,
+            reserved: 0,
+        }
+    }
+
+    /// 再現テスト(レビュー指摘4): `AudioBufferList::number_buffers` がインターリーブ形式の
+    /// 前提(常に1)と異なる値のとき、実装はコメント(`AudioBufferList` の doc)が言う
+    /// 「念のため確認する」を満たしていない——現状は `== 0` しか弾かず、2以上は
+    /// そのまま `buffers[0]` を使って書き込んでしまう。
+    #[test]
+    fn render_proc_skips_writing_when_number_buffers_is_not_one() {
+        let context_ptr = test_callback_context(48_000);
+
+        const SENTINEL: f32 = 1.234_5;
+        let mut buffer = [SENTINEL; 8]; // 4 frames * 2ch
+        let mut buffer_list = AudioBufferList {
+            // 本来インターリーブ形式では常に1のはずの値を、わざと2にして再現する。
+            number_buffers: 2,
+            buffers: [AudioBuffer {
+                number_channels: 2,
+                data_byte_size: (buffer.len() * std::mem::size_of::<f32>()) as u32,
+                data: buffer.as_mut_ptr().cast(),
+            }],
+        };
+        let time_stamp = dummy_time_stamp(1_000);
+
+        let status = unsafe {
+            render_proc(
+                context_ptr.cast(),
+                std::ptr::null_mut(),
+                &time_stamp,
+                0,
+                4,
+                &mut buffer_list,
+            )
+        };
+
+        assert_eq!(status, NO_ERR);
+        assert_eq!(
+            buffer, [SENTINEL; 8],
+            "number_buffers != 1 のときは書き込みをスキップするはず"
+        );
+        let context = unsafe { &*context_ptr };
+        assert_eq!(
+            context.callback_frames.load(Ordering::Relaxed),
+            0,
+            "スキップしたときは callback_frames も更新されないはず"
+        );
+
+        drop(unsafe { Box::from_raw(context_ptr) });
+    }
+
+    /// `number_buffers == 1`(正常系)では引き続き書き込むことの確認——上のテストが
+    /// 「2以上なら弾く」を固定するのに対し、こちらは「1なら通る」を固定する。
+    #[test]
+    fn render_proc_writes_when_number_buffers_is_one() {
+        let context_ptr = test_callback_context(48_000);
+
+        const SENTINEL: f32 = 1.234_5;
+        let mut buffer = [SENTINEL; 8]; // 4 frames * 2ch
+        let mut buffer_list = AudioBufferList {
+            number_buffers: 1,
+            buffers: [AudioBuffer {
+                number_channels: 2,
+                data_byte_size: (buffer.len() * std::mem::size_of::<f32>()) as u32,
+                data: buffer.as_mut_ptr().cast(),
+            }],
+        };
+        let time_stamp = dummy_time_stamp(1_000);
+
+        let status = unsafe {
+            render_proc(
+                context_ptr.cast(),
+                std::ptr::null_mut(),
+                &time_stamp,
+                0,
+                4,
+                &mut buffer_list,
+            )
+        };
+
+        assert_eq!(status, NO_ERR);
+        assert_ne!(
+            buffer, [SENTINEL; 8],
+            "number_buffers == 1 では Renderer::render が書き込むはず"
+        );
+        let context = unsafe { &*context_ptr };
+        assert_eq!(context.callback_frames.load(Ordering::Relaxed), 4);
+
+        drop(unsafe { Box::from_raw(context_ptr) });
     }
 }

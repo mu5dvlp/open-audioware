@@ -68,7 +68,10 @@ fn ticks_to_ns_with_timebase(ticks: u64, numer: u32, denom: u32) -> u64 {
     if denom == 0 {
         return ticks;
     }
-    (ticks as u128 * numer as u128 / denom as u128) as u64
+    // `u128` で計算した時点では桁あふれしないが、結果を `u64` へ戻す際に
+    // `u64::MAX` を超えていることがある(例: numer > denom で ticks が極端に大きい)。
+    // `as u64` はラップアラウンドするため、ここは必ず saturating にする。
+    (ticks as u128 * numer as u128 / denom as u128).min(u64::MAX as u128) as u64
 }
 
 /// Mach の tick 値(`mach_absolute_time()` の戻り値、または `AudioTimeStamp::mHostTime`
@@ -194,5 +197,14 @@ mod tests {
     #[test]
     fn ticks_to_ns_with_timebase_falls_back_to_raw_ticks_when_denom_is_zero() {
         assert_eq!(ticks_to_ns_with_timebase(12_345, 7, 0), 12_345);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+    #[test]
+    fn ticks_to_ns_with_timebase_saturates_instead_of_overflowing() {
+        // numer/denom = 2/1 で ticks=u64::MAX を変換すると、素の `u128` 計算では
+        // u64 の範囲を超える(u64::MAX の2倍)。`as u64` で素直に切り詰めると
+        // ラップアラウンドして小さい値になってしまうため、saturating が要る。
+        assert_eq!(ticks_to_ns_with_timebase(u64::MAX, 2, 1), u64::MAX);
     }
 }
