@@ -102,27 +102,53 @@
   `CpalBackend::log_new_output_underruns`(ゲームスレッド専用、`log_output_latency_once`
   と同じ配線)が新規検知分だけ日和見的にログへ出す。
 
-- `native_backend::apple::AppleBackend`(AUDIOWARE-DEPS-PLAN.md ステップ4-1、macOS のみ)—
-  macOS の既定出力デバイスへ AudioUnit(AUHAL、`kAudioUnitSubType_DefaultOutput`)で
+- `native_backend::apple::AppleBackend`(AUDIOWARE-DEPS-PLAN.md ステップ4-1〔macOS〕・
+  4-2〔iOS/tvOS〕)— macOS の既定出力デバイス(AUHAL、`kAudioUnitSubType_DefaultOutput`)/
+  iOS・tvOS のハードウェア I/O(RemoteIO、`kAudioUnitSubType_RemoteIO`)へ AudioUnit で
   直接出力する `Backend` 実装。新しい外部クレートは追加していない——AudioToolbox /
   CoreAudio フレームワークの C API を自前の `extern "C"` 宣言で直接叩く
   (`objc2-audio-toolbox` 等は使わない。それらは `objc2`/`objc2-foundation` を引き込むため
-  依存排除の到達点に反する)。手順は `AudioComponentFindNext` →
-  `AudioComponentInstanceNew` → `AudioUnitSetProperty`(StreamFormat /
-  SetRenderCallback)→ `AudioUnitInitialize` → `AudioOutputUnitStart`。
+  依存排除の到達点に反する)。iOS/tvOS のルート変化監視だけは `ios_interruption.rs` が
+  既に使っている `objc2-foundation`/`block2`(NSNotificationCenter)と
+  `objc2-avf-audio`(AVAudioSession)を再利用する(いずれも既存の iOS/tvOS 向け依存。
+  新規追加なし)。手順は `AudioComponentFindNext` → `AudioComponentInstanceNew` →
+  `AudioUnitSetProperty`(StreamFormat / SetRenderCallback)→ `AudioUnitInitialize` →
+  `AudioOutputUnitStart`(iOS/tvOS では直前に `ios_session::configure()` を呼ぶ)。
   タイムスタンプは `AudioTimeStamp.mHostTime` を `host_time::mach_ticks_to_ns`
-  (cpal 版の `host_time_ns` と同じ式)で ns 化し、`compute_timestamps`(`apple.rs`)で
-  バッファ長 + デバイス側の追加レイテンシ(`query_device_extra_latency_frames` が
-  `AudioObjectGetPropertyData` で読む `kAudioDevicePropertyLatency` +
-  `kAudioDevicePropertySafetyOffset` の合計。cpal 0.18.1 の
-  `get_device_extra_latency_frames` と同じ2プロパティ)を加えたものを
-  `Renderer::render` の `buffer_start_host_time_ns` として渡す。
-  `OutputUnderrunTracker` は cpal 版と共用。**既知の差分**: デバイス切断・既定出力の
-  変更を監視する `AudioObjectPropertyListener` は未実装のため、`Backend::open` が
-  受け取る `events` は使わず `StreamError` イベントは発行しない(macOS Editor 専用の
-  開発機バックエンドという 4-1 の前提で許容——4-2 で `ios_interruption` 統合に合わせて
-  再検討する)。`mw-ffi` の切替口(`handle.rs::make_backend`)が `backend-native` feature
-  (macOS のみ)で選ぶ。既定の `backend-cpal` では選ばれない。
+  (cpal 版の `host_time_ns` と同じ式)で ns 化したものを**相関点**とし、
+  `compute_timestamps`(`apple.rs`)でバッファ長(このコールバックの実測フレーム数)+
+  **補正項**(`device_extra_latency_ns`。OS ごとに出し方が違う——下記)を加えたものを
+  `Renderer::render` の `buffer_start_host_time_ns` として渡す。相関点と補正項は
+  意図的に別々の状態として持つ(HANDOFF 0f の統合。cpal 0.18.2 が iOS の `playback` へ
+  `AVAudioSession.outputLatency()` を無断で足し、校正済みの音楽クロックが実機で
+  約65ms ずれた〔`9fdf287`〕のと同じ事故を、ここでは「補正項だけを独立かつ明示的に
+  更新できる」構造にすることで避ける):
+  - **macOS**: `open()` で `query_device_extra_latency_frames`
+    (`AudioObjectGetPropertyData` で読む `kAudioDevicePropertyLatency` +
+    `kAudioDevicePropertySafetyOffset`。cpal 0.18.1 の `get_device_extra_latency_frames`
+    と同じ2プロパティ)を1度だけ読み、以後固定(4-1 の既知の差分、デバイス切断監視は未実装)。
+  - **iOS/tvOS**: `open()` で `AVAudioSession.outputLatency()`
+    (`query_ios_output_latency_ns`)を読んで初期化し、以後は `IosOutputLatencyWatcher`
+    (`apple.rs` の `ios_impl` サブモジュール)が `AVAudioSessionRouteChangeNotification`
+    を監視してルート(スピーカー/有線/Bluetooth)が変わるたびに読み直す。
+    `IOBufferDuration` は別途読まない——バッファ長はレンダーコールバックの実測フレーム数
+    (`compute_timestamps` の引数)が既に正確に捉えており、二重計上を避けるため。
+    🔴 **cpal 0.18.1(固定中)の iOS 実装は `outputLatency()` を一切読んでいない**
+    (`IOBufferDuration` だけ)——この実装は意図的にその意味を変え、`mw-core::Mixer::
+    render` と client 側 `NativeMusicClockCore.cs` が最初から要求している
+    「DAC 出力時刻の予測」を正しく満たす。`backend-cpal` が既定のままなので本番には
+    影響しないが、実際に iOS を `backend-native` へ切り替える段では出力レイテンシの
+    前提が変わるため、`AudioOffsetSeconds` 等の実機校正を取り直す必要がある
+    (client 側のクラス doc が既に明記している帰結)。
+  `OutputUnderrunTracker` は cpal 版と共用。**既知の差分**: macOS のデバイス切断・
+  既定出力の変更の監視、および iOS/tvOS の割り込み(電話・Siri)・バックグラウンド
+  遷移からのストリーム復帰(`ios_interruption.rs` が cpal 版に対して持つ復帰ロジック)は
+  どちらも未実装——`Backend::open` が受け取る `events` は使わず `StreamError`/
+  `AudioInterruptionEnded` 等は発行しない。4-1 は macOS Editor 専用の開発機バックエンド、
+  4-2 は「補正項をルート変化で追従させるところまで」という前提で許容する判断とした。
+  本番導入(cpal 削除、ステップ4-4)前には `ios_interruption.rs` 相当の復帰ロジックの
+  移植が別途要る。`mw-ffi` の切替口(`handle.rs::make_backend`)が `backend-native`
+  feature(macOS/iOS/tvOS)で選ぶ。既定の `backend-cpal` では選ばれない。
 
 ## 設計意図
 

@@ -18,5 +18,5 @@ pub mod underrun;
 pub use backend::{Backend, BackendError};
 pub use cpal_backend::CpalBackend;
 pub use host_time::host_time_ns;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub use native_backend::NativeBackend;
