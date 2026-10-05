@@ -11,6 +11,7 @@
   <a href="./rust-toolchain.toml"><img src="https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fmu5dvlp%2Fopen-audioware%2Fmain%2Frust-toolchain.toml&query=%24.toolchain.channel&label=rust&color=orange&logo=rust" alt="Rust のツールチェーン" /></a>
   <img src="https://img.shields.io/badge/Unity-6-black.svg?logo=unity" alt="Unity 6" />
   <img src="https://img.shields.io/badge/platform-iOS%20%7C%20Android%20%7C%20macOS-lightgrey.svg" alt="対応プラットフォーム" />
+  <a href="https://github.com/sponsors/mu5dvlp"><img src="https://img.shields.io/github/sponsors/mu5dvlp?label=Sponsor&logo=GitHub&color=ea4aaa" alt="GitHub Sponsors で支援する" /></a>
 </p>
 
 **音楽ゲームのための Unity 向けオーディオミドルウェア(Rust 製)です。**
