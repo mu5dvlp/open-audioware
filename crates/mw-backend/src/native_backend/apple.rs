@@ -1324,17 +1324,20 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn extra_latency_frames_to_ns_converts_using_the_sample_rate() {
         // 48 frames @ 48kHz = 1ms。
         assert_eq!(extra_latency_frames_to_ns(48, 48_000), 1_000_000);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn extra_latency_frames_to_ns_is_zero_when_sample_rate_is_unknown() {
         assert_eq!(extra_latency_frames_to_ns(48, 0), 0);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn extra_latency_frames_to_ns_is_zero_for_zero_frames() {
         assert_eq!(extra_latency_frames_to_ns(0, 48_000), 0);
