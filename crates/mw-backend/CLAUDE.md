@@ -150,6 +150,40 @@
   移植が別途要る。`mw-ffi` の切替口(`handle.rs::make_backend`)が `backend-native`
   feature(macOS/iOS/tvOS)で選ぶ。既定の `backend-cpal` では選ばれない。
 
+- `native_backend::android::AndroidBackend`(AUDIOWARE-DEPS-PLAN.md ステップ4-3)——
+  Android の既定出力へ `libaaudio.so`(API 26+)で直接出力する `Backend` 実装。
+  新しい外部クレートは追加していない(`ndk`/`ndk-sys` は使わず自前の `extern "C"`
+  宣言)。手順は `AAudio_createStreamBuilder` → `setPerformanceMode`
+  (`AAUDIO_PERFORMANCE_MODE_LOW_LATENCY`。cpal の `realtime` feature が Android で
+  低遅延を得るために設定していたのと同じ値で、`audio_thread_priority`〔MPL〕への
+  依存をこの実装自体は持たない)→ `setDataCallback`/`setErrorCallback` →
+  `AAudioStreamBuilder_openStream` → `AAudioStream_requestStart`。
+  タイムスタンプは macOS/iOS のような「相関点 + 補正項」の分離を持たない——
+  `AAudioStream_getTimestamp` が毎コールバック「フレーム位置 `anchor_frame` が
+  ホスト単調時刻 `anchor_time_ns` に出力される」という対応点を返すので、
+  これを `AAudioStream_getFramesWritten`(このコールバックが書き込むバッファの
+  先頭フレーム位置)へ線形に外挿して予測出力時刻を求める——cpal 0.18.1 の AAudio
+  実装(`cpal::host::aaudio::convert::{output_stream_instant,
+  stream_instant_from_anchor}`)と**全く同じ式**(iOS と異なり cpal の Android 実装は
+  最初から「予測される DAC 出力時刻」を正しく計算しているため、意味を変える必要が
+  無い)。外挿が未確定(ストリーム開始直後等)の場合はコールバックの呼び出し時刻
+  そのものへフォールバックする(cpal の `now_stream_instant()` フォールバックと同じ)。
+  切断(`AAUDIO_ERROR_DISCONNECTED`)は `Event::StreamError { reason:
+  DeviceUnavailable }` として `events` 経由で通知し、`mw-ffi` の既存の内部再オープン
+  (`handle.rs::Instance::attempt_reopen`、cpal 版の Android 切断経路がこれまで使っていた
+  のと同じ仕組み)へそのまま乗る——AppleBackend と異なりここは `events` を使う。
+  `android_context`(JavaVM/Context の `ndk_context` 登録)は cpal が Java 側
+  `AudioManager` を参照するためだけに要るものなので、この実装は呼ばない
+  (AAudio の生 C API 自体はネイティブに閉じており Context を要求しない)。
+  **既知の差分**: cpal 版が持つ xrun 検知時の動的バッファ長調整
+  (`cpal::host::aaudio::mod.rs` の `tune_dynamically`)は実装していない
+  (`AAUDIO_PERFORMANCE_MODE_LOW_LATENCY` の既定バッファで足りるという前提)。
+  `OutputUnderrunTracker` は cpal 版・AppleBackend と共用。`mw-ffi` の切替口が
+  `backend-native` feature(Android を含む4OS)で選ぶ。既定の `backend-cpal` では
+  選ばれない。純粋ロジック(タイムスタンプの外挿計算・バッファ検証・エラー分類)は
+  `target_os` を問わずコンパイルされ、ホスト(macOS)の `cargo test` で固定化している
+  (`native_backend::android` モジュール doc参照)。
+
 ## 設計意図
 
 - 初期構築仕様 M6(【仮】): 立ち上げは cpal で macOS Editor / iOS / Android を1系統に揃える。
