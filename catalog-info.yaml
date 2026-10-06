@@ -1,0 +1,13 @@
+# Backstage 互換のカタログ(PLATFORM-PLAN 0-6)。Backstage はいま入れない(2026-09-25 決定)——
+# 持ち主・依存・API だけを宣言しておき、入れるときにそのまま取り込めるようにする。
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: open-audioware
+  description: Rust 製の低遅延オーディオミドルウェア(C ABI + Unity パッケージ)
+  annotations:
+    github.com/project-slug: mu5dvlp/open-audioware
+spec:
+  type: library
+  lifecycle: experimental
+  owner: user:mu5dvlp
