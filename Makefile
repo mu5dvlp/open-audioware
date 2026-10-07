@@ -185,17 +185,13 @@ gitleaks: ## 秘密情報がコミットされていないか git 履歴ごと�
 SEMGREP_VERSION := 1.179.0
 SEMGREP_IMAGE := semgrep/semgrep:$(SEMGREP_VERSION)
 
-# p/default(汎用)+ p/rust。⚠️ 2つのルールを除外している:
-#   - rust.lang.security.unsafe-usage: このクレートは FFI / リングバッファ用の低レイヤ
-#     オーディオミドルウェアで `unsafe` が本質的に必要(167件検知)。安全性は Miri
-#     (`make miri`)/ ThreadSanitizer(`make tsan`)/ csbindgen の ABI assert で別途保証して
-#     いるため、「unsafe が有る」こと自体を1件ずつ洗う検知は信号にならない。
-#   - yaml.github-actions...github-actions-mutable-action-tag: 全ワークフローの `uses:` を
-#     コミット SHA 固定にするかは5リポジトリ共通の ci-workflows にまたがる別判断で、この
-#     導入だけでは決めない(採否はユーザー判断待ち)。
+# p/default(汎用)+ p/rust。⚠️ rust.lang.security.unsafe-usage は除外する ——
+# このクレートは FFI / リングバッファ用の低レイヤオーディオミドルウェアで `unsafe` が
+# 本質的に必要(167件検知)。安全性は Miri(`make miri`)/ ThreadSanitizer(`make tsan`)/
+# csbindgen の ABI assert で別途保証しているため、「unsafe が有る」こと自体を
+# 1件ずつ洗う検知は信号にならない。
 SEMGREP_CONFIG := --config p/default --config p/rust \
-	--exclude-rule rust.lang.security.unsafe-usage.unsafe-usage \
-	--exclude-rule yaml.github-actions.security.github-actions-mutable-action-tag.github-actions-mutable-action-tag
+	--exclude-rule rust.lang.security.unsafe-usage.unsafe-usage
 
 semgrep: ## 静的解析(Semgrep CE。CI には載せない —— make lint とは別に手元で回す)
 	@if command -v semgrep >/dev/null 2>&1; then \

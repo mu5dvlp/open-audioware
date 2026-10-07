@@ -19,7 +19,7 @@ jobs:
   lint-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install ALSA dev headers (cpal の Linux ビルドに必要)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
@@ -60,12 +60,12 @@ jobs:
         # `@stable` は rust-toolchain.toml を読まず常に最新 stable を入れてしまい、
         # ローカル(ファイル固定)と CI(常に最新)がズレて事故る(実際に2回発生した)。
         # バージョンはリポジトリ直下の rust-toolchain.toml と手で合わせること。
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@4dfd137a5aecc12897f37a01818006f58cf58347 # 1.98.0
         with:
           # llvm-tools-preview は cargo-llvm-cov(カバレッジ計測)が要求する。
           components: rustfmt, clippy, llvm-tools-preview
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -74,7 +74,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo deny check
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
       # 🔴 **`cargo test` の置き換え**(Codecov 導入)。
       # `cargo llvm-cov` は「テストを走らせたうえで計測する」ので、これ1本で
@@ -87,13 +87,13 @@ jobs:
       # 違うので別アーティファクトになる)。所要がコーヒー基準を割るようなら、
       # このジョブを `on: push` から外して schedule(週次)+ workflow_dispatch へ回す。
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@27cdd3237bf9a6a2b668f3bcbfaa06949ae17deb # cargo-llvm-cov
 
       - name: cargo llvm-cov (テスト実行 + カバレッジ計測)
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v7
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -112,7 +112,7 @@ jobs:
       # 📌 3秒で終わるのでコーヒー基準を壊さない。Makefile と二重に書かないため
       # `make csharp-check` を呼ぶ(既定分岐と UNITY_IOS 分岐の両方を見る)。
       - name: Setup .NET (C# ラッパのコンパイル検査用)
-        uses: actions/setup-dotnet@v6
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: '8.0.x'
 
@@ -128,15 +128,15 @@ jobs:
   miri:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # stable の lint-test とは別のツールチェーン・別の成果物なのでキャッシュを分ける。
           key: miri
 
       - name: Cache the Miri sysroot
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/miri
           key: miri-sysroot-${{ runner.os }}-${{ hashFiles('Makefile') }}
@@ -153,14 +153,14 @@ jobs:
   fuzz:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: fuzz
           workspaces: fuzz
 
-      - uses: taiki-e/install-action@cargo-fuzz
+      - uses: taiki-e/install-action@82fc405565b9cf90abfe700ba43b4751ce2fe422 # cargo-fuzz
 
       - name: make fuzz-corpus
         run: make fuzz-corpus
@@ -169,20 +169,20 @@ jobs:
   macos-build:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
         # `@stable` は rust-toolchain.toml を読まず常に最新 stable を入れてしまい、
         # ローカル(ファイル固定)と CI(常に最新)がズレて事故る(実際に2回発生した)。
         # バージョンはリポジトリ直下の rust-toolchain.toml と手で合わせること。
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@4dfd137a5aecc12897f37a01818006f58cf58347 # 1.98.0
         with:
           targets: |
             aarch64-apple-darwin
             x86_64-apple-darwin
             aarch64-apple-ios
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: make build-macos
         run: make build-macos
@@ -191,7 +191,7 @@ jobs:
         run: make build-ios
 
       - name: Upload build artifacts (デバッグ用。Release 添付ではない)
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-ios-native
           path: |
@@ -203,21 +203,21 @@ jobs:
   android-build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
         # `@stable` は rust-toolchain.toml を読まず常に最新 stable を入れてしまい、
         # ローカル(ファイル固定)と CI(常に最新)がズレて事故る(実際に2回発生した)。
         # バージョンはリポジトリ直下の rust-toolchain.toml と手で合わせること。
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@4dfd137a5aecc12897f37a01818006f58cf58347 # 1.98.0
         with:
           targets: aarch64-linux-android
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Setup Android NDK
         id: setup-ndk
-        uses: nttld/setup-ndk@v1
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1.6.0
         with:
           ndk-version: r27c
 
@@ -230,7 +230,7 @@ jobs:
         run: cargo ndk -t arm64-v8a -P 26 build -p mw-ffi --release
 
       - name: Upload build artifact (デバッグ用。Release 添付ではない)
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: android-native
           path: target/aarch64-linux-android/release/libmw_ffi.so
