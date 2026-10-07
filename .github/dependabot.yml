@@ -12,6 +12,11 @@ updates:
     directory: "/"
     schedule:
       interval: "monthly"
+    # 公開されたばかりのバージョンは悪意のあるコードや不安定さが混入している可能性がある
+    # ため、7日待ってから PR を出す(Semgrep CE package_managers.dependabot 検知。
+    # セキュリティ更新はこの cooldown に従わず即座に来る)。
+    cooldown:
+      default-days: 7
     groups:
       cargo:
         patterns:
@@ -33,6 +38,8 @@ updates:
     directory: "/"
     schedule:
       interval: "monthly"
+    cooldown:
+      default-days: 7
     groups:
       github-actions:
         patterns:

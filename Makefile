@@ -26,7 +26,7 @@ PLUGINS_ANDROID_DIR   := unity/Runtime/Plugins/Android/libs/$(ANDROID_ABI)
 
 XCFRAMEWORK           := $(PLUGINS_IOS_DIR)/MwFfi.xcframework
 
-.PHONY: help setup lint format gitleaks test bench bindgen csharp-check \
+.PHONY: help setup lint format gitleaks semgrep test bench bindgen csharp-check \
         build-macos build-ios build-android \
         package unity-sample-create unity-test \
         measurement-scene measurement-export-ios measurement-build-android clean \
@@ -64,6 +64,7 @@ help:
 	@echo "  make measurement-export-ios - A/B 計測アプリの Xcode プロジェクトを書き出す(要 Unity ロック)"
 	@echo "  make measurement-build-android - A/B 計測アプリの apk を書き出す(要 Unity ロック)"
 	@echo "  make clean          - target/ 以下のビルド成果物を削除"
+	@echo "  make semgrep        - 静的解析(Semgrep CE。CI には載せない。main へ入れる前に手元で回す)"
 
 # --- setup --------------------------------------------------------------
 
@@ -170,6 +171,42 @@ gitleaks: ## 秘密情報がコミットされていないか git 履歴ごと�
 	else \
 		echo "[error] gitleaks も docker も見つかりません。どちらかを用意してください。"; \
 		echo "        brew install gitleaks  # または Docker Desktop を起動する"; \
+		exit 1; \
+	fi
+
+# ===========================================================================
+# Semgrep CE(静的解析。PLATFORM-PLAN 0-3)
+# ===========================================================================
+
+# 🔴 バージョンはここ1箇所だけで固定する(gitleaks と同じ方針)。ローカルに semgrep の
+# バイナリが入っている場合はそちらが使われるため、実行時に必ずどちらを使ったかを表示する。
+# 🔴 **CI には載せない**(public リポジトリで Actions 自体は無料だが、5リポジトリ共通の
+# 方針として統一している)。main へ入れる前に手元で回す。
+SEMGREP_VERSION := 1.179.0
+SEMGREP_IMAGE := semgrep/semgrep:$(SEMGREP_VERSION)
+
+# p/default(汎用)+ p/rust。⚠️ 2つのルールを除外している:
+#   - rust.lang.security.unsafe-usage: このクレートは FFI / リングバッファ用の低レイヤ
+#     オーディオミドルウェアで `unsafe` が本質的に必要(167件検知)。安全性は Miri
+#     (`make miri`)/ ThreadSanitizer(`make tsan`)/ csbindgen の ABI assert で別途保証して
+#     いるため、「unsafe が有る」こと自体を1件ずつ洗う検知は信号にならない。
+#   - yaml.github-actions...github-actions-mutable-action-tag: 全ワークフローの `uses:` を
+#     コミット SHA 固定にするかは5リポジトリ共通の ci-workflows にまたがる別判断で、この
+#     導入だけでは決めない(採否はユーザー判断待ち)。
+SEMGREP_CONFIG := --config p/default --config p/rust \
+	--exclude-rule rust.lang.security.unsafe-usage.unsafe-usage \
+	--exclude-rule yaml.github-actions.security.github-actions-mutable-action-tag.github-actions-mutable-action-tag
+
+semgrep: ## 静的解析(Semgrep CE。CI には載せない —— make lint とは別に手元で回す)
+	@if command -v semgrep >/dev/null 2>&1; then \
+		echo "== semgrep(ローカルのバイナリ: $$(semgrep --version)。固定版は $(SEMGREP_VERSION)) =="; \
+		semgrep scan $(SEMGREP_CONFIG) --error --metrics=off .; \
+	elif command -v docker >/dev/null 2>&1; then \
+		echo "== semgrep($(SEMGREP_IMAGE)) =="; \
+		docker run --rm -v "$(CURDIR):/src" -w /src $(SEMGREP_IMAGE) semgrep scan $(SEMGREP_CONFIG) --error --metrics=off .; \
+	else \
+		echo "[error] semgrep も docker も見つかりません。どちらかを用意してください。"; \
+		echo "        brew install semgrep  # または Docker Desktop を起動する"; \
 		exit 1; \
 	fi
 

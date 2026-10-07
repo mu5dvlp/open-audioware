@@ -194,6 +194,7 @@ Makefile・コードのどちらもアーチ非依存に書いてあります。
 | `make unity-sample-create` | `unity-sample/` プロジェクトを新規作成(初回のみ。要 Unity ロック) |
 | `make unity-test` | `unity-sample/` の EditMode テストを実行(要 Unity ロック) |
 | `make clean` | `cargo clean` |
+| `make semgrep` | 静的解析(Semgrep CE。🔴 CI には載せない。main へ入れる前に手元で回す) |
 
 `unity-sample-create` / `unity-test` は Unity をバッチモードで起動します。同一マシン上の
 他プロセスと衝突しないよう `tools/with-unity-lock.sh` がロック(`/tmp/mgct-unity.lock`)を
@@ -240,6 +241,7 @@ Makefile・コードのどちらもアーチ非依存に書いてあります。
 | cargo-deny | 依存ライセンス・脆弱性の検査(`deny.toml`) |
 | cargo-llvm-cov | テスト実行とカバレッジ計測を兼ねる(CI) |
 | Codecov | カバレッジレポートのアップロード・可視化 |
+| Semgrep CE | 静的解析(`make semgrep`。🔴 CI には載せない。main へ入れる前に手元で回す) |
 
 ### CI・自動化
 

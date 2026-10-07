@@ -38,7 +38,12 @@ jobs:
       - uses: taiki-e/install-action@cargo-fuzz
 
       - name: make fuzz-run
-        run: make fuzz-run TARGET=${{ matrix.target }} SECONDS=${{ github.event.inputs.seconds || '900' }}
+        # workflow_dispatch の入力を `run:` に直接展開しない(shell injection 対策。
+        # env 経由にすることでシェルの特殊文字をそのまま渡さない)。
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+          FUZZ_SECONDS: ${{ github.event.inputs.seconds || '900' }}
+        run: make fuzz-run TARGET="$FUZZ_TARGET" SECONDS="$FUZZ_SECONDS"
 
       - name: Upload crash artifacts
         if: failure()
