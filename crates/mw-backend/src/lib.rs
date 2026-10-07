@@ -22,6 +22,7 @@ pub use host_time::host_time_ns;
     target_os = "macos",
     target_os = "ios",
     target_os = "tvos",
-    target_os = "android"
+    target_os = "android",
+    target_os = "linux"
 ))]
 pub use native_backend::NativeBackend;

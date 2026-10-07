@@ -160,6 +160,26 @@ impl OutputUnderrunTracker {
     }
 }
 
+impl OutputUnderrunTracker {
+    /// コールバック間隔からは見えない形で OS が報告したアンダーラン(ALSA の xrun 等)を
+    /// 1回として記録する。**音声コールバックスレッドから呼ぶこと**([`observe`](Self::observe)
+    /// と同じ制約)。
+    ///
+    /// 復旧に要した時間は次の `observe` から見ると「大きな間隔」になるため、そのまま
+    /// 放置すると同じ事象が間隔ヒューリスティックでも二重に数えられる。そこで
+    /// 直前コールバックの記録を捨て、次の `observe` では判定を行わない(基準の取り直し)。
+    pub fn record_reported_underrun(&mut self, host_time_ns: u64) {
+        self.prev_host_time_ns = 0;
+        self.prev_frames = 0;
+        self.consecutive = self.consecutive.saturating_add(1);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.last_host_time_ns
+            .store(host_time_ns, Ordering::Relaxed);
+        self.consecutive_published
+            .store(self.consecutive, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +308,20 @@ mod tests {
         let (mut tracker, _count, _last, _consecutive) = tracker_with_handles();
         tracker.observe(1_000_000, 512, 48_000);
         tracker.observe(500_000, 512, 48_000); // 逆転
+    }
+
+    #[test]
+    fn a_reported_underrun_is_counted_once_and_rebases_the_gap_detection() {
+        let (mut tracker, count, last_host_time_ns, consecutive) = tracker_with_handles();
+        tracker.observe(1, 512, 48_000);
+        tracker.record_reported_underrun(100_000_000);
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+        assert_eq!(last_host_time_ns.load(Ordering::Relaxed), 100_000_000);
+        assert_eq!(consecutive.load(Ordering::Relaxed), 1);
+
+        // 復旧後の最初の `observe` は、どれだけ間隔が開いていても二重に数えない。
+        tracker.observe(500_000_000, 512, 48_000);
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+        assert_eq!(consecutive.load(Ordering::Relaxed), 0);
     }
 }

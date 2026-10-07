@@ -179,10 +179,28 @@
   (`cpal::host::aaudio::mod.rs` の `tune_dynamically`)は実装していない
   (`AAUDIO_PERFORMANCE_MODE_LOW_LATENCY` の既定バッファで足りるという前提)。
   `OutputUnderrunTracker` は cpal 版・AppleBackend と共用。`mw-ffi` の切替口が
-  `backend-native` feature(Android を含む4OS)で選ぶ。既定の `backend-cpal` では
+  `backend-native` feature(Android を含む5OS)で選ぶ。既定の `backend-cpal` では
   選ばれない。純粋ロジック(タイムスタンプの外挿計算・バッファ検証・エラー分類)は
   `target_os` を問わずコンパイルされ、ホスト(macOS)の `cargo test` で固定化している
   (`native_backend::android` モジュール doc参照)。
+
+- `native_backend::linux::LinuxBackend`(AUDIOWARE-DEPS-PLAN.md ステップ4-4 の前提)——
+  Linux の ALSA `default` へ `libasound` の C API(自前の `extern "C"` +
+  `#[link(name = "asound")]`。新しいクレートは追加していない)で出力する `Backend` 実装。
+  コールバック駆動ではなく、**専用スレッドが `Renderer::render` → ブロッキングの
+  `snd_pcm_writei` を回す**(cpal の ALSA ホストと同じ方式)。`snd_pcm_set_params` は
+  FLOAT_LE・インターリーブ・2ch・48kHz・`soft_resample=1`・総レイテンシ
+  `TARGET_LATENCY_US`(【仮】20ms)。バッファ先頭の出力時刻は `host_time_ns()` +
+  `snd_pcm_delay`(`playback_start_ns`)、出力レイテンシはその遅延分。xrun は
+  `snd_pcm_recover` で復旧して `OutputUnderrunTracker::record_reported_underrun` で数える。
+  🔴 **時計を持たない `null` デバイスでは `writei` が待たないので、`throttle_sleep_ns` で
+  「書いたフレーム数が実時間 + バッファ長を超えたら眠る」**(外すと 1 コア空回りする)。
+  実デバイスでは発動しない。デバイスが無ければ `open` は `NoOutputDevice` で返る。
+  **既知の差分**: 音声スレッドの優先度は上げない / デバイス切断・既定出力変更の監視は無い
+  (書き込みが致命的に失敗したときだけ `Event::StreamError` を積んでスレッドを終える)。
+  純粋ロジックは `target_os` を問わずホストの `cargo test` で固定。`null` デバイスでの
+  動作確認は `#[ignore]` のテスト(`ALSA_CONFIG_PATH` を `pcm.!default { type null }` だけの
+  設定ファイルへ向けて `cargo test -p mw-backend -- --ignored`)。
 
 ## 設計意図
 
