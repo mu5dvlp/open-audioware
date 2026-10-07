@@ -19,10 +19,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# upm ブランチへのコミット・タグ push 以外は何もしない。外部の秘密情報は使わない
-# (push 認証は actions/checkout が設定する GITHUB_TOKEN のみ)。
+# 既定は読み取りのみに絞る(zizmor 対応)。push が要るのは upm ブランチへ書き出す
+# publish-upm ジョブだけなので、contents: write はそのジョブにだけ付与する(下記)。
 permissions:
-  contents: write
+  contents: read
 
 # 同時に2本の release run が upm ブランチを push しにいく事故を避ける。
 concurrency:
@@ -35,13 +35,20 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4dfd137a5aecc12897f37a01818006f58cf58347 # 1.98.0
         with:
           targets: aarch64-apple-ios
 
+      # タグ push で動く(= 特権コンテキストの)ビルドなので、他の ref で書かれた
+      # キャッシュを信用して取り込まない(zizmor cache-poisoning 対応)。
+      # lookup-only により、キャッシュの有無確認はするが内容は復元しない。
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          lookup-only: true
 
       - name: make build-ios
         run: make build-ios
@@ -59,6 +66,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4dfd137a5aecc12897f37a01818006f58cf58347 # 1.98.0
@@ -67,7 +76,12 @@ jobs:
             aarch64-apple-darwin
             x86_64-apple-darwin
 
+      # タグ push で動く(= 特権コンテキストの)ビルドなので、他の ref で書かれた
+      # キャッシュを信用して取り込まない(zizmor cache-poisoning 対応)。
+      # lookup-only により、キャッシュの有無確認はするが内容は復元しない。
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          lookup-only: true
 
       - name: make build-macos
         run: make build-macos
@@ -91,13 +105,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4dfd137a5aecc12897f37a01818006f58cf58347 # 1.98.0
         with:
           targets: aarch64-linux-android
 
+      # タグ push で動く(= 特権コンテキストの)ビルドなので、他の ref で書かれた
+      # キャッシュを信用して取り込まない(zizmor cache-poisoning 対応)。
+      # lookup-only により、キャッシュの有無確認はするが内容は復元しない。
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          lookup-only: true
 
       - name: Setup Android NDK
         id: setup-ndk
@@ -125,8 +146,14 @@ jobs:
   publish-upm:
     needs: [build-ios, build-macos, build-android]
     runs-on: ubuntu-latest
+    # upm ブランチへのコミット・タグ push を行う唯一のジョブなので、ここにだけ contents: write を付与する。
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # persist-credentials はデフォルト(true)のまま —— 後続の「push する」ステップが
+      # 素の git push で、この checkout が設定する資格情報(上記の contents: write に
+      # 絞った GITHUB_TOKEN)を使う。
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 # zizmor: ignore[artipacked]
 
       - name: タグと unity/package.json の版が一致することを確認する
         run: |

@@ -10,6 +10,11 @@ on:
   pull_request:
     branches: ["**"]
 
+# どのジョブも push / 書き込みを行わない(ビルド検証・テスト・秘密情報検知のみ)ため、
+# 読み取りのみに絞る(zizmor 対応)。
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -20,6 +25,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install ALSA dev headers (cpal の Linux ビルドに必要)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
@@ -129,6 +136,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -154,6 +163,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -170,6 +181,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         # `@stable` は rust-toolchain.toml を読まず常に最新 stable を入れてしまい、
@@ -204,6 +217,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         # `@stable` は rust-toolchain.toml を読まず常に最新 stable を入れてしまい、
@@ -243,4 +258,6 @@ jobs:
   # 🔴 **検査の定義は Makefile 1箇所**(`make gitleaks`)。⚠️ `fetch-depth: 0` が必須
   # (浅いクローンだと「過去にコミットされた鍵」を取りこぼして緑になる)。
   gitleaks:
+    # @v1 は意図的な可動タグ(互換を保つ修正は運用側がタグを前へ動かす)。
+    # zizmor: ignore[unpinned-uses]
     uses: mu5dvlp/ci-workflows/.github/workflows/gitleaks.yml@v1
