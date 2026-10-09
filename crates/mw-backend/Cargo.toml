@@ -52,7 +52,9 @@ ndk-context = "0.1"
 # する**唯一のスイッチ(既定では設定されず、AAudio が大きめのバッファを選ぶ)。
 # 無効時はコールバックバッファが大きくなり、端末の FastMixer より遅延が増えるため有効にする
 # (docs/measurement-m1.md §6.2)。
-# 併せて音声コールバックスレッドの優先度も上げる。
+# ⚠️ cpal 0.18.1 の AAudio ホストは音声コールバックスレッドの優先度を上げない
+# (Android でも `audio_thread_priority` を依存に引き込むが、呼ぶのは ALSA / PipeWire /
+# WASAPI のホストだけ)。コールバックは AAudio が用意するスレッドのまま。
 cpal = { version = "=0.18.1", features = ["realtime"] }
 
 [dev-dependencies]

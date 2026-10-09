@@ -396,7 +396,9 @@ Normal frame count 960(20ms)。AAudio が低レイテンシ経路を掴めれば
       ホスト側(Unity の C#)に協力を求めない形にしてある(`.so` を置くだけで動く)
 - [x] **AAudio の performance mode**(2026-08-23 実施)。cpal では `realtime` フィーチャが
       `AudioPerformanceMode::LowLatency` を設定する唯一のスイッチで、既定では設定されない。
-      Android ターゲットで有効化した(音声コールバックスレッドの優先度も上がる)
+      Android ターゲットで有効化した。⚠️ cpal 0.18.1 の AAudio ホストはこのフィーチャで
+      音声コールバックスレッドの優先度を**上げない**(`audio_thread_priority` を呼ぶのは
+      ALSA / PipeWire / WASAPI のホストだけ。コールバックは AAudio が用意するスレッドのまま)
 - [ ] AAudio の **exclusive モード**の要否。上記でも目標に届かない場合の次の手
 
 ### 6.6 計測当日にユーザーがやることの最短手順
