@@ -178,19 +178,31 @@
   最初から「予測される DAC 出力時刻」を正しく計算しているため、意味を変える必要が
   無い)。外挿が未確定(ストリーム開始直後等)の場合はコールバックの呼び出し時刻
   そのものへフォールバックする(cpal の `now_stream_instant()` フォールバックと同じ)。
-  切断(`AAUDIO_ERROR_DISCONNECTED`)は `Event::StreamError { reason:
-  DeviceUnavailable }` として `events` 経由で通知し、`mw-ffi` の既存の内部再オープン
+  サンプルレートは cpal 版と同じく 48kHz を要求する(開けたなら 48kHz。端末の内部レートが
+  違えば AAudio が変換する。再オープンでレートが変わらないので、ロード時に出力レートへ
+  リサンプルした SE がずれない)。
+  切断(`AAUDIO_ERROR_DISCONNECTED`)と、cpal が `DeviceNotAvailable` / `DeviceBusy` に
+  していた `UNAVAILABLE` / `NO_SERVICE` / `INVALID_HANDLE` / `TIMEOUT` / `WOULD_BLOCK` は
+  `Event::StreamError { reason: DeviceUnavailable }` として `events` 経由で通知し
+  (`INTERNAL` / `INVALID_STATE` は `Reconfigured`。分類は `classify_aaudio_error`)、`mw-ffi` の既存の内部再オープン
   (`handle.rs::Instance::attempt_reopen`、cpal 版の Android 切断経路がこれまで使っていた
   のと同じ仕組み)へそのまま乗る——AppleBackend と異なりここは `events` を使う。
   `android_context`(JavaVM/Context の `ndk_context` 登録)は cpal が Java 側
   `AudioManager` を参照するためだけに要るものなので、この実装は呼ばない
   (AAudio の生 C API 自体はネイティブに閉じており Context を要求しない)。
-  **既知の差分**: cpal 版が持つ xrun 検知時の動的バッファ長調整
-  (`cpal::host::aaudio::mod.rs` の `tune_dynamically`)は実装していない
-  (`AAUDIO_PERFORMANCE_MODE_LOW_LATENCY` の既定バッファで足りるという前提)。
+  cpal 版の `tune_dynamically` と同じく、データコールバックの中で
+  `AAudioStream_getXRunCount` が増えたら `setBufferSizeInFrames` で 1 burst ずつ伸ばす
+  (上限は capacity。判断は `XrunBufferTuner`)。xrun の実数は
+  `OutputUnderrunTracker::record_reported_underrun` で数える(間隔のヒューリスティックと併用)。
+  ⚠️ cpal 0.18.1 は成功時の戻り値〔正の値〕を失敗と見なすため実際には1段しか伸ばさない。
+  ここは capacity まで伸ばす。
+  `open` で性能モード・共有モード・レート・burst・バッファ長・capacity を1回ログに出し、
+  LowLatency が通らなければ cpal の `RealtimeDenied` と同じ `StreamError { Backend }` を積む。
+  フレーム数・ポインタが異常なとき・panic を捕まえたときは書ける範囲をゼロで埋める。
   `OutputUnderrunTracker` は cpal 版・AppleBackend と共用。`mw-ffi` の切替口が
   `backend-native` feature(Android を含む5OS)で選ぶ。既定の `backend-cpal` では
-  選ばれない。純粋ロジック(タイムスタンプの外挿計算・バッファ検証・エラー分類)は
+  選ばれない。純粋ロジック(タイムスタンプの外挿計算・バッファ検証・ゼロ埋めの範囲・エラー分類・
+  バッファを伸ばす判断)は
   `target_os` を問わずコンパイルされ、ホスト(macOS)の `cargo test` で固定化している
   (`native_backend::android` モジュール doc参照)。
 

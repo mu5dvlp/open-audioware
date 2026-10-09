@@ -45,19 +45,32 @@
 //! bump_generation` の呼び出しは不要(`cpal_backend::build_output_stream` も同じ理由で
 //! 呼んでいない)。
 //!
-//! # cpal 版との既知の差分
+//! # cpal 版と揃えていること
 //!
-//! 切断(`AAUDIO_ERROR_DISCONNECTED`)の通知は実装している——`error_proc` が
-//! `Event::StreamError { reason: DeviceUnavailable }` を積み、`mw-ffi` 側の既存の
-//! 内部再オープン(`handle.rs::Instance::attempt_reopen`)がそれを受けて
-//! close→open をやり直す(cpal 版の Android 切断経路と同じ仕組みに乗る。
-//! `cpal_backend.rs` の `device_not_available_classifies_...` テスト doc参照)。
-//! 一方、cpal 版が持つ xrun 発生時の動的バッファ長調整(`cpal::host::aaudio::mod.rs`
-//! の `tune_dynamically` 分岐)は実装していない——`AAUDIO_PERFORMANCE_MODE_LOW_LATENCY`
-//! が選ぶ既定のバッファで十分という前提(4-1/4-2 が macOS/iOS 側の自動チューニングに
-//! 踏み込まなかったのと同じ判断)。出力コールバック自体の間隔異常
-//! (「アンダーラン(の疑い)」)は cpal 版と同じ [`crate::underrun::OutputUnderrunTracker`]
-//! で検知する。
+//! - **サンプルレート**: [`REQUESTED_SAMPLE_RATE_HZ`](48kHz)を明示的に要求する
+//!   (cpal 版も既定構成で 48kHz を要求していた)。AAudio は指定したレートで開けなければ
+//!   `openStream` を失敗させる契約なので、開けたなら 48kHz(端末の内部レートが違えば
+//!   AAudio が変換する)。再オープンで出力先が変わってもレートは変わらず、ロード時に
+//!   出力レートへリサンプルして常駐させた SE がずれない。念のため開いた後に
+//!   `AAudioStream_getSampleRate` を読み、`Renderer` にはその実際の値を渡す。
+//! - **エラーの分類**: [`classify_aaudio_error`] が cpal 0.18.1 の
+//!   `impl From<ndk::audio::AudioError> for cpal::Error` と
+//!   `cpal_backend::classify_stream_error` を合成したのと同じ結果を返す
+//!   (切断・サービス喪失・タイムアウト等は `DeviceUnavailable` = 内部再オープンの対象)。
+//! - **xrun でバッファを伸ばす**: cpal の `tune_dynamically` と同じく、データコールバックの
+//!   中で `AAudioStream_getXRunCount` が増えていたら `AAudioStream_setBufferSizeInFrames`
+//!   で 1 burst ずつ伸ばす(上限は capacity。判断は [`XrunBufferTuner`])。xrun の実数は
+//!   [`crate::underrun::OutputUnderrunTracker::record_reported_underrun`] で数える。
+//! - **性能モードの確認**: 開いた後の実効値(性能モード・共有モード・レート・burst・
+//!   バッファ長・capacity)を `open` で1回ログに出し、LowLatency が通らなかったときは
+//!   cpal の `ErrorKind::RealtimeDenied` が行き着いていたのと同じ
+//!   `Event::StreamError { reason: Backend }` を積む。
+//! - **異常時のゼロ埋め**: フレーム数・ポインタが異常なとき・panic を捕まえたときは、
+//!   書ける範囲([`silence_byte_count`])をゼロで埋めてから返す(cpal は毎回ゼロで
+//!   埋めてからユーザーのコールバックを呼んでいた)。
+//!
+//! 出力コールバック自体の間隔異常(「アンダーラン(の疑い)」)は cpal 版と同じ
+//! [`crate::underrun::OutputUnderrunTracker`] で検知する。
 
 use std::ffi::c_void;
 
@@ -84,16 +97,33 @@ use crate::underrun::OutputUnderrunTracker;
 // 純関数部分(ハードウェア無しで `cargo test`(ホスト)から固定化できる)
 // ============================================================================
 
-/// `<aaudio/AAudio.h>` の `AAUDIO_ERROR_DISCONNECTED`。[`classify_aaudio_error`]
-/// (ホストでも実行される純関数)と、実機でのみ呼ばれる [`error_proc`] の両方から
-/// 参照するため `target_os` を問わずコンパイルする。
+/// `<aaudio/AAudio.h>` の `aaudio_result_t` のうち [`classify_aaudio_error`] が見分ける値
+/// (ndk-sys 0.6 の `AAUDIO_ERROR_*` と同じ値)。
 ///
-/// `pub` にしてある理由は実装上の都合: Android 以外のホスト(macOS 等)では
-/// 実際の呼び出し元([`error_proc`])が `#[cfg]` で存在しないため、非公開のままだと
-/// `dead_code` が立つ(`native_backend::apple::seconds_to_ns` が同じ理由で `pub` に
-/// してあるのと同じ事情。以下の [`project_frame_to_ns`]/[`validated_sample_count`]/
-/// [`classify_aaudio_error`] も同様)。
+/// 分類(ホストでも実行される純関数)と、実機でのみ呼ばれる [`error_proc`] の両方から
+/// 参照するため `target_os` を問わずコンパイルする。`pub` にしてある理由は実装上の都合:
+/// Android 以外のホスト(macOS 等)では実際の呼び出し元が `#[cfg]` で存在しないため、
+/// 非公開のままだと `dead_code` が立つ(`native_backend::apple::seconds_to_ns` が同じ理由で
+/// `pub` にしてあるのと同じ事情。以下の純関数も同様)。
 pub const AAUDIO_ERROR_DISCONNECTED: i32 = -899;
+/// `AAUDIO_ERROR_INTERNAL`。
+pub const AAUDIO_ERROR_INTERNAL: i32 = -896;
+/// `AAUDIO_ERROR_INVALID_STATE`。
+pub const AAUDIO_ERROR_INVALID_STATE: i32 = -895;
+/// `AAUDIO_ERROR_INVALID_HANDLE`。
+pub const AAUDIO_ERROR_INVALID_HANDLE: i32 = -892;
+/// `AAUDIO_ERROR_UNAVAILABLE`。
+pub const AAUDIO_ERROR_UNAVAILABLE: i32 = -889;
+/// `AAUDIO_ERROR_TIMEOUT`。
+pub const AAUDIO_ERROR_TIMEOUT: i32 = -885;
+/// `AAUDIO_ERROR_WOULD_BLOCK`。
+pub const AAUDIO_ERROR_WOULD_BLOCK: i32 = -884;
+/// `AAUDIO_ERROR_NO_SERVICE`。
+pub const AAUDIO_ERROR_NO_SERVICE: i32 = -881;
+
+/// 出力ストリームに要求するサンプルレート。cpal 版が既定構成で要求していたのと同じ値
+/// (モジュール doc「cpal 版と揃えていること」)。
+pub const REQUESTED_SAMPLE_RATE_HZ: u32 = 48_000;
 
 /// `AAudioStream_getTimestamp` が返す基準点(フレーム位置 `anchor_frame` が
 /// ホスト単調時刻 `anchor_time_ns` に出力される対応)から、別のフレーム位置
@@ -145,20 +175,148 @@ pub fn validated_sample_count(frames: i32, data: *mut c_void) -> Option<usize> {
     (frames as usize).checked_mul(CHANNELS)
 }
 
+/// 出力が異常なときにゼロで埋めてよいバイト数を返す。null ポインタ・0 以下のフレーム数は
+/// `None`(触らない)。
+///
+/// [`validated_sample_count`] と違いアラインメントは問わない——ゼロ埋めはバイト単位で
+/// 書けるので、`f32` のスライスを作れない(非アラインの)ポインタでも埋められる。
+/// 大きさは AAudio の契約(`numFrames * channelCount * sizeof(float)` 以上を確保済み)に
+/// 従う。
+pub fn silence_byte_count(frames: i32, data: *mut c_void) -> Option<usize> {
+    if frames <= 0 || data.is_null() {
+        return None;
+    }
+    (frames as usize)
+        .checked_mul(CHANNELS)?
+        .checked_mul(std::mem::size_of::<f32>())
+}
+
 /// AAudio のエラーコールバックが渡す `aaudio_result_t` を `mw_core::
 /// StreamErrorReason`(初期構築仕様『§4.6』)へ分類する。
 ///
-/// `cpal_backend::classify_stream_error` と同じ考え方(C# 側が実用的に分岐できる
-/// 粒度へ丸める)だが、分類元が cpal の `ErrorKind`(14種)ではなく AAudio が
-/// エラーコールバックへ実際に渡しうる値に絞られる——Android NDK のドキュメントは
-/// 「切断(`AAUDIO_ERROR_DISCONNECTED`)で呼ばれる」とだけ述べており、それ以外の値が
-/// 実際に渡ることは想定されていない。`AAUDIO_ERROR_DISCONNECTED` だけを明示的に分類し、
-/// 残りは `cpal_backend::classify_stream_error` の `_ =>` と同じ
-/// `StreamErrorReason::Backend` へ丸める。
+/// cpal 0.18.1 が `ndk::audio::AudioError` を `cpal::ErrorKind` へ変換し
+/// (`cpal::host::aaudio::convert` の `impl From<AudioError> for Error`)、それを
+/// `cpal_backend::classify_stream_error` が丸めていたのと同じ結果になる:
+///
+/// | AAudio | cpal の `ErrorKind` | ここ |
+/// |---|---|---|
+/// | `DISCONNECTED` / `UNAVAILABLE` / `NO_SERVICE` / `INVALID_HANDLE` | `DeviceNotAvailable` | `DeviceUnavailable` |
+/// | `WOULD_BLOCK` / `TIMEOUT` | `DeviceBusy` | `DeviceUnavailable` |
+/// | `INTERNAL` / `INVALID_STATE` | `StreamInvalidated` | `Reconfigured` |
+/// | それ以外 | (いずれも `classify_stream_error` の `_ =>`) | `Backend` |
+///
+/// `DeviceUnavailable` だけが `mw-ffi` の内部再オープンの対象になる
+/// (`handle.rs::Instance::note_stream_error`)。
 pub fn classify_aaudio_error(error: i32) -> StreamErrorReason {
     match error {
-        AAUDIO_ERROR_DISCONNECTED => StreamErrorReason::DeviceUnavailable,
+        AAUDIO_ERROR_DISCONNECTED
+        | AAUDIO_ERROR_UNAVAILABLE
+        | AAUDIO_ERROR_NO_SERVICE
+        | AAUDIO_ERROR_INVALID_HANDLE
+        | AAUDIO_ERROR_WOULD_BLOCK
+        | AAUDIO_ERROR_TIMEOUT => StreamErrorReason::DeviceUnavailable,
+        AAUDIO_ERROR_INTERNAL | AAUDIO_ERROR_INVALID_STATE => StreamErrorReason::Reconfigured,
         _ => StreamErrorReason::Backend,
+    }
+}
+
+/// `AAudioStream_getFramesPerBurst` が 0 以下を返したときに使う burst の長さ
+/// (cpal 0.18.1 の `tune_dynamically` と同じ。AAudio のドキュメントの値)。
+pub const FALLBACK_FRAMES_PER_BURST: i32 = 256;
+/// burst の長さの下限(cpal 0.18.1 と同じ。Oboe の値)。
+pub const MIN_FRAMES_PER_BURST: i32 = 16;
+
+/// xrun が増えたときに出力バッファを 1 burst 伸ばす判断(cpal 0.18.1 の
+/// `build_output_stream` の `tune_dynamically` 分岐と同じ考え方。AAudio の
+/// 「Tuning buffers」の手順)。音声スレッドが排他的に持つ。確保・ロックは無い。
+///
+/// 初期の burst 数は開いた直後の `getBufferSizeInFrames / getFramesPerBurst`
+/// (cpal はシステムプロパティ `aaudio.mixer_bursts` を Java 経由で読み、読めなければ
+/// この式に落ちていた。ここは Java を使わないので常にこの式)。
+///
+/// ⚠️ cpal 0.18.1 は `setBufferSizeInFrames` の成否を ndk 0.9 の `from_result` で
+/// 判定しており、成功時の戻り値(実際のバッファ長 = 正の値)を失敗と見なして
+/// burst 数を進めない。結果として cpal 版は最初の xrun で1段伸ばしたきり止まる。
+/// ここは AAudio の契約どおり「0 以上なら成功」と見なし、capacity まで段階的に伸ばす。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XrunBufferTuner {
+    previous_xrun_count: i32,
+    bursts: i32,
+    capacity_frames: i32,
+}
+
+/// [`XrunBufferTuner::observe`] が返す、このコールバックでやること。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XrunStep {
+    /// 前回から増えた xrun の数。
+    pub new_xruns: u32,
+    /// `AAudioStream_setBufferSizeInFrames` へ渡すフレーム数。既に capacity に達して
+    /// いれば `None`(呼ばない)。
+    pub request_buffer_frames: Option<i32>,
+    /// 伸ばしが通ったときの burst 数([`XrunBufferTuner::commit`] へそのまま渡す)。
+    pub next_bursts: i32,
+}
+
+impl XrunBufferTuner {
+    /// 開いた直後の値から作る。
+    pub fn new(buffer_size_frames: i32, frames_per_burst: i32, capacity_frames: i32) -> Self {
+        let bursts = if frames_per_burst > 0 && buffer_size_frames > 0 {
+            buffer_size_frames / frames_per_burst
+        } else {
+            0
+        };
+        Self {
+            previous_xrun_count: 0,
+            bursts,
+            capacity_frames,
+        }
+    }
+
+    /// 今の burst 数。
+    pub fn bursts(&self) -> i32 {
+        self.bursts
+    }
+
+    /// 毎コールバック、`AAudioStream_getXRunCount` と `AAudioStream_getFramesPerBurst`
+    /// (burst の長さは動的に変わりうる)の値で呼ぶ。xrun が増えていなければ `None`。
+    pub fn observe(&mut self, xrun_count: i32, frames_per_burst: i32) -> Option<XrunStep> {
+        if xrun_count <= self.previous_xrun_count {
+            return None;
+        }
+        let new_xruns = (xrun_count - self.previous_xrun_count) as u32;
+        self.previous_xrun_count = xrun_count;
+
+        let burst = if frames_per_burst <= 0 {
+            FALLBACK_FRAMES_PER_BURST
+        } else {
+            frames_per_burst.max(MIN_FRAMES_PER_BURST)
+        };
+        let capacity = self.capacity_frames;
+        let current = burst.saturating_mul(self.bursts);
+        let next_bursts = self.bursts.saturating_add(1);
+        let request_buffer_frames = if capacity > 0 && current >= capacity {
+            None
+        } else {
+            let wanted = burst.saturating_mul(next_bursts);
+            Some(if capacity > 0 {
+                wanted.min(capacity)
+            } else {
+                wanted
+            })
+        };
+        Some(XrunStep {
+            new_xruns,
+            request_buffer_frames,
+            next_bursts,
+        })
+    }
+
+    /// `AAudioStream_setBufferSizeInFrames` の戻り値(実際のバッファ長、または負のエラー)
+    /// を渡す。成功なら burst 数を進める。
+    pub fn commit(&mut self, step: XrunStep, set_result: i32) {
+        if set_result >= 0 {
+            self.bursts = step.next_bursts;
+        }
     }
 }
 
@@ -203,6 +361,18 @@ const AAUDIO_FORMAT_PCM_FLOAT: i32 = 2;
 /// 設定していたのと同じ値(モジュール doc参照)。
 #[cfg(target_os = "android")]
 const AAUDIO_PERFORMANCE_MODE_LOW_LATENCY: i32 = 12;
+/// `AAUDIO_SHARING_MODE_EXCLUSIVE`(ログで名前を出すためだけに使う)。
+#[cfg(target_os = "android")]
+const AAUDIO_SHARING_MODE_EXCLUSIVE: i32 = 0;
+/// `AAUDIO_SHARING_MODE_SHARED`。
+#[cfg(target_os = "android")]
+const AAUDIO_SHARING_MODE_SHARED: i32 = 1;
+/// `AAUDIO_PERFORMANCE_MODE_NONE`。
+#[cfg(target_os = "android")]
+const AAUDIO_PERFORMANCE_MODE_NONE: i32 = 10;
+/// `AAUDIO_PERFORMANCE_MODE_POWER_SAVING`。
+#[cfg(target_os = "android")]
+const AAUDIO_PERFORMANCE_MODE_POWER_SAVING: i32 = 11;
 /// `AAUDIO_CALLBACK_RESULT_CONTINUE`。
 #[cfg(target_os = "android")]
 const AAUDIO_CALLBACK_RESULT_CONTINUE: i32 = 0;
@@ -243,6 +413,13 @@ unsafe extern "C" {
     fn AAudioStream_requestStop(stream: *mut AAudioStream) -> i32;
     fn AAudioStream_close(stream: *mut AAudioStream) -> i32;
     fn AAudioStream_getSampleRate(stream: *mut AAudioStream) -> i32;
+    fn AAudioStream_getPerformanceMode(stream: *mut AAudioStream) -> i32;
+    fn AAudioStream_getSharingMode(stream: *mut AAudioStream) -> i32;
+    fn AAudioStream_getFramesPerBurst(stream: *mut AAudioStream) -> i32;
+    fn AAudioStream_getBufferSizeInFrames(stream: *mut AAudioStream) -> i32;
+    fn AAudioStream_getBufferCapacityInFrames(stream: *mut AAudioStream) -> i32;
+    fn AAudioStream_setBufferSizeInFrames(stream: *mut AAudioStream, num_frames: i32) -> i32;
+    fn AAudioStream_getXRunCount(stream: *mut AAudioStream) -> i32;
     fn AAudioStream_getFramesWritten(stream: *mut AAudioStream) -> i64;
     fn AAudioStream_getTimestamp(
         stream: *mut AAudioStream,
@@ -252,10 +429,26 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-/// デバイスが見つからない等でハードウェアのレートを読めなかったときのフォールバック
-/// (`native_backend::apple::FALLBACK_SAMPLE_RATE_HZ` と同じ役割)。
+/// ログ用に性能モードの名前を返す。
 #[cfg(target_os = "android")]
-const FALLBACK_SAMPLE_RATE_HZ: u32 = 48_000;
+fn performance_mode_name(mode: i32) -> &'static str {
+    match mode {
+        AAUDIO_PERFORMANCE_MODE_NONE => "NONE",
+        AAUDIO_PERFORMANCE_MODE_POWER_SAVING => "POWER_SAVING",
+        AAUDIO_PERFORMANCE_MODE_LOW_LATENCY => "LOW_LATENCY",
+        _ => "UNKNOWN",
+    }
+}
+
+/// ログ用に共有モードの名前を返す。
+#[cfg(target_os = "android")]
+fn sharing_mode_name(mode: i32) -> &'static str {
+    match mode {
+        AAUDIO_SHARING_MODE_EXCLUSIVE => "EXCLUSIVE",
+        AAUDIO_SHARING_MODE_SHARED => "SHARED",
+        _ => "UNKNOWN",
+    }
+}
 
 // ============================================================================
 // レンダーコールバック(音声スレッド)/ エラーコールバック(別スレッド)
@@ -271,10 +464,15 @@ struct CallbackContext {
     /// オープン後に確定したサンプルレート(オープン中は変わらない)。
     sample_rate: u32,
     underrun_tracker: OutputUnderrunTracker,
+    /// xrun でバッファを伸ばす判断(モジュール doc「cpal 版と揃えていること」)。
+    buffer_tuner: XrunBufferTuner,
     /// [`AndroidBackend::callback_frames`] へ渡す `Arc`。
     callback_frames: Arc<AtomicU32>,
     /// [`AndroidBackend::output_latency_ns`] へ渡す `Arc`。
     output_latency_ns: Arc<AtomicU64>,
+    /// [`AndroidBackend::buffer_size_frames`] へ渡す `Arc`(xrun で伸ばした後の実際の
+    /// バッファ長。ログはゲームスレッドが出す)。
+    buffer_size_frames: Arc<AtomicU32>,
     /// [`AndroidBackend::close`] がストリーム停止後に `Acquire` で読むための同期点
     /// (`cpal_backend::CpalBackend::render_completions` と同じ理由)。
     render_completions: Arc<AtomicU64>,
@@ -315,6 +513,10 @@ unsafe extern "C" fn render_proc(
         let context = unsafe { &mut *(user_data as *mut CallbackContext) };
 
         let Some(sample_count) = validated_sample_count(num_frames, audio_data) else {
+            // 書けない形(非アライン等)でも、触れる範囲は無音にしておく(前回の中身が
+            // 残るとブツ音・持続音になる)。
+            // SAFETY: 関数 doc の契約 + `silence_byte_count` が null と 0 以下を弾く。
+            unsafe { write_silence(num_frames, audio_data) };
             return;
         };
         // SAFETY: `validated_sample_count` が null・非アライン・0以下のフレーム数を
@@ -330,6 +532,34 @@ unsafe extern "C" fn render_proc(
 
         // 相関点(このコールバックが呼ばれたホスト単調時刻)。
         let callback_host_time_ns = host_time_ns();
+
+        // xrun の実数を数え、増えていればバッファを 1 burst 伸ばす(cpal 0.18.1 も
+        // データコールバックの中で同じ2つを呼んでいる。どちらも AAudio のクライアント側の
+        // 状態を読み書きするだけで、確保・ロック・待ちは無い)。
+        // `observe` より先に数える——`record_reported_underrun` が間隔の基準を捨てるので、
+        // 同じ事象を間隔のヒューリスティックでも二重に数えない。
+        // SAFETY: `stream` は AAudio が渡す有効なポインタ(関数 doc の契約)。
+        let (xrun_count, frames_per_burst) = unsafe {
+            (
+                AAudioStream_getXRunCount(stream),
+                AAudioStream_getFramesPerBurst(stream),
+            )
+        };
+        if let Some(step) = context.buffer_tuner.observe(xrun_count, frames_per_burst) {
+            for _ in 0..step.new_xruns.min(MAX_XRUNS_RECORDED_PER_CALLBACK) {
+                context
+                    .underrun_tracker
+                    .record_reported_underrun(callback_host_time_ns);
+            }
+            if let Some(frames) = step.request_buffer_frames {
+                // SAFETY: 同上。
+                let result = unsafe { AAudioStream_setBufferSizeInFrames(stream, frames) };
+                context.buffer_tuner.commit(step, result);
+                context
+                    .buffer_size_frames
+                    .store(result.max(0) as u32, Ordering::Relaxed);
+            }
+        }
 
         let mut anchor_frame: i64 = 0;
         let mut anchor_time_ns: i64 = 0;
@@ -374,10 +604,30 @@ unsafe extern "C" fn render_proc(
 
     if caught.is_err() {
         // 契約が破られた場合の最後の防波堤(`native_backend::apple::render_proc` と
-        // 同じ方針)。バッファへは書き込まない(無音ではなく直前の内容が残る可能性が
-        // あるが、クラッシュさせないことを優先する)。
+        // 同じ方針)。途中まで書いた内容が残らないよう、触れる範囲を無音にする。
+        // SAFETY: 関数 doc の契約 + `silence_byte_count` が null と 0 以下を弾く。
+        unsafe { write_silence(num_frames, audio_data) };
     }
     AAUDIO_CALLBACK_RESULT_CONTINUE
+}
+
+/// 1回のコールバックで `record_reported_underrun` を呼ぶ回数の上限(xrun 数が一度に
+/// 大きく跳んだときに音声スレッドでの処理が延びないようにする)。
+#[cfg(target_os = "android")]
+const MAX_XRUNS_RECORDED_PER_CALLBACK: u32 = 64;
+
+/// 出力バッファの触れる範囲をゼロで埋める。null・0 以下のフレーム数なら何もしない。
+///
+/// # SAFETY
+///
+/// `data` が null でなければ、AAudio の契約どおり `frames * CHANNELS * size_of::<f32>()`
+/// バイト以上書ける領域を指していること(データコールバックの `audio_data`)。
+#[cfg(target_os = "android")]
+unsafe fn write_silence(frames: i32, data: *mut c_void) {
+    if let Some(bytes) = silence_byte_count(frames, data) {
+        // SAFETY: 呼び出し元の契約。バイト単位なのでアラインメントは問わない。
+        unsafe { std::ptr::write_bytes(data as *mut u8, 0, bytes) };
+    }
 }
 
 /// AAudio のエラー通知スレッド(音声コールバックとは別スレッド、モジュール doc参照)
@@ -422,6 +672,7 @@ pub struct AndroidBackend {
     error_context_ptr: Option<*mut ErrorContext>,
     callback_frames: Arc<AtomicU32>,
     output_latency_ns: Arc<AtomicU64>,
+    buffer_size_frames: Arc<AtomicU32>,
     render_completions: Arc<AtomicU64>,
     logged_output_latency: AtomicBool,
     sample_rate: u32,
@@ -455,6 +706,7 @@ impl AndroidBackend {
             error_context_ptr: None,
             callback_frames: Arc::new(AtomicU32::new(0)),
             output_latency_ns: Arc::new(AtomicU64::new(0)),
+            buffer_size_frames: Arc::new(AtomicU32::new(0)),
             render_completions: Arc::new(AtomicU64::new(0)),
             logged_output_latency: AtomicBool::new(false),
             sample_rate: 0,
@@ -486,11 +738,10 @@ impl Backend for AndroidBackend {
             AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_OUTPUT);
             AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
             AAudioStreamBuilder_setChannelCount(builder, CHANNELS as i32);
-            // サンプルレートは指定しない(`AAUDIO_UNSPECIFIED` = 0)——ハードウェアの
-            // 既定値をそのまま使う(`native_backend::apple::query_output_sample_rate`
-            // がハードウェア側のレートに合わせるのと同じ狙い)。実際に採用された値は
-            // オープン後に `AAudioStream_getSampleRate` で読み直す(下記)。
-            AAudioStreamBuilder_setSampleRate(builder, 0);
+            // cpal 版と同じく 48kHz を要求する(モジュール doc「cpal 版と揃えている
+            // こと」)。端末の既定レートを採ると、再オープンで出力先が変わったときに
+            // レートが変わり、ロード済みの SE がずれたレートのまま鳴る。
+            AAudioStreamBuilder_setSampleRate(builder, REQUESTED_SAMPLE_RATE_HZ as i32);
             AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
         }
 
@@ -504,8 +755,11 @@ impl Backend for AndroidBackend {
                 Arc::clone(&self.last_output_underrun_host_time_ns),
                 Arc::clone(&self.consecutive_output_underrun_count),
             ),
+            // 実際の値は `openStream` の後でないと分からない(下記で書き直す)。
+            buffer_tuner: XrunBufferTuner::new(0, 0, 0),
             callback_frames: Arc::clone(&self.callback_frames),
             output_latency_ns: Arc::clone(&self.output_latency_ns),
+            buffer_size_frames: Arc::clone(&self.buffer_size_frames),
             render_completions: Arc::clone(&self.render_completions),
         });
         let context_ptr = Box::into_raw(context);
@@ -547,11 +801,29 @@ impl Backend for AndroidBackend {
         }
 
         // SAFETY: `stream` は直前に `openStream` が返した有効なハンドル。
-        let negotiated_rate = unsafe { AAudioStream_getSampleRate(stream) };
+        let (
+            negotiated_rate,
+            performance_mode,
+            sharing_mode,
+            frames_per_burst,
+            buffer_size,
+            capacity,
+        ) = unsafe {
+            (
+                AAudioStream_getSampleRate(stream),
+                AAudioStream_getPerformanceMode(stream),
+                AAudioStream_getSharingMode(stream),
+                AAudioStream_getFramesPerBurst(stream),
+                AAudioStream_getBufferSizeInFrames(stream),
+                AAudioStream_getBufferCapacityInFrames(stream),
+            )
+        };
+        // 要求したレートで開けなければ `openStream` が失敗する契約なので、ここは
+        // `REQUESTED_SAMPLE_RATE_HZ` のはず。それでも `Renderer` には実際の値を渡す。
         let sample_rate = if negotiated_rate > 0 {
             negotiated_rate as u32
         } else {
-            FALLBACK_SAMPLE_RATE_HZ
+            REQUESTED_SAMPLE_RATE_HZ
         };
 
         // `AAudioStream_requestStart` を呼ぶ前なので、レンダーコールバックは一度も
@@ -563,6 +835,44 @@ impl Backend for AndroidBackend {
         unsafe {
             (*context_ptr).sample_rate = sample_rate;
             (*context_ptr).renderer.set_sample_rate(sample_rate);
+            (*context_ptr).buffer_tuner =
+                XrunBufferTuner::new(buffer_size, frames_per_burst, capacity);
+        }
+        self.buffer_size_frames
+            .store(buffer_size.max(0) as u32, Ordering::Relaxed);
+
+        // 開いた後の実効値。端末ごとの違い(LowLatency が通ったか・burst・バッファ長)は
+        // 実機で問題が起きたときの手がかりになる。
+        crate::mw_log!(
+            "[mw-backend] (native/android) output stream opened: performance_mode={} ({}), \
+             sharing_mode={} ({}), sample_rate={} Hz (requested {} Hz), \
+             frames_per_burst={}, buffer_size={} frames, buffer_capacity={} frames",
+            performance_mode_name(performance_mode),
+            performance_mode,
+            sharing_mode_name(sharing_mode),
+            sharing_mode,
+            negotiated_rate,
+            REQUESTED_SAMPLE_RATE_HZ,
+            frames_per_burst,
+            buffer_size,
+            capacity,
+        );
+        if performance_mode != AAUDIO_PERFORMANCE_MODE_LOW_LATENCY {
+            // cpal 0.18.1 は最初のデータコールバックで性能モードを読み、LowLatency で
+            // なければ `ErrorKind::RealtimeDenied` を error callback へ流していた。
+            // `cpal_backend::classify_stream_error` はそれを `Backend` に丸めるので、
+            // 同じイベントをここ(ゲームスレッド)で積む。性能モードは開いた時点で
+            // 決まっているので、音声スレッドで読む必要は無い。
+            crate::mw_log!(
+                "[mw-backend] (native/android) low-latency performance mode was not granted"
+            );
+            // SAFETY: `error_context_ptr` はこの関数が `Box::into_raw` したもので、
+            // `ErrorContext` は共有参照でしか触られない(error callback と同じ)。
+            unsafe { &*error_context_ptr }
+                .events
+                .push_side_channel(Event::StreamError {
+                    reason: StreamErrorReason::Backend,
+                });
         }
 
         // SAFETY: `stream` は有効なハンドル。
@@ -628,6 +938,7 @@ impl Backend for AndroidBackend {
                 self.callback_frames.store(0, Ordering::Relaxed);
                 self.render_completions.store(0, Ordering::Relaxed);
                 self.output_latency_ns.store(0, Ordering::Relaxed);
+                self.buffer_size_frames.store(0, Ordering::Relaxed);
                 self.logged_output_latency.store(false, Ordering::Relaxed);
                 self.output_underrun_count.store(0, Ordering::Relaxed);
                 self.last_output_underrun_host_time_ns
@@ -687,9 +998,11 @@ impl Backend for AndroidBackend {
         let consecutive = self
             .consecutive_output_underrun_count
             .load(Ordering::Relaxed);
+        let buffer_size = self.buffer_size_frames.load(Ordering::Relaxed);
         crate::mw_log!(
-            "[mw-backend] (native/android) output underrun suspected: +{new_count} since \
-             last check (cumulative={current}, consecutive={consecutive})"
+            "[mw-backend] (native/android) output underrun (AAudio xrun or suspected \
+             callback gap): +{new_count} since last check (cumulative={current}, \
+             consecutive={consecutive}, buffer_size={buffer_size} frames)"
         );
     }
 
@@ -787,7 +1100,134 @@ mod tests {
     }
 
     #[test]
+    fn classify_aaudio_error_maps_lost_device_and_service_codes_to_device_unavailable() {
+        for code in [
+            AAUDIO_ERROR_UNAVAILABLE,
+            AAUDIO_ERROR_NO_SERVICE,
+            AAUDIO_ERROR_INVALID_HANDLE,
+            AAUDIO_ERROR_TIMEOUT,
+            AAUDIO_ERROR_WOULD_BLOCK,
+        ] {
+            assert_eq!(
+                classify_aaudio_error(code),
+                StreamErrorReason::DeviceUnavailable,
+                "code {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_aaudio_error_maps_internal_and_invalid_state_to_reconfigured() {
+        assert_eq!(
+            classify_aaudio_error(AAUDIO_ERROR_INTERNAL),
+            StreamErrorReason::Reconfigured
+        );
+        assert_eq!(
+            classify_aaudio_error(AAUDIO_ERROR_INVALID_STATE),
+            StreamErrorReason::Reconfigured
+        );
+    }
+
+    #[test]
     fn classify_aaudio_error_maps_unmatched_codes_to_backend() {
-        assert_eq!(classify_aaudio_error(-885), StreamErrorReason::Backend);
+        // `AAUDIO_ERROR_ILLEGAL_ARGUMENT`。
+        assert_eq!(classify_aaudio_error(-898), StreamErrorReason::Backend);
+        assert_eq!(classify_aaudio_error(1), StreamErrorReason::Backend);
+    }
+
+    #[test]
+    fn requested_sample_rate_is_48khz() {
+        assert_eq!(REQUESTED_SAMPLE_RATE_HZ, 48_000);
+    }
+
+    #[test]
+    fn silence_byte_count_covers_every_channel_of_every_frame() {
+        let mut buf = [0.0f32; 8];
+        assert_eq!(
+            silence_byte_count(4, buf.as_mut_ptr().cast()),
+            Some(4 * CHANNELS * std::mem::size_of::<f32>())
+        );
+    }
+
+    #[test]
+    fn silence_byte_count_accepts_a_misaligned_pointer() {
+        let mut buf = [0.0f32; 8];
+        let misaligned = unsafe { (buf.as_mut_ptr() as *mut u8).add(1) };
+        assert_eq!(
+            silence_byte_count(1, misaligned.cast()),
+            Some(CHANNELS * std::mem::size_of::<f32>())
+        );
+    }
+
+    #[test]
+    fn silence_byte_count_leaves_a_null_buffer_untouched() {
+        assert_eq!(silence_byte_count(4, std::ptr::null_mut()), None);
+    }
+
+    #[test]
+    fn silence_byte_count_rejects_non_positive_frame_counts() {
+        let mut buf = [0.0f32; 8];
+        assert_eq!(silence_byte_count(0, buf.as_mut_ptr().cast()), None);
+        assert_eq!(silence_byte_count(-4, buf.as_mut_ptr().cast()), None);
+    }
+
+    #[test]
+    fn xrun_buffer_tuner_starts_from_the_opened_buffer_in_bursts() {
+        let tuner = XrunBufferTuner::new(192, 96, 1_920);
+        assert_eq!(tuner.bursts(), 2);
+    }
+
+    #[test]
+    fn xrun_buffer_tuner_does_nothing_while_the_xrun_count_stays() {
+        let mut tuner = XrunBufferTuner::new(192, 96, 1_920);
+        assert_eq!(tuner.observe(0, 96), None);
+    }
+
+    #[test]
+    fn xrun_buffer_tuner_grows_the_buffer_by_one_burst_per_new_xrun_report() {
+        let mut tuner = XrunBufferTuner::new(192, 96, 1_920);
+
+        let step = tuner.observe(1, 96).expect("xrun increased");
+        assert_eq!(step.new_xruns, 1);
+        assert_eq!(step.request_buffer_frames, Some(288));
+        tuner.commit(step, 288);
+        assert_eq!(tuner.bursts(), 3);
+
+        let step = tuner.observe(4, 96).expect("xrun increased");
+        assert_eq!(step.new_xruns, 3);
+        assert_eq!(step.request_buffer_frames, Some(384));
+        tuner.commit(step, 384);
+        assert_eq!(tuner.bursts(), 4);
+    }
+
+    #[test]
+    fn xrun_buffer_tuner_keeps_the_burst_count_when_the_resize_fails() {
+        let mut tuner = XrunBufferTuner::new(192, 96, 1_920);
+        let step = tuner.observe(1, 96).expect("xrun increased");
+        tuner.commit(step, AAUDIO_ERROR_INVALID_STATE);
+        assert_eq!(tuner.bursts(), 2);
+    }
+
+    #[test]
+    fn xrun_buffer_tuner_clamps_to_the_capacity_and_then_stops_resizing() {
+        let mut tuner = XrunBufferTuner::new(192, 96, 250);
+        let step = tuner.observe(1, 96).expect("xrun increased");
+        assert_eq!(step.request_buffer_frames, Some(250));
+        tuner.commit(step, 250);
+
+        let step = tuner.observe(2, 96).expect("xrun increased");
+        assert_eq!(step.new_xruns, 1);
+        assert_eq!(step.request_buffer_frames, None);
+    }
+
+    #[test]
+    fn xrun_buffer_tuner_uses_the_fallback_and_floor_for_odd_burst_sizes() {
+        let mut tuner = XrunBufferTuner::new(0, 0, 10_000);
+        let step = tuner.observe(1, 0).expect("xrun increased");
+        assert_eq!(step.request_buffer_frames, Some(FALLBACK_FRAMES_PER_BURST));
+
+        let mut tuner = XrunBufferTuner::new(0, 0, 10_000);
+        let step = tuner.observe(1, 4).expect("xrun increased");
+        assert_eq!(step.request_buffer_frames, Some(MIN_FRAMES_PER_BURST));
     }
 }
