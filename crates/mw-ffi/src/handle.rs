@@ -757,6 +757,7 @@ impl Instance {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let saved_bus_volumes: [f32; BUS_COUNT] =
             std::array::from_fn(|i| f32::from_bits(self.bus_volumes[i].load(Ordering::Relaxed)));
+        let sample_rate_before = self.backend_sample_rate();
 
         mw_backend::mw_log!(
             "[mw-ffi] attempting internal stream reopen (attempt={}, music_state={:?}, \
@@ -799,6 +800,7 @@ impl Instance {
                 saved_bgm_sound_id,
                 saved_bgm_loop,
                 saved_bus_volumes,
+                sample_rate_before,
             },
         }
     }
@@ -829,10 +831,15 @@ impl Instance {
     }
 
     /// 楽曲ボイスの状態を再送する(段3 `finalize_reopen_success` が呼ぶ)。
+    ///
+    /// `clock_before.song_frames` と `loop_region` は再オープン前の出力レート
+    /// (`sample_rate_before`)のフレーム数。`loop_region` は呼び出し元が換算済みのものを
+    /// 渡し、位置はここで新しい出力レートへ換算する(`rescale_output_frames`)。
     fn restore_music(
         &self,
         sound_id: Option<u64>,
         clock_before: &MusicClockSnapshot,
+        sample_rate_before: u32,
         loop_region: Option<(u64, u64)>,
     ) {
         let Some(sound_id) = sound_id else {
@@ -864,7 +871,11 @@ impl Instance {
         // 問題への対処」参照)。
         let _ = self.command_sender.send(Command::MusicPrepare);
         let _ = self.command_sender.send(Command::MusicSeek {
-            frames: clock_before.song_frames,
+            frames: rescale_output_frames(
+                clock_before.song_frames,
+                sample_rate_before,
+                output_sample_rate,
+            ),
         });
         if let Some(region) = loop_region {
             let _ = self.command_sender.send(Command::MusicSetLoop {
@@ -949,6 +960,33 @@ struct ReopenSnapshot {
     saved_bgm_loop: Option<(u64, u64)>,
     /// 4バスの直近の目標音量の複製。
     saved_bus_volumes: [f32; BUS_COUNT],
+    /// 再オープン前の出力サンプルレート(0 = 不明)。曲の位置・ループ区間は出力レートの
+    /// フレーム数なので、新しいストリームのレートが違えば換算して戻す。
+    sample_rate_before: u32,
+}
+
+/// 出力レート `from_rate` のフレーム数を `to_rate` のフレーム数へ換算する。どちらかが
+/// 0(不明)なら換算しない。丸めはデコーダのシーク位置と同じ
+/// (`mw_core::resample::convert_frame_count`)。
+fn rescale_output_frames(frames: u64, from_rate: u32, to_rate: u32) -> u64 {
+    if from_rate == 0 || to_rate == 0 {
+        return frames;
+    }
+    mw_core::resample::convert_frame_count(frames, from_rate, to_rate)
+}
+
+/// [`rescale_output_frames`] のループ区間版。
+fn rescale_output_region(
+    region: Option<(u64, u64)>,
+    from_rate: u32,
+    to_rate: u32,
+) -> Option<(u64, u64)> {
+    region.map(|(begin, end)| {
+        (
+            rescale_output_frames(begin, from_rate, to_rate),
+            rescale_output_frames(end, from_rate, to_rate),
+        )
+    })
 }
 
 /// 段1 が `Instance` から切り離し、段2(ワーカースレッド)へ渡す一式。
@@ -1209,14 +1247,39 @@ fn finalize_reopen_success(
         .last_known_sample_rate
         .store(instance.backend.sample_rate(), Ordering::Relaxed);
 
+    // 曲の位置・ループ区間は出力レートのフレーム数なので、レートが変わっていれば換算する。
+    let sample_rate_after = instance.backend_sample_rate();
+    let music_loop = rescale_output_region(
+        snapshot.saved_music_loop,
+        snapshot.sample_rate_before,
+        sample_rate_after,
+    );
+    let bgm_loop = rescale_output_region(
+        snapshot.saved_bgm_loop,
+        snapshot.sample_rate_before,
+        sample_rate_after,
+    );
+    if snapshot.sample_rate_before != 0 && snapshot.sample_rate_before != sample_rate_after {
+        mw_backend::mw_log!(
+            "[mw-ffi] internal stream reopen: output sample rate changed {} -> {} Hz; music \
+             position and loop regions are converted, but already loaded SE keep the old rate \
+             (their pitch and length are off until reloaded)",
+            snapshot.sample_rate_before,
+            sample_rate_after,
+        );
+        instance.note_music_loop(music_loop);
+        instance.note_bgm_loop(bgm_loop);
+    }
+
     // 状態を復元する(`Instance::begin_reopen` のドキュメント「復元できる状態」参照)。
     instance.restore_bus_volumes(&snapshot.saved_bus_volumes);
     instance.restore_music(
         snapshot.saved_music_sound_id,
         &snapshot.clock_before,
-        snapshot.saved_music_loop,
+        snapshot.sample_rate_before,
+        music_loop,
     );
-    instance.restore_bgm(snapshot.saved_bgm_sound_id, snapshot.saved_bgm_loop);
+    instance.restore_bgm(snapshot.saved_bgm_sound_id, bgm_loop);
 
     mw_backend::mw_log!("[mw-ffi] internal stream reopen succeeded");
     instance.reopen.record_result(true, now_ns);
@@ -1680,6 +1743,28 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn rescale_output_frames_converts_between_output_rates() {
+        assert_eq!(rescale_output_frames(48_000, 48_000, 44_100), 44_100);
+        assert_eq!(rescale_output_frames(44_100, 44_100, 48_000), 48_000);
+    }
+
+    #[test]
+    fn rescale_output_frames_keeps_the_value_when_the_rate_is_unchanged_or_unknown() {
+        assert_eq!(rescale_output_frames(12_345, 48_000, 48_000), 12_345);
+        assert_eq!(rescale_output_frames(12_345, 0, 48_000), 12_345);
+        assert_eq!(rescale_output_frames(12_345, 48_000, 0), 12_345);
+    }
+
+    #[test]
+    fn rescale_output_region_converts_both_ends() {
+        assert_eq!(
+            rescale_output_region(Some((96_000, 192_000)), 48_000, 44_100),
+            Some((88_200, 176_400))
+        );
+        assert_eq!(rescale_output_region(None, 48_000, 44_100), None);
+    }
 
     // Note: これらのテストはグローバルレジストリを共有するため、cpal のデバイス有無に
     // 依存する部分(実際に `Opened` になるかどうか)は環境依存。ここでは
