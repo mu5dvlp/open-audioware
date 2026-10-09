@@ -42,6 +42,20 @@ impl StreamHandle {
     }
 }
 
+/// iOS の割り込み復帰([`ios_interruption::Watcher`])から見た cpal のストリーム。
+/// 止め直し・動かし直しは cpal の `pause()`/`play()` そのもの。作り直しはしない
+/// (`RecoverableOutput::supports_rebuild` の既定 `false`。作り直すと `Renderer` ごと
+/// 失われるため——`ios_interruption.rs` のモジュール doc「実装方針」)。
+impl ios_interruption::RecoverableOutput for StreamHandle {
+    fn pause(&self) -> Result<(), String> {
+        StreamHandle::pause(self).map_err(|e| e.to_string())
+    }
+
+    fn play(&self) -> Result<(), String> {
+        StreamHandle::play(self).map_err(|e| e.to_string())
+    }
+}
+
 /// [`StreamHandle::pause`]/[`StreamHandle::play`] が返すエラー。cpal の内部エラー型
 /// (`cpal::PauseStreamError`/`cpal::PlayStreamError`)を文言だけ保持して包み直したもの。
 #[derive(Debug)]
@@ -268,7 +282,7 @@ impl Backend for CpalBackend {
         // フィールド doc を参照。iOS / tvOS 以外では no-op(`ios_interruption.rs`)。
         let stream = Arc::new(stream);
         self.ios_interruption = Some(ios_interruption::Watcher::new(
-            Arc::clone(&stream),
+            Arc::clone(&stream) as Arc<dyn ios_interruption::RecoverableOutput>,
             events,
             Arc::clone(&self.callback_ticks),
         ));

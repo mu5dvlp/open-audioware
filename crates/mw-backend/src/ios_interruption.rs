@@ -183,7 +183,41 @@ use std::sync::atomic::AtomicU64;
 
 use mw_core::EventQueue;
 
-use crate::cpal_backend::StreamHandle;
+/// 復帰の対象になる出力。**監視(どの通知で・いつ復帰を試みるか)はこのモジュールが
+/// 一手に持ち、実際の止め方・動かし方だけをバックエンドごとに差し替える**ための境目。
+///
+/// - cpal 版(`cpal_backend::StreamHandle`): `pause()`/`play()` は cpal の
+///   `Stream::pause`/`Stream::play` そのもの(モジュール doc「実機バグの原因」)。
+/// - 自前の Apple バックエンド(`native_backend::apple`): `pause()` は
+///   `AudioOutputUnitStop`、`play()` は `AudioOutputUnitStart`(失敗したら
+///   `AudioUnitInitialize` し直してから再度 Start)。
+///
+/// どちらも**音声スレッドからは呼ばれない**(通知ハンドラ・復帰確認のワーカー・
+/// ウォッチドッグのいずれかの非リアルタイムスレッド)。エラーは文言だけを返す
+/// (ログに出すためだけに使い、成否の最終判定はコールバックの前進の実測で行う)。
+pub trait RecoverableOutput: Send + Sync {
+    /// 出力を止める。既に止まっているものに呼んでも安全であること。
+    fn pause(&self) -> Result<(), String>;
+
+    /// 出力を(再)開始する。既に動いているものに呼んでも安全であること。
+    fn play(&self) -> Result<(), String>;
+
+    /// 出力そのもの(AudioUnit 等)を作り直せるか。`true` のときだけ
+    /// `AVAudioSessionMediaServicesWereResetNotification` を監視し、
+    /// 復帰確認が最後まで空振りしたときの最後の手段としても [`Self::rebuild`] を使う。
+    ///
+    /// 既定は `false`(cpal 版。`cpal::Stream` は作り直すと `Renderer` ごと失われるため
+    /// 作り直さない——モジュール doc「実装方針」の選択肢1)。
+    fn supports_rebuild(&self) -> bool {
+        false
+    }
+
+    /// 出力そのものを作り直す(**開始はしない**——開始は続く [`Self::play`] が行う)。
+    /// [`Self::supports_rebuild`] が `false` の出力では呼ばれない。
+    fn rebuild(&self) -> Result<(), String> {
+        Err("rebuild is not supported by this output".to_owned())
+    }
+}
 
 /// 割り込みからの復帰を表す状態機械(OS API 呼び出しを一切含まない、純粋な値型)。
 ///
@@ -289,6 +323,23 @@ impl InterruptionState {
             Self::RecoveryPending
         } else {
             self
+        }
+    }
+
+    /// メディアサービスがリセットされた(`AVAudioSessionMediaServicesWereResetNotification`。
+    /// 出力を作り直せるバックエンド〔[`RecoverableOutput::supports_rebuild`]〕だけが監視する)。
+    ///
+    /// 出力の作り直し自体は状態を問わず通知ハンドラが先に済ませる(古い AudioUnit は
+    /// リセットの時点で使えなくなっている)。ここで決めるのは**作り直した出力をすぐ
+    /// 動かしてよいか**だけ:
+    ///
+    /// - `Interrupted` / `Backgrounded`: 動かさない(そのまま)。割り込みの終了・前面復帰で
+    ///   いつもどおり復帰する——ここで動かすと、割り込み中・背面で出力を奪い返すことになる。
+    /// - それ以外: `RecoveryPending`(すぐ復帰を試みる)。
+    pub fn on_media_services_reset(self) -> Self {
+        match self {
+            Self::Interrupted | Self::Backgrounded => self,
+            _ => Self::RecoveryPending,
         }
     }
 
@@ -557,7 +608,7 @@ pub struct Watcher {
 }
 
 impl Watcher {
-    /// `stream` は復帰時に `pause()`→`play()` を呼び直す対象。`events` は
+    /// `output` は復帰時に `pause()`→`play()` を呼び直す対象([`RecoverableOutput`])。`events` は
     /// `Event::AudioInterruptionBegan`/`AudioInterruptionEnded` を積む先
     /// (`EventQueue::push_side_channel`。ここは音声スレッドではないので §5.3 の対象外)。
     /// `callback_ticks` は `CpalBackend` が持つ「音声コールバックが呼ばれた回数」の
@@ -565,23 +616,23 @@ impl Watcher {
     /// 前進させたかを実測するために使う(調査記録「`pause()`→`play()` が
     /// Ok を返しても無音のままだったケース」参照)。
     ///
-    /// `CpalBackend::open` から、ストリームを `play()` した直後に呼ぶこと
-    /// (`cpal_backend.rs` 参照)。
+    /// 各バックエンドの `open` から、出力を開始した直後に呼ぶこと
+    /// (`cpal_backend.rs` / `native_backend/apple.rs` 参照)。
     #[cfg(any(target_os = "ios", target_os = "tvos"))]
     pub(crate) fn new(
-        stream: Arc<StreamHandle>,
+        output: Arc<dyn RecoverableOutput>,
         events: Arc<EventQueue>,
         callback_ticks: Arc<AtomicU64>,
     ) -> Self {
         Self {
-            inner: imp::Watcher::new(stream, events, callback_ticks),
+            inner: imp::Watcher::new(output, events, callback_ticks),
         }
     }
 
     /// iOS / tvOS 以外では何もしない。
     #[cfg(not(any(target_os = "ios", target_os = "tvos")))]
     pub(crate) fn new(
-        _stream: Arc<StreamHandle>,
+        _output: Arc<dyn RecoverableOutput>,
         _events: Arc<EventQueue>,
         _callback_ticks: Arc<AtomicU64>,
     ) -> Self {
@@ -605,14 +656,15 @@ mod imp {
     use objc2_avf_audio::{
         AVAudioSessionInterruptionNotification, AVAudioSessionInterruptionOptionKey,
         AVAudioSessionInterruptionOptions, AVAudioSessionInterruptionType,
-        AVAudioSessionInterruptionTypeKey, AVAudioSessionRouteChangeNotification,
-        AVAudioSessionRouteChangeReason, AVAudioSessionRouteChangeReasonKey,
+        AVAudioSessionInterruptionTypeKey, AVAudioSessionMediaServicesWereResetNotification,
+        AVAudioSessionRouteChangeNotification, AVAudioSessionRouteChangeReason,
+        AVAudioSessionRouteChangeReasonKey,
     };
     use objc2_foundation::{NSNotification, NSNotificationCenter, NSNumber, NSString, ns_string};
 
     use super::{
-        InterruptionState, OutputStallDetector, RECOVERY_WAIT_SCHEDULE_MS, RouteChangeReason,
-        StreamHandle, WATCHDOG_POLL_INTERVAL_MS, confirm_recovery_progress,
+        InterruptionState, OutputStallDetector, RECOVERY_WAIT_SCHEDULE_MS, RecoverableOutput,
+        RouteChangeReason, WATCHDOG_POLL_INTERVAL_MS, confirm_recovery_progress,
     };
 
     /// ウォッチドッグの待機を刻む単位(ms)。[`WATCHDOG_POLL_INTERVAL_MS`] をこの粒度で
@@ -638,7 +690,7 @@ mod imp {
 
     impl Watcher {
         pub(super) fn new(
-            stream: Arc<StreamHandle>,
+            stream: Arc<dyn RecoverableOutput>,
             events: Arc<EventQueue>,
             callback_ticks: Arc<AtomicU64>,
         ) -> Self {
@@ -795,6 +847,45 @@ mod imp {
                 }
             }
 
+            // メディアサービスのリセット。出力を作り直せるバックエンド(自前の RemoteIO)だけが
+            // 監視する —— リセット後は古い AudioUnit が使えなくなるため、止め直し・動かし直し
+            // では戻らない。cpal 版は作り直せない(`RecoverableOutput::supports_rebuild`)ので
+            // 監視自体をしない(cpal 版の挙動は変えない)。
+            if stream.supports_rebuild() {
+                let state = Arc::clone(&state);
+                let stream = Arc::clone(&stream);
+                let events = Arc::clone(&events);
+                let callback_ticks = Arc::clone(&callback_ticks);
+                let block = RcBlock::new(move |_: NonNull<NSNotification>| {
+                    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                        handle_media_services_reset(&state, &stream, &events, &callback_ticks);
+                    }));
+                    if outcome.is_err() {
+                        crate::mw_log!(
+                            "[mw-backend] ios_interruption: panic while handling \
+                             AVAudioSessionMediaServicesWereResetNotification (caught at the boundary)"
+                        );
+                    }
+                });
+                // SAFETY: 通知名はプロセス生存中変化しない静的値。上の observer と同じ契約で登録する。
+                if let Some(name) = unsafe { AVAudioSessionMediaServicesWereResetNotification } {
+                    let observer = unsafe {
+                        nc.addObserverForName_object_queue_usingBlock(
+                            Some(name),
+                            None,
+                            None,
+                            &block,
+                        )
+                    };
+                    observers.push(observer);
+                } else {
+                    crate::mw_log!(
+                        "[mw-backend] ios_interruption: \
+                         AVAudioSessionMediaServicesWereResetNotification is unavailable"
+                    );
+                }
+            }
+
             // 出力停止ウォッチドッグ(V14。`OutputStallDetector` のクラス doc)。
             // observer の登録がすべて済んだ後に起こす —— 先に起こすと、まだ observer が
             // 揃っていない状態で復帰を試みることになりうる。
@@ -837,7 +928,7 @@ mod imp {
     fn handle_interruption_notification(
         notif: &NSNotification,
         state: &Arc<Mutex<InterruptionState>>,
-        stream: &Arc<StreamHandle>,
+        stream: &Arc<dyn RecoverableOutput>,
         events: &Arc<EventQueue>,
         callback_ticks: &Arc<AtomicU64>,
     ) {
@@ -916,7 +1007,7 @@ mod imp {
     /// `DidBecomeActive` 安全網の前提が崩れていたケース」の観測性節参照)。
     fn handle_became_active(
         state: &Arc<Mutex<InterruptionState>>,
-        stream: &Arc<StreamHandle>,
+        stream: &Arc<dyn RecoverableOutput>,
         events: &Arc<EventQueue>,
         callback_ticks: &Arc<AtomicU64>,
     ) {
@@ -943,7 +1034,7 @@ mod imp {
     fn handle_route_change_notification(
         notif: &NSNotification,
         state: &Arc<Mutex<InterruptionState>>,
-        stream: &Arc<StreamHandle>,
+        stream: &Arc<dyn RecoverableOutput>,
         events: &Arc<EventQueue>,
         callback_ticks: &Arc<AtomicU64>,
     ) {
@@ -977,6 +1068,46 @@ mod imp {
                 events,
                 callback_ticks,
                 RecoveryTrigger::RouteChange { reason },
+            );
+        }
+    }
+
+    /// メディアサービスがリセットされた(`AVAudioSessionMediaServicesWereResetNotification`)。
+    ///
+    /// 古い出力は使えなくなっているので、**状態を問わず先に作り直す**(作り直しは開始を
+    /// 伴わない —— [`RecoverableOutput::rebuild`])。動かすかどうかは
+    /// [`InterruptionState::on_media_services_reset`] が決める(割り込み中・背面なら、
+    /// いつもどおり割り込みの終了・前面復帰を待つ)。
+    fn handle_media_services_reset(
+        state: &Arc<Mutex<InterruptionState>>,
+        stream: &Arc<dyn RecoverableOutput>,
+        events: &Arc<EventQueue>,
+        callback_ticks: &Arc<AtomicU64>,
+    ) {
+        crate::mw_log!("[mw-backend] AVAudioSession media services were reset; rebuilding output");
+        if let Err(err) = stream.rebuild() {
+            // 作り直せなくても止まらない。続く復帰の試み(と、その確認が空振りしたときの
+            // 作り直しの再試行)・ウォッチドッグがまだ残っている。
+            crate::mw_log!("[mw-backend] ios_interruption: output rebuild failed: {err}");
+        }
+
+        let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+        let previous_state = *guard;
+        *guard = guard.on_media_services_reset();
+        let attempt = guard.needs_recovery_attempt();
+        drop(guard);
+        if attempt {
+            attempt_recovery(
+                state,
+                stream,
+                events,
+                callback_ticks,
+                RecoveryTrigger::MediaServicesReset,
+            );
+        } else {
+            crate::mw_log!(
+                "[mw-backend] ios_interruption: output rebuilt but not started \
+                 (state={previous_state:?}); will start on the next recovery"
             );
         }
     }
@@ -1036,6 +1167,9 @@ mod imp {
         /// `stalled_ms` は「進んでいない」と判定するまでに実際に経過した時間。
         #[allow(dead_code)]
         OutputStalled { stalled_ms: u64 },
+        /// `AVAudioSessionMediaServicesWereResetNotification`(出力を作り直せる
+        /// バックエンドのみ。作り直した直後の開始)。
+        MediaServicesReset,
     }
 
     /// 出力停止ウォッチドッグのスレッドを起こす(V14。判定そのものは
@@ -1049,7 +1183,7 @@ mod imp {
     /// 既存の復帰経路はそのまま動く(`ios_session::configure` と同じ「失敗は記録して続行」)。
     fn spawn_output_stall_watchdog(
         state: Arc<Mutex<InterruptionState>>,
-        stream: Arc<StreamHandle>,
+        stream: Arc<dyn RecoverableOutput>,
         events: Arc<EventQueue>,
         callback_ticks: Arc<AtomicU64>,
         shutdown: Arc<AtomicBool>,
@@ -1193,7 +1327,7 @@ mod imp {
     /// この観測性は変わらない(ログを出す場所が別スレッドになるだけ)。
     fn attempt_recovery(
         state: &Arc<Mutex<InterruptionState>>,
-        stream: &Arc<StreamHandle>,
+        stream: &Arc<dyn RecoverableOutput>,
         events: &Arc<EventQueue>,
         callback_ticks: &Arc<AtomicU64>,
         trigger: RecoveryTrigger,
@@ -1252,6 +1386,43 @@ mod imp {
                     },
                     |wait_ms| std::thread::sleep(Duration::from_millis(wait_ms)),
                 );
+
+                // 止め直し・動かし直しを最後まで繰り返しても進まなかった。出力そのものを
+                // 作り直せるバックエンドなら、最後の手段として作り直してもう一巡だけ確かめる
+                // (OS からの通知なしに出力ユニットが使えなくなっている場合への備え。
+                // cpal 版は作り直せないので、ここは素通りする)。
+                let outcome = match outcome {
+                    None if worker_stream.supports_rebuild() => {
+                        crate::mw_log!(
+                            "[mw-backend] ios_interruption: restart not confirmed \
+                             (trigger={trigger:?}); rebuilding the output as a last resort"
+                        );
+                        let ticks_before = worker_callback_ticks.load(Ordering::Relaxed);
+                        match worker_stream.rebuild() {
+                            Ok(()) => {
+                                if let Err(err) = worker_stream.play() {
+                                    crate::mw_log!(
+                                        "[mw-backend] ios_interruption: play() after rebuild \
+                                         returned Err: {err}"
+                                    );
+                                }
+                            }
+                            Err(err) => crate::mw_log!(
+                                "[mw-backend] ios_interruption: output rebuild failed: {err}"
+                            ),
+                        }
+                        confirm_recovery_progress(
+                            ticks_before,
+                            || worker_callback_ticks.load(Ordering::Relaxed),
+                            || {
+                                let _ = worker_stream.pause();
+                                let _ = worker_stream.play();
+                            },
+                            |wait_ms| std::thread::sleep(Duration::from_millis(wait_ms)),
+                        )
+                    }
+                    other => other,
+                };
 
                 let success = match outcome {
                     Some((attempt, waited_ms)) => {
@@ -1850,5 +2021,43 @@ mod tests {
             !detector.observe(InterruptionState::Running, 5),
             "割り込み中に数えた分を持ち越しています"
         );
+    }
+
+    /// メディアサービスのリセットは、止まっているのが正常でない状態ならすぐ復帰を要求する
+    /// (作り直した出力をそのまま動かす)。
+    #[test]
+    fn media_services_reset_requests_recovery_unless_interrupted_or_backgrounded() {
+        for state in [
+            InterruptionState::Running,
+            InterruptionState::Recovered,
+            InterruptionState::RecoveryFailed,
+            InterruptionState::RecoveryPending,
+        ] {
+            let next = state.on_media_services_reset();
+            assert_eq!(next, InterruptionState::RecoveryPending, "from {state:?}");
+            assert!(next.needs_recovery_attempt(), "from {state:?}");
+        }
+    }
+
+    /// 割り込み中・背面ではリセットされても動かさない(出力を奪い返さない)。
+    /// 割り込みの終了・前面復帰で、いつもどおり復帰を要求する。
+    #[test]
+    fn media_services_reset_while_interrupted_waits_for_the_interruption_to_end() {
+        let state = InterruptionState::Interrupted.on_media_services_reset();
+        assert_eq!(state, InterruptionState::Interrupted);
+        assert!(!state.needs_recovery_attempt());
+
+        let state = state.on_interruption_ended(true);
+        assert_eq!(state, InterruptionState::RecoveryPending);
+    }
+
+    #[test]
+    fn media_services_reset_while_backgrounded_waits_for_the_app_to_become_active() {
+        let state = InterruptionState::Backgrounded.on_media_services_reset();
+        assert_eq!(state, InterruptionState::Backgrounded);
+        assert!(!state.needs_recovery_attempt());
+
+        let state = state.on_app_became_active();
+        assert_eq!(state, InterruptionState::RecoveryPending);
     }
 }

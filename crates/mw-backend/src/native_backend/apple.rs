@@ -18,18 +18,38 @@
 //! [`Backend::open`] の冒頭で呼ぶ)・補正項の更新(`IosOutputLatencyWatcher`)だけに
 //! 絞れた(4-1 の見込みどおり)。
 //!
-//! # cpal 版との既知の差分(4-1/4-2 の時点で未対応)
+//! # iOS/tvOS の割り込み・バックグラウンドからの復帰
 //!
-//! デバイスの切断・既定出力デバイスの変更(macOS)、および電話・Siri 等の割り込みからの
-//! ストリーム復帰(iOS/tvOS、`ios_interruption.rs` が cpal 版に対して持つ復帰ロジック)は
-//! どちらも実装していない。そのため [`Backend::open`] が受け取る `events` はこの実装では
-//! 使わず、`StreamError`/`AudioInterruptionEnded` 等のイベントは発行されない。
-//! 4-1 は「macOS Editor 専用の開発機バックエンド」、4-2 は「`backend-native` を明示的に
-//! 選んだときだけ有効になる、既定〔`backend-cpal`〕に影響しない実装」という前提の範囲で
-//! 許容する判断とした。iOS/tvOS で実装したのは**補正項(出力遅延)をルート変化のたびに
-//! 最新化すること**だけ(`IosOutputLatencyWatcher`)——電話着信・バックグラウンド遷移
-//! からのストリーム再始動は未実装で、本番導入(cpal 削除、ステップ4-4)前には
-//! `ios_interruption.rs` 相当の復帰ロジックの移植が別途要る。出力コールバック自体の
+//! cpal 版と**同じ監視**(`ios_interruption::Watcher`。割り込みの開始/終了・背面/前面・
+//! ルート変化・出力停止のウォッチドッグ)をそのまま使い、復帰の操作だけをこのファイルの
+//! [`UnitControl`](`ios_interruption::RecoverableOutput` の実装)で差し替える:
+//!
+//! - 止め直し: `AudioOutputUnitStop`。
+//! - 動かし直し: `AudioOutputUnitStart`(失敗したら `AudioUnitUninitialize` →
+//!   `AudioUnitInitialize` し直してから再度 Start)。直前に補正項(`outputLatency`)を
+//!   読み直す(背面にいる間にルートが変わっていることがある)。
+//! - 作り直し(メディアサービスのリセット後、または止め直しを繰り返しても進まないときの
+//!   最後の手段): **AudioUnit だけ**を新しく作り、レンダーコールバックの context
+//!   (`CallbackContext` —— `Renderer` を持つ)は**同じポインタのまま**付け替える。
+//!   古いユニットを止めてから新しいユニットを開始するまでの間はコールバックが走らないので、
+//!   context の排他所有(単一の書き手)は崩れない。サンプルレートは開いたときの値のまま
+//!   (ハードウェアと違えば AudioUnit が変換する)——`Renderer` のサンプルレートを
+//!   変えずに済ませるため。
+//!
+//! 動かし直し・作り直しのたびにホスト時刻の相関点が飛ぶので、音声スレッドが次の
+//! コールバックで音楽クロックの世代を進める(補正項の変化と同じ経路。
+//! `CallbackContext::last_restart_epoch`)。
+//!
+//! AudioUnit は `UnitControl` の `Mutex` の中に置く。通知ハンドラ・復帰確認のワーカーと
+//! [`Backend::close`] が同じロックを通るので、閉じた後のユニットへ Start を撃つことはない
+//! (閉じた後の操作は何もせずエラーを返す)。音声スレッドはこのロックに一切触れない。
+//!
+//! # cpal 版との既知の差分
+//!
+//! macOS のデバイスの切断・既定出力デバイスの変更の監視は実装していない(4-1 は
+//! 「macOS Editor 専用の開発機バックエンド」という前提の範囲で許容する判断とした)。
+//! `StreamError` イベントは発行しない(iOS/tvOS の割り込み・ルート変化のイベントは
+//! cpal 版と同じく `ios_interruption` が発行する)。出力コールバック自体の
 //! 間隔異常(「アンダーラン(の疑い)」)は cpal 版と同じ
 //! [`crate::underrun::OutputUnderrunTracker`] で検知する(macOS/iOS/tvOS 共通)。
 //!
@@ -83,13 +103,14 @@
 
 use std::ffi::c_void;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use mw_core::{CHANNELS, EventQueue, MusicClockPublisher, Renderer};
 
 use crate::backend::{Backend, BackendError};
 use crate::host_time::mach_ticks_to_ns;
+use crate::ios_interruption::{self, RecoverableOutput};
 use crate::underrun::OutputUnderrunTracker;
 
 // ============================================================================
@@ -619,6 +640,14 @@ struct CallbackContext {
     /// seqlock の単一書き手前提は崩れない([`Mixer::music_clock_handle`] のドキュメント
     /// 参照)。
     music_clock: Arc<MusicClockPublisher>,
+    /// 出力を動かし直した・作り直した回数([`UnitControl`] が書く)。
+    /// [`AppleBackend::restart_epoch`] と同じ `Arc`。
+    restart_epoch: Arc<AtomicU64>,
+    /// `render_proc` が直前までに観測していた `restart_epoch`。**音声スレッド専用**
+    /// (`last_device_extra_latency_ns` と同じ扱い)。変わっていたら、止まっていた間の
+    /// ぶんホスト時刻の相関点が飛んでいるので世代を進める——補正項の変化と同じく、
+    /// 同じ世代のまま跨いで外挿すると `MusicClockSnapshot` の契約に反する。
+    last_restart_epoch: u64,
     underrun_tracker: OutputUnderrunTracker,
     /// [`AppleBackend::callback_frames`] へ渡す `Arc`。
     callback_frames: Arc<AtomicU32>,
@@ -694,7 +723,10 @@ unsafe extern "C" fn render_proc(
             .unwrap_or(0);
 
         let device_extra_latency_ns = context.device_extra_latency_ns.load(Ordering::Relaxed);
-        if device_extra_latency_ns != context.last_device_extra_latency_ns {
+        let restart_epoch = context.restart_epoch.load(Ordering::Relaxed);
+        if device_extra_latency_ns != context.last_device_extra_latency_ns
+            || restart_epoch != context.last_restart_epoch
+        {
             // 補正項が変わった(iOS/tvOS: `IosOutputLatencyWatcher` が別スレッドで
             // ルート変化を検知し、書き換えた)。新しい相関点(このすぐ下の
             // `compute_timestamps`)が確定する前に世代を進める——`MusicClockPublisher::
@@ -705,8 +737,12 @@ unsafe extern "C" fn render_proc(
             // 変化がどれだけ小さくても、それを同じ世代のまま跨いで外挿すると
             // `MusicClockSnapshot` の契約違反になる(`CallbackContext::
             // last_device_extra_latency_ns` のドキュメント参照)。
+            // 出力を動かし直した・作り直した(`restart_epoch`)ときも同じ扱い——止まって
+            // いた間のぶん相関点が飛ぶ(`CallbackContext::last_restart_epoch`)。両方が同時に
+            // 変わっていても世代は1回だけ進める。
             context.music_clock.bump_generation();
             context.last_device_extra_latency_ns = device_extra_latency_ns;
+            context.last_restart_epoch = restart_epoch;
         }
 
         let (buffer_start_host_time_ns, output_latency_ns) = compute_timestamps(
@@ -747,6 +783,260 @@ unsafe extern "C" fn render_proc(
 }
 
 // ============================================================================
+// AudioUnit の組み立て(`open` と作り直しで共用)
+// ============================================================================
+
+/// 出力用の AudioUnit のインスタンスを作る(まだ何も設定していない)。
+fn new_output_unit() -> Result<AudioUnit, BackendError> {
+    let description = AudioComponentDescription {
+        component_type: AUDIO_UNIT_TYPE_OUTPUT,
+        component_sub_type: AUDIO_UNIT_SUBTYPE,
+        component_manufacturer: AUDIO_UNIT_MANUFACTURER_APPLE,
+        component_flags: 0,
+        component_flags_mask: 0,
+    };
+
+    // SAFETY: `description` はスタック上の有効な値。`AudioComponentFindNext` は
+    // システムのコンポーネント登録簿を検索するだけで、所有権の移動は無い
+    // (見つからなければ null を返す。コンポーネント自体は dispose 不要)。
+    let component = unsafe { AudioComponentFindNext(std::ptr::null_mut(), &description) };
+    if component.is_null() {
+        return Err(BackendError::NoOutputDevice);
+    }
+
+    let mut unit: AudioUnit = std::ptr::null_mut();
+    // SAFETY: `component` は直前に取得した有効なハンドル。`&mut unit` はスタック上の
+    // 有効な出力先。
+    let status = unsafe { AudioComponentInstanceNew(component, &mut unit) };
+    if status != NO_ERR || unit.is_null() {
+        return Err(BackendError::BuildStreamFailed(format!(
+            "AudioComponentInstanceNew failed: OSStatus {status}"
+        )));
+    }
+    Ok(unit)
+}
+
+/// アプリ側(`kAudioUnitScope_Input`)のフォーマットを f32 インターリーブ・ステレオに
+/// 設定する。ハードウェア側(`kAudioUnitScope_Output`)との差は AudioUnit が変換する。
+/// 戻り値は `OSStatus`。
+fn set_stream_format(unit: AudioUnit, sample_rate: f64) -> i32 {
+    let asbd = stereo_f32_asbd(sample_rate);
+    // SAFETY: `unit` は呼び出し元が生成した有効なインスタンス。`asbd` はスタック上の値で、
+    // サイズを正しく渡している。
+    unsafe {
+        AudioUnitSetProperty(
+            unit,
+            AUDIO_UNIT_PROPERTY_STREAM_FORMAT,
+            AUDIO_UNIT_SCOPE_INPUT,
+            0,
+            &asbd as *const _ as *const c_void,
+            std::mem::size_of::<AudioStreamBasicDescription>() as u32,
+        )
+    }
+}
+
+/// レンダーコールバック(`render_proc` + `context_ptr`)を設定する。戻り値は `OSStatus`。
+/// コールバックが実際に呼ばれ始めるのは `AudioOutputUnitStart` の後。
+fn set_render_callback(unit: AudioUnit, context_ptr: *mut CallbackContext) -> i32 {
+    let callback_struct = AURenderCallbackStruct {
+        input_proc: render_proc,
+        input_proc_ref_con: context_ptr as *mut c_void,
+    };
+    // SAFETY: `unit` は呼び出し元が生成した有効なインスタンス。`callback_struct` は
+    // スタック上の有効な値。
+    unsafe {
+        AudioUnitSetProperty(
+            unit,
+            AUDIO_UNIT_PROPERTY_SET_RENDER_CALLBACK,
+            AUDIO_UNIT_SCOPE_INPUT,
+            0,
+            &callback_struct as *const _ as *const c_void,
+            std::mem::size_of::<AURenderCallbackStruct>() as u32,
+        )
+    }
+}
+
+/// 既にある context(`Renderer` を持つ)へつなぎ直す新しい AudioUnit を、初期化まで
+/// 済ませて返す(開始はしない)。[`UnitControl::rebuild`] 専用。失敗したら作りかけの
+/// ユニットは破棄して文言を返す。
+fn build_unit_for_existing_context(
+    sample_rate: f64,
+    context_ptr: *mut CallbackContext,
+) -> Result<AudioUnit, String> {
+    let unit = new_output_unit().map_err(|e| e.to_string())?;
+    let fail = |what: &str, status: i32| {
+        // SAFETY: `unit` は直前に作ったばかりで、まだ開始していない(コールバックは
+        // 一度も呼ばれていない)。
+        unsafe {
+            AudioComponentInstanceDispose(unit);
+        }
+        Err(format!("{what} failed: OSStatus {status}"))
+    };
+    let status = set_stream_format(unit, sample_rate);
+    if status != NO_ERR {
+        return fail("AudioUnitSetProperty(StreamFormat)", status);
+    }
+    let status = set_render_callback(unit, context_ptr);
+    if status != NO_ERR {
+        return fail("AudioUnitSetProperty(SetRenderCallback)", status);
+    }
+    // SAFETY: `unit` は構成済みの有効なインスタンス。
+    let status = unsafe { AudioUnitInitialize(unit) };
+    if status != NO_ERR {
+        return fail("AudioUnitInitialize", status);
+    }
+    Ok(unit)
+}
+
+// ============================================================================
+// 開いている AudioUnit の制御口(閉じる・止め直す・動かし直す・作り直す)
+// ============================================================================
+
+/// 開いている AudioUnit と、そのレンダーコールバックの context。
+struct OpenUnit {
+    unit: AudioUnit,
+    context_ptr: *mut CallbackContext,
+}
+
+/// [`OpenUnit`] を `Mutex` の中に持ち、[`AppleBackend::close`] と iOS/tvOS の復帰
+/// (`ios_interruption::Watcher` の通知ハンドラ・復帰確認のワーカー・ウォッチドッグ)の
+/// 両方へ同じ口を渡す(モジュール doc「iOS/tvOS の割り込み・バックグラウンドからの復帰」)。
+///
+/// 🔴 **音声スレッドはこのロックに触れない**(`render_proc` は context だけを見る)。
+/// ロックを取るのはゲームスレッド・通知ハンドラ・ワーカーといった非リアルタイムスレッドだけ。
+///
+/// `close` が [`OpenUnit`] を取り出した後は、すべての操作が何もせずエラーを返す——
+/// 復帰確認のワーカーは `close` と同期しない(cpal 版でもストリームの `Arc` を握ったまま
+/// 走り切る)ので、閉じたユニットへ Start を撃たないためにこの形にしてある。
+struct UnitControl {
+    slot: Mutex<Option<OpenUnit>>,
+    /// 開いたときのサンプルレート。作り直しでもこの値のまま
+    /// (`Renderer` 側のサンプルレートを変えずに済ませるため)。
+    sample_rate: f64,
+    /// [`AppleBackend::restart_epoch`] と同じ `Arc`。
+    restart_epoch: Arc<AtomicU64>,
+    /// 補正項。iOS/tvOS では動かし直しの直前に読み直す。
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    device_extra_latency_ns: Arc<AtomicU64>,
+    /// 古いユニットを捨ててから context を新しいユニットへ渡すときの同期点
+    /// (`AppleBackend::close` と同じ理由)。
+    render_completions: Arc<AtomicU64>,
+}
+
+// SAFETY: `OpenUnit` の生ポインタ(AudioUnit・context)へは必ず `slot` の `Mutex` を
+// 通してしか触れない。AudioUnit の C API はどのスレッドから呼んでもよい。context の中身
+// (`Renderer`)へはここからは一切触れず、ポインタ値をコールバックへ渡し直すだけ。
+unsafe impl Send for UnitControl {}
+unsafe impl Sync for UnitControl {}
+
+const UNIT_CLOSED: &str = "the output unit is already closed";
+
+impl UnitControl {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<OpenUnit>> {
+        self.slot.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+impl RecoverableOutput for UnitControl {
+    fn pause(&self) -> Result<(), String> {
+        let guard = self.lock();
+        let Some(open) = guard.as_ref() else {
+            return Err(UNIT_CLOSED.to_owned());
+        };
+        // SAFETY: `open.unit` はロックの内側にある、まだ破棄していないインスタンス。
+        let status = unsafe { AudioOutputUnitStop(open.unit) };
+        if status == NO_ERR {
+            Ok(())
+        } else {
+            Err(format!("AudioOutputUnitStop failed: OSStatus {status}"))
+        }
+    }
+
+    fn play(&self) -> Result<(), String> {
+        let guard = self.lock();
+        let Some(open) = guard.as_ref() else {
+            return Err(UNIT_CLOSED.to_owned());
+        };
+
+        // 背面にいる間・割り込みの間にルートが変わっていることがあるので、補正項を
+        // 読み直してから動かす(最初のコールバックから新しい値を使わせる)。
+        #[cfg(any(target_os = "ios", target_os = "tvos"))]
+        self.device_extra_latency_ns
+            .store(query_ios_output_latency_ns(), Ordering::Relaxed);
+        // 止まっていた間のぶんホスト時刻の相関点が飛ぶので、次のコールバックで世代を
+        // 進めさせる(`CallbackContext::last_restart_epoch`)。
+        self.restart_epoch.fetch_add(1, Ordering::Relaxed);
+
+        // SAFETY: `open.unit` はロックの内側にある、初期化済みのインスタンス。
+        let status = unsafe { AudioOutputUnitStart(open.unit) };
+        if status == NO_ERR {
+            return Ok(());
+        }
+
+        // Start が通らない(セッションの再アクティブ化の後などで初期化状態が崩れている)
+        // ときは、初期化し直してからもう一度だけ Start する。
+        // SAFETY: Start に失敗した = コールバックは動いていない。プロパティ(フォーマット・
+        // コールバック)は Uninitialize を跨いで保たれる。
+        let reinit = unsafe {
+            AudioUnitUninitialize(open.unit);
+            AudioUnitInitialize(open.unit)
+        };
+        if reinit != NO_ERR {
+            return Err(format!(
+                "AudioOutputUnitStart failed (OSStatus {status}) and AudioUnitInitialize \
+                 failed (OSStatus {reinit})"
+            ));
+        }
+        // SAFETY: 同上(初期化し直したインスタンス)。
+        let retry = unsafe { AudioOutputUnitStart(open.unit) };
+        if retry == NO_ERR {
+            Ok(())
+        } else {
+            Err(format!(
+                "AudioOutputUnitStart failed (OSStatus {status}), and again after \
+                 re-initializing (OSStatus {retry})"
+            ))
+        }
+    }
+
+    fn supports_rebuild(&self) -> bool {
+        true
+    }
+
+    fn rebuild(&self) -> Result<(), String> {
+        let mut guard = self.lock();
+        let Some(open) = guard.as_mut() else {
+            return Err(UNIT_CLOSED.to_owned());
+        };
+
+        // 古いユニットを先に止める——ここから新しいユニットの Start までコールバックは
+        // 走らないので、同じ context を新しいユニットへ渡しても書き手は1人のまま。
+        // SAFETY: `open.unit` はロックの内側にある、まだ破棄していないインスタンス
+        // (メディアサービスのリセット後は失敗を返しうるが、それは無視してよい)。
+        unsafe {
+            AudioOutputUnitStop(open.unit);
+        }
+
+        // 新しいユニットが作れなかったら古いユニットを残す(少なくとも有効なハンドルの
+        // まま。続く動かし直し・次の作り直しの対象にする)。
+        let new_unit = build_unit_for_existing_context(self.sample_rate, open.context_ptr)?;
+
+        // SAFETY: 古いユニットは止めてあり、以後誰も使わない(`open.unit` をこの直後に
+        // 差し替える)。
+        unsafe {
+            AudioUnitUninitialize(open.unit);
+            AudioComponentInstanceDispose(open.unit);
+        }
+        // 古いユニットの最後のコールバックの書き込みを、新しいユニットのコールバックが
+        // 読む前に観測しておく(`AppleBackend::close` の同じ load と同じ理由)。
+        let _ = self.render_completions.load(Ordering::Acquire);
+        open.unit = new_unit;
+        self.restart_epoch.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+// ============================================================================
 // Backend 実装
 // ============================================================================
 
@@ -754,8 +1044,9 @@ unsafe extern "C" fn render_proc(
 /// `kAudioUnitSubType_RemoteIO`)の既定出力へ AudioUnit で直接出力する `Backend` 実装
 /// (AUDIOWARE-DEPS-PLAN.md ステップ4-1〔macOS〕・4-2〔iOS/tvOS〕)。
 pub struct AppleBackend {
-    unit: Option<AudioUnit>,
-    context_ptr: Option<*mut CallbackContext>,
+    /// 開いている AudioUnit の制御口(`close` と iOS/tvOS の復帰で共有する)。
+    /// `None` なら閉じている。
+    control: Option<Arc<UnitControl>>,
     callback_frames: Arc<AtomicU32>,
     output_latency_ns: Arc<AtomicU64>,
     render_completions: Arc<AtomicU64>,
@@ -776,9 +1067,17 @@ pub struct AppleBackend {
     /// macOS では常に `Some` だが中身は no-op(構築・破棄のコストも無い)。
     /// `open()`/`close()` と1対1(`cpal_backend::CpalBackend::ios_interruption` と同じ配線)。
     ios_output_latency_watcher: Option<IosOutputLatencyWatcher>,
+    /// 出力を動かし直した・作り直した回数。[`CallbackContext::restart_epoch`] /
+    /// [`UnitControl::restart_epoch`] と同じ `Arc`(`open()`/`close()` を跨いで再利用する)。
+    restart_epoch: Arc<AtomicU64>,
+    /// iOS/tvOS の割り込み・背面遷移・ルート変化・出力停止からの復帰
+    /// (cpal 版と同じ `ios_interruption::Watcher`。macOS では no-op)。
+    /// `open()`/`close()` と1対1。
+    ios_interruption: Option<ios_interruption::Watcher>,
 }
 
-// SAFETY: `unit`/`context_ptr` は生ポインタだが、`mw-ffi::handle::Instance` がグローバル
+// SAFETY: `control` の中に生ポインタ(AudioUnit・context)を持つが、それらは
+// `UnitControl` の `Mutex` を通してしか触れない。そのうえで、`mw-ffi::handle::Instance` がグローバル
 // レジストリの `Mutex` 経由で単一所有を保証するため、`AppleBackend` の `&mut self`
 // メソッドが複数スレッドから同時に呼ばれることは無い(`cpal_backend::CpalBackend` と同じ
 // 理由。`mw-ffi/CLAUDE.md` の「バックエンドをトレイトオブジェクトで持つ理由」参照)。
@@ -794,8 +1093,7 @@ impl Default for AppleBackend {
 impl AppleBackend {
     pub fn new() -> Self {
         Self {
-            unit: None,
-            context_ptr: None,
+            control: None,
             callback_frames: Arc::new(AtomicU32::new(0)),
             output_latency_ns: Arc::new(AtomicU64::new(0)),
             render_completions: Arc::new(AtomicU64::new(0)),
@@ -807,13 +1105,15 @@ impl AppleBackend {
             logged_output_underrun_count: AtomicU64::new(0),
             device_extra_latency_ns: Arc::new(AtomicU64::new(0)),
             ios_output_latency_watcher: None,
+            restart_epoch: Arc::new(AtomicU64::new(0)),
+            ios_interruption: None,
         }
     }
 }
 
 impl Backend for AppleBackend {
-    fn open(&mut self, renderer: Renderer, _events: Arc<EventQueue>) -> Result<(), BackendError> {
-        if self.unit.is_some() {
+    fn open(&mut self, renderer: Renderer, events: Arc<EventQueue>) -> Result<(), BackendError> {
+        if self.control.is_some() {
             return Err(BackendError::AlreadyOpen);
         }
 
@@ -823,49 +1123,14 @@ impl Backend for AppleBackend {
         // no-op(`ios_session::configure` のドキュメント参照)。
         crate::ios_session::configure();
 
-        let description = AudioComponentDescription {
-            component_type: AUDIO_UNIT_TYPE_OUTPUT,
-            component_sub_type: AUDIO_UNIT_SUBTYPE,
-            component_manufacturer: AUDIO_UNIT_MANUFACTURER_APPLE,
-            component_flags: 0,
-            component_flags_mask: 0,
-        };
-
-        // SAFETY: `description` はスタック上の有効な値。`AudioComponentFindNext` は
-        // システムのコンポーネント登録簿を検索するだけで、所有権の移動は無い
-        // (見つからなければ null を返す。コンポーネント自体は dispose 不要)。
-        let component = unsafe { AudioComponentFindNext(std::ptr::null_mut(), &description) };
-        if component.is_null() {
-            return Err(BackendError::NoOutputDevice);
-        }
-
-        let mut unit: AudioUnit = std::ptr::null_mut();
-        // SAFETY: `component` は直前に取得した有効なハンドル。`&mut unit` はスタック上の
-        // 有効な出力先。
-        let status = unsafe { AudioComponentInstanceNew(component, &mut unit) };
-        if status != NO_ERR || unit.is_null() {
-            return Err(BackendError::BuildStreamFailed(format!(
-                "AudioComponentInstanceNew failed: OSStatus {status}"
-            )));
-        }
+        let unit = new_output_unit()?;
 
         let sample_rate = query_output_sample_rate(unit);
-        let asbd = stereo_f32_asbd(sample_rate);
 
-        // SAFETY: `unit` は有効なインスタンス。`asbd` はスタック上の値で、サイズを
-        // 正しく渡している。`kAudioUnitScope_Input` 側(アプリがデータを渡す側)への
-        // 設定であり、ハードウェア側(`kAudioUnitScope_Output`)のフォーマットは
-        // AUHAL が自動的に変換する(関数先頭のモジュール doc 参照)。
-        let status = unsafe {
-            AudioUnitSetProperty(
-                unit,
-                AUDIO_UNIT_PROPERTY_STREAM_FORMAT,
-                AUDIO_UNIT_SCOPE_INPUT,
-                0,
-                &asbd as *const _ as *const c_void,
-                std::mem::size_of::<AudioStreamBasicDescription>() as u32,
-            )
-        };
+        // `kAudioUnitScope_Input` 側(アプリがデータを渡す側)への設定であり、
+        // ハードウェア側(`kAudioUnitScope_Output`)のフォーマットは AUHAL が自動的に
+        // 変換する(関数先頭のモジュール doc 参照)。
+        let status = set_stream_format(unit, sample_rate);
         if status != NO_ERR {
             // SAFETY: `unit` は `AudioComponentInstanceNew` が返した有効なインスタンスで、
             // まだ誰にも共有していない(エラーで抜ける前にここで確実に破棄する)。
@@ -894,6 +1159,9 @@ impl Backend for AppleBackend {
             // 確定した直後に `context_ptr` 経由で書き直す(下記)。
             last_device_extra_latency_ns: 0,
             music_clock,
+            restart_epoch: Arc::clone(&self.restart_epoch),
+            // 開いた時点の値を基準にする(これと違う値を見たら世代を進める)。
+            last_restart_epoch: self.restart_epoch.load(Ordering::Relaxed),
             underrun_tracker: OutputUnderrunTracker::new(
                 Arc::clone(&self.output_underrun_count),
                 Arc::clone(&self.last_output_underrun_host_time_ns),
@@ -905,23 +1173,9 @@ impl Backend for AppleBackend {
         });
         let context_ptr = Box::into_raw(context);
 
-        let callback_struct = AURenderCallbackStruct {
-            input_proc: render_proc,
-            input_proc_ref_con: context_ptr as *mut c_void,
-        };
-        // SAFETY: `callback_struct` はスタック上の有効な値。`context_ptr` は直前に
-        // `Box::into_raw` したばかりで、CoreAudio はまだこれを知らない
-        // (`AudioOutputUnitStart` を呼ぶまでレンダーコールバックは起動しない)。
-        let status = unsafe {
-            AudioUnitSetProperty(
-                unit,
-                AUDIO_UNIT_PROPERTY_SET_RENDER_CALLBACK,
-                AUDIO_UNIT_SCOPE_INPUT,
-                0,
-                &callback_struct as *const _ as *const c_void,
-                std::mem::size_of::<AURenderCallbackStruct>() as u32,
-            )
-        };
+        // `context_ptr` は直前に `Box::into_raw` したばかりで、CoreAudio はまだこれを
+        // 知らない(`AudioOutputUnitStart` を呼ぶまでレンダーコールバックは起動しない)。
+        let status = set_render_callback(unit, context_ptr);
         if status != NO_ERR {
             // SAFETY: `context_ptr` は直前にこの関数が `Box::into_raw` したばかりで、
             // CoreAudio を含め他のどこからも参照されていない(上のコメント参照)。
@@ -986,7 +1240,7 @@ impl Backend for AppleBackend {
         let status = unsafe { AudioOutputUnitStart(unit) };
         if status != NO_ERR {
             // 直前に組み立てた監視を手放す——`open()` 自体が失敗して返るため、
-            // `self.unit`/`self.context_ptr` は `None` のままで `is_open()` も
+            // `self.control` は `None` のままで `is_open()` も
             // `false` のままになる(= 開いていない状態の一部として監視も無い状態に
             // 揃える)。
             self.ios_output_latency_watcher = None;
@@ -1013,8 +1267,25 @@ impl Backend for AppleBackend {
             device_extra_latency_ns as f64 / 1_000_000.0,
         );
 
-        self.unit = Some(unit);
-        self.context_ptr = Some(context_ptr);
+        let control = Arc::new(UnitControl {
+            slot: Mutex::new(Some(OpenUnit { unit, context_ptr })),
+            sample_rate,
+            restart_epoch: Arc::clone(&self.restart_epoch),
+            device_extra_latency_ns: Arc::clone(&self.device_extra_latency_ns),
+            render_completions: Arc::clone(&self.render_completions),
+        });
+
+        // 割り込み・背面遷移・ルート変化・出力停止からの復帰(cpal 版と同じ監視。
+        // iOS/tvOS 以外では no-op)。cpal 版と同じく、出力を開始した直後に組み立てる。
+        // 「コールバックが進んだか」の実測には `render_completions`(毎コールバック1増える)
+        // を使う。
+        self.ios_interruption = Some(ios_interruption::Watcher::new(
+            Arc::clone(&control) as Arc<dyn RecoverableOutput>,
+            events,
+            Arc::clone(&self.render_completions),
+        ));
+
+        self.control = Some(control);
         self.sample_rate = sample_rate as u32;
         Ok(())
     }
@@ -1024,9 +1295,17 @@ impl Backend for AppleBackend {
         // 止まりかけの状態で補正項を書き直されないようにする(`cpal_backend::
         // CpalBackend::close` が `ios_interruption` を先に止めるのと同じ理由)。
         self.ios_output_latency_watcher = None;
+        // 復帰の監視も先に止める(ウォッチドッグはここで join される)。まだ走っている
+        // 復帰確認のワーカーがあっても、下で `OpenUnit` を取り出した後の操作は
+        // `UnitControl` が空振りさせる。
+        self.ios_interruption = None;
 
-        match (self.unit.take(), self.context_ptr.take()) {
-            (Some(unit), Some(context_ptr)) => {
+        let open = self
+            .control
+            .take()
+            .and_then(|control| control.lock().take());
+        match open {
+            Some(OpenUnit { unit, context_ptr }) => {
                 // Apple が推奨する解体順序(Stop → Uninitialize → Dispose)をそのまま守る。
                 // SAFETY: `unit` はこの `AppleBackend` だけが所有しており(`take()` で
                 // 既に自分からも外した)、`open()` が成功させたまま一度も dispose
@@ -1070,7 +1349,7 @@ impl Backend for AppleBackend {
     }
 
     fn is_open(&self) -> bool {
-        self.unit.is_some()
+        self.control.is_some()
     }
 
     fn last_callback_frames(&self) -> u32 {
@@ -1143,11 +1422,10 @@ impl Backend for AppleBackend {
 /// Bluetooth)が変わるたびに `device_extra_latency_ns`(補正項)を
 /// `query_ios_output_latency_ns` で読み直す。macOS では no-op。
 ///
-/// **`ios_interruption::Watcher` とは独立**——あちらは cpal の `Stream` の
-/// `pause()`/`play()` を再試行する割り込み復帰ロジック(電話・Siri・バックグラウンド
-/// 遷移からの再始動)を持つが、こちらはそれを持たない。責務は「補正項を最新に保つ」
-/// ことだけで、AudioUnit 自体には一切触れない(モジュール doc「cpal 版との既知の差分」
-/// 参照——電話着信等からのストリーム復帰は本バックエンドでは未実装)。
+/// **`ios_interruption::Watcher` とは独立**——あちらは割り込み・背面遷移・ルート変化からの
+/// 復帰(`UnitControl` 越しの止め直し・動かし直し)を受け持ち、こちらは「補正項を最新に
+/// 保つ」ことだけを受け持つ(AudioUnit 自体には一切触れない)。同じルート変化の通知を
+/// 両方が受け取るが、触る状態が重ならないので二重処理にはならない。
 pub(super) struct IosOutputLatencyWatcher {
     #[cfg(any(target_os = "ios", target_os = "tvos"))]
     #[allow(dead_code)] // Drop 経由で `removeObserver` させるためだけに保持する
@@ -1495,6 +1773,8 @@ mod tests {
             device_extra_latency_ns: Arc::new(AtomicU64::new(0)),
             last_device_extra_latency_ns: 0,
             music_clock,
+            restart_epoch: Arc::new(AtomicU64::new(0)),
+            last_restart_epoch: 0,
             underrun_tracker: OutputUnderrunTracker::new(
                 Arc::new(AtomicU64::new(0)),
                 Arc::new(AtomicU64::new(0)),
@@ -1738,5 +2018,154 @@ mod tests {
         );
 
         drop(unsafe { Box::from_raw(context_ptr) });
+    }
+
+    /// テスト専用: 4 フレームぶんの有効なバッファで `render_proc` を1回呼び、呼んだ後の
+    /// 音楽クロックの世代を返す。
+    fn render_once_and_read_generation(context_ptr: *mut CallbackContext) -> u32 {
+        let mut buffer = [0.0f32; 8]; // 4 frames * 2ch
+        let mut buffer_list = AudioBufferList {
+            number_buffers: 1,
+            buffers: [AudioBuffer {
+                number_channels: 2,
+                data_byte_size: (buffer.len() * std::mem::size_of::<f32>()) as u32,
+                data: buffer.as_mut_ptr().cast(),
+            }],
+        };
+        let time_stamp = dummy_time_stamp(1_000);
+        let status = unsafe {
+            render_proc(
+                context_ptr.cast(),
+                std::ptr::null_mut(),
+                &time_stamp,
+                0,
+                4,
+                &mut buffer_list,
+            )
+        };
+        assert_eq!(status, NO_ERR);
+        unsafe { (*context_ptr).renderer.music_clock_handle() }
+            .snapshot()
+            .generation
+    }
+
+    /// 出力を動かし直した・作り直した(`restart_epoch` が進んだ)次のコールバックで、
+    /// 世代が1つ進む。動かし直しが無ければ進まない。
+    #[test]
+    fn render_proc_bumps_music_clock_generation_once_after_the_output_is_restarted() {
+        let context_ptr = test_callback_context(48_000);
+
+        let before = render_once_and_read_generation(context_ptr);
+        assert_eq!(render_once_and_read_generation(context_ptr), before);
+
+        // `UnitControl::play` / `rebuild` が行う書き込みを模す。
+        unsafe { (*context_ptr).restart_epoch.fetch_add(1, Ordering::Relaxed) };
+
+        let after = render_once_and_read_generation(context_ptr);
+        assert_eq!(after, before + 1);
+        assert_eq!(
+            render_once_and_read_generation(context_ptr),
+            after,
+            "動かし直しの後のコールバックで世代が進み続けている"
+        );
+
+        drop(unsafe { Box::from_raw(context_ptr) });
+    }
+
+    /// 動かし直しと補正項の変化が同じコールバックで見えても、世代は1つだけ進む。
+    #[test]
+    fn render_proc_bumps_music_clock_generation_once_when_restart_and_correction_change_together() {
+        let context_ptr = test_callback_context(48_000);
+        let before = render_once_and_read_generation(context_ptr);
+
+        unsafe {
+            (*context_ptr).restart_epoch.fetch_add(1, Ordering::Relaxed);
+            (*context_ptr)
+                .device_extra_latency_ns
+                .store(80_000_000, Ordering::Relaxed);
+        }
+
+        assert_eq!(render_once_and_read_generation(context_ptr), before + 1);
+
+        drop(unsafe { Box::from_raw(context_ptr) });
+    }
+
+    /// 閉じた後(`OpenUnit` を取り出した後)の制御口は、AudioUnit に触れずにエラーを返す。
+    /// 復帰確認のワーカーが `close` の後まで走り続けても、閉じたユニットへ Start を撃たない。
+    #[test]
+    fn unit_control_does_nothing_once_the_unit_is_closed() {
+        let restart_epoch = Arc::new(AtomicU64::new(0));
+        let control = UnitControl {
+            slot: Mutex::new(None),
+            sample_rate: 48_000.0,
+            restart_epoch: Arc::clone(&restart_epoch),
+            device_extra_latency_ns: Arc::new(AtomicU64::new(0)),
+            render_completions: Arc::new(AtomicU64::new(0)),
+        };
+
+        assert!(control.supports_rebuild());
+        assert!(control.pause().is_err());
+        assert!(control.play().is_err());
+        assert!(control.rebuild().is_err());
+        assert_eq!(
+            restart_epoch.load(Ordering::Relaxed),
+            0,
+            "閉じた後の操作で世代を進める合図を出している"
+        );
+    }
+
+    /// 実デバイスで、止め直し → 動かし直し、作り直し → 動かし直しのそれぞれの後に
+    /// コールバックが再び進むこと(作り直しでは同じ context を新しいユニットへ付け替える)。
+    /// CI・ヘッドレス環境では実行しない。
+    #[test]
+    #[ignore = "実デバイス(既定の出力)を開いて鳴らすため、手元の macOS でのみ実行する"]
+    fn restarting_and_rebuilding_the_real_output_resumes_the_callback() {
+        let (renderer, _sender, _reclaim, _music_producer, music_clock, events, _bgm) =
+            mw_core::Renderer::build(mw_core::Config::default(), 48_000);
+
+        let mut backend = AppleBackend::new();
+        backend
+            .open(renderer, events)
+            .expect("open should succeed on a machine with a real default output device");
+        let control = Arc::clone(backend.control.as_ref().expect("open"));
+
+        let wait_for_progress = |label: &str| {
+            let before = backend.render_completions.load(Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let after = backend.render_completions.load(Ordering::Relaxed);
+            assert!(
+                after > before,
+                "{label}: the render callback did not advance"
+            );
+        };
+
+        wait_for_progress("after open");
+        let generation_open = music_clock.snapshot().generation;
+
+        control.pause().expect("pause");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let paused = backend.render_completions.load(Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            backend.render_completions.load(Ordering::Relaxed),
+            paused,
+            "the callback kept running after AudioOutputUnitStop"
+        );
+        control.play().expect("play");
+        wait_for_progress("after pause + play");
+        let generation_restart = music_clock.snapshot().generation;
+        assert!(generation_restart > generation_open);
+
+        control.rebuild().expect("rebuild");
+        control.play().expect("play after rebuild");
+        wait_for_progress("after rebuild + play");
+        assert!(music_clock.snapshot().generation > generation_restart);
+
+        backend.close().expect("close should succeed");
+        assert!(!backend.is_open());
+        assert!(
+            control.play().is_err(),
+            "the control must be inert after close"
+        );
     }
 }

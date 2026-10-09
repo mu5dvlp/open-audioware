@@ -140,14 +140,24 @@
     影響しないが、実際に iOS を `backend-native` へ切り替える段では出力レイテンシの
     前提が変わるため、`AudioOffsetSeconds` 等の実機校正を取り直す必要がある
     (client 側のクラス doc が既に明記している帰結)。
-  `OutputUnderrunTracker` は cpal 版と共用。**既知の差分**: macOS のデバイス切断・
-  既定出力の変更の監視、および iOS/tvOS の割り込み(電話・Siri)・バックグラウンド
-  遷移からのストリーム復帰(`ios_interruption.rs` が cpal 版に対して持つ復帰ロジック)は
-  どちらも未実装——`Backend::open` が受け取る `events` は使わず `StreamError`/
-  `AudioInterruptionEnded` 等は発行しない。4-1 は macOS Editor 専用の開発機バックエンド、
-  4-2 は「補正項をルート変化で追従させるところまで」という前提で許容する判断とした。
-  本番導入(cpal 削除、ステップ4-4)前には `ios_interruption.rs` 相当の復帰ロジックの
-  移植が別途要る。`mw-ffi` の切替口(`handle.rs::make_backend`)が `backend-native`
+  `OutputUnderrunTracker` は cpal 版と共用。
+  **iOS/tvOS の割り込み・バックグラウンド・ルート変化・出力停止からの復帰は cpal 版と
+  同じ `ios_interruption::Watcher` を使う**(監視と判断は共有し、復帰の操作だけを
+  `ios_interruption::RecoverableOutput` の実装で差し替える。cpal 版は `StreamHandle`
+  〔`pause()`/`play()`〕、Apple 版は `UnitControl`〔`AudioOutputUnitStop`/
+  `AudioOutputUnitStart`、Start に失敗したら Initialize し直し〕)。Apple 版だけは
+  出力を**作り直せる**(`supports_rebuild`)——
+  `AVAudioSessionMediaServicesWereResetNotification` を監視し、止め直しを繰り返しても
+  進まないときの最後の手段にも使う。
+  作り直すのは AudioUnit だけで、`Renderer` を持つコールバックの context は同じ
+  ポインタのまま付け替える(サンプルレートは開いたときの値のまま)。AudioUnit は
+  `UnitControl` の `Mutex` の中にあり、`close` と復帰が同じ口を通る(閉じた後の操作は
+  空振り。音声スレッドはこのロックに触れない)。動かし直し・作り直しのたびに
+  `restart_epoch` を進め、音声スレッドが次のコールバックで音楽クロックの世代を進める
+  (補正項の変化と同じ経路)。動かし直しの直前に補正項(`outputLatency`)も読み直す。
+  **既知の差分**: macOS のデバイス切断・既定出力の変更の監視は未実装、`StreamError` は
+  発行しない(4-1 は macOS Editor 専用の開発機バックエンドという前提で許容)。
+  `mw-ffi` の切替口(`handle.rs::make_backend`)が `backend-native`
   feature(macOS/iOS/tvOS)で選ぶ。既定の `backend-cpal` では選ばれない。
 
 - `native_backend::android::AndroidBackend`(AUDIOWARE-DEPS-PLAN.md ステップ4-3)——
