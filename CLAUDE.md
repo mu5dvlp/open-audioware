@@ -43,6 +43,9 @@
   C# から見える形は `unity/Runtime/Generated/NativeMethods.g.cs`(`make bindgen`)
 - `docs/` — 肥大化する内容の切り出し先(設計 ADR は未着手。⚠️ 初期構築仕様と各クレートの
   `CLAUDE.md` に既にある決定を写すと正が2つになるため、何を切り出すか決めてから作る)
+- [`docs/android-native-backend-parity.md`](./docs/android-native-backend-parity.md) —
+  自前の出力(`backend-native`)と cpal 版のパリティ確認表(Android 主、iOS 付き)。
+  **cpal の削除(ステップ4-4)の前に足すべきもの**と実機の確認項目
 - [`docs/history.md`](./docs/history.md) — 作業の経緯(索引。本体は `docs/history/`)
 - **ワークスペース全体の状態・次にやること** → 1つ上の階層の `docs/HANDOFF.md`
 - **踏んだ罠と教訓** → 1つ上の階層の `docs/LESSONS.md`
