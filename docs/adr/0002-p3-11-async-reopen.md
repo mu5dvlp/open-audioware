@@ -18,7 +18,7 @@ maybe_reopen`(`mw_poll_events` から毎フレーム呼ばれる)がレジスト
 かかりうる)→ `SymphoniaDecoder::open_shared`(デコード probe)。この間、`with_instance`
 経由の他のすべての FFI 呼び出しが同じ `Mutex` を取ろうとしてゲームスレッドで足止めされる
 ——初期構築仕様『§5.4「全関数非ブロッキング」』への最悪の違反であり、
-`docs/plans/REFACTOR-PLAN.md` の P3-11 として長く「設計だけ合意し、着手は保留」の
+`docs/plans/done/REFACTOR-PLAN.md` の P3-11 として長く「設計だけ合意し、着手は保留」の
 状態だった(素朴にロックを早く手放すと「バックエンドの無い `Instance`」を他の呼び出しが
 見てしまう、という危険がある design memo が先に残されていた)。
 

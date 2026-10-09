@@ -617,7 +617,7 @@ impl Instance {
     /// **レジストリの `Mutex` を握ったまま**通しで実行しており、その間は他のあらゆる
     /// FFI 呼び出し(`with_instance` 経由)がゲームスレッドで足止めされていた
     /// (初期構築仕様『§5.4』「全関数非ブロッキング」への最悪の違反、
-    /// `docs/plans/REFACTOR-PLAN.md` P3-11 参照)。設計はオーケストレータが決定済み
+    /// `docs/plans/done/REFACTOR-PLAN.md` P3-11 参照)。設計はオーケストレータが決定済み
     /// (`docs/handoff/operations.md` 決定表): **再オープン中の API 呼び出しは
     /// 「成功を返して捨てる」**(専用エラーは作らない・ブロックしない)。
     ///
@@ -733,7 +733,7 @@ impl Instance {
     /// デスクトップの `cargo test` では「(段2 の間)固まらないこと」も
     /// 「実機で実際に音が復帰すること」も測れない——CI にはデバイスが無く
     /// `backend.open()` が即座に失敗して終わるため、いま直したい待ち時間そのものが
-    /// 発生しない(`crate::reopen` モジュール doc、`docs/plans/REFACTOR-PLAN.md`
+    /// 発生しない(`crate::reopen` モジュール doc、`docs/plans/done/REFACTOR-PLAN.md`
     /// 「P3-11」参照)。
     fn begin_reopen(&mut self, now_ns: u64) -> ReopenDetached {
         // 1) セッションを壊す前に、復元に要る情報をすべて読み取っておく。
@@ -1706,7 +1706,7 @@ mod tests {
     // ⚠️ ここに無いもの(実機が要る/この環境では検証できない):
     // - 段2(`run_reopen_worker`)が実際に走っている間、他の FFI 呼び出しが
     //   ブロックされないこと自体の実測(「固まらない」ことを測るテストは書けない
-    //   ——`crate::reopen` モジュール doc、`docs/plans/REFACTOR-PLAN.md` 参照)。
+    //   ——`crate::reopen` モジュール doc、`docs/plans/done/REFACTOR-PLAN.md` 参照)。
     // - Android(AAudio)の実機切断→復帰での動作確認。
     // - `mw_music_set`/`mw_bgm_set` が段2の窓でどう振る舞うか(このモジュールの
     //   `Instance::begin_reopen` ドキュメント「例外2箇所目」参照。実際に踏むには

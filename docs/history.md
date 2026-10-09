@@ -90,7 +90,7 @@
 
 - 🔴 **P3-11(リファクタ計画 最後の1件)完了**: `maybe_reopen` の内部再オープンを
   ロック保持のまま行わない3段構成(段1切り離し/段2ワーカースレッド/段3差し込み)へ分割。
-  `docs/plans/REFACTOR-PLAN.md` 39項目中 39件完了(100%)。⚠️ 受け入れ確認は Android 実機が要る
+  `docs/plans/done/REFACTOR-PLAN.md` 39項目中 39件完了(100%)。⚠️ 受け入れ確認は Android 実機が要る
 
 - 🆕 **CI に Codecov を入れた**(2026-09-23)—— `cargo test` を `cargo llvm-cov` へ置き換え、
   `patch 70%` をゲートに。🔴 実デバイスが要る `cpal_backend.rs` / `ios_interruption.rs` は
