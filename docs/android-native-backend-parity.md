@@ -148,6 +148,27 @@ iOS は `ed0236d` で、cpal 版の周り(`ios_interruption.rs`)と同じ監視�
 | I9 | Control Center・通知バナー | Watcher が `DidBecomeActive` を割り込み中だけ扱う | 同じ | 同じ | **未確認**(音が途切れない・ずれないこと) |
 | I10 | macOS(Editor)のデバイス切断・既定出力の変更 | cpal が扱う | 監視しない・`StreamError` も出さない | していない(開発機専用として許容) | — |
 
+### 4.1 時計に入る4項目(iOS/tvOS)
+
+`buffer_start_host_time_ns`(予測出力時刻、I7 の実体)は4つの値から組み立てる。
+2026-10-10 の一連の修正(`c9faf55`/`0f1e447`/`8920550`/`8f0b188`/`caa4a1b`)は、
+この4つそれぞれについて「いつ読むか」「いつ読み直すか」「変わったら音楽クロックの
+世代を進めるか」を1本ずつ詰めたもの——**どれも元は暗黙のままで、1つずつ実機で
+症状が出てから直した**。表はその最終形。
+
+| 項目 | いつ読むか | いつ読み直すか(iOS/tvOS) | 世代を進めるか | cpal 0.18.1 では |
+|---|---|---|---|---|
+| **ホスト時刻 mHostTime**(相関点) | 毎コールバック、`AudioTimeStamp.mHostTime` を `mach_ticks_to_ns` で ns 化(`render_proc`) | 読み直す対象ではない(定義上、毎コールバック変わる値)。ただし Control Center 表示後に `in_number_frames` が異常値(観測上 ~2048、希望値は通常240)のまま戻らない状態に入ると、この相関点そのものが実際の出力時刻からずれて信頼できなくなることがあると分かった(`8f0b188`) | 相関点自体の変化は世代のトリガーにしない(毎回変わる値のため)。対処は値の直接補正ではなく、オーバーサイズのコールバックが閾値(連続20回、【仮】)を超えたら安全な時点(曲の再生予約/再開の直前〔`caa4a1b`で再開にも拡張〕、または復帰確認直後で非背面)でだけ出力を**作り直し**(`UnitControl::rebuild`)、作り直しは `restart_epoch` を進めることで世代を進める | 同じ `OutputCallbackInfo::timestamp().callback` から取るだけで、オーバーサイズのコールバックが続くケースへの対処は持たない |
+| **バッファ長の項** | macOS: このコールバックの実測フレーム数(`in_number_frames`)から毎回計算(変更無し)。iOS/tvOS: `AVAudioSession.IOBufferDuration()` から計算し、`CallbackContext::io_buffer_duration_ns` にキャッシュして使う——**実測フレーム数は使わない**(`8920550`で実測フレーム数由来から切替。理由は次行「出力レイテンシ」のタイミングと合わせて読むため) | iOS/tvOSのみ、出力レイテンシ(次の行)と**全く同じ箇所**(`open()` の初期化・ルート変化・曲の再生予約の直前〔`0f1e447`で追加〕・曲の再開の直前〔`caa4a1b`で追加〕・動かし直し `play()`・作り直し `rebuild()`〔`0f1e447`で追加、それまで読み直し漏れ〕)で読み直す。`refresh_ios_output_latency` が両方をセットで読む | はい。`last_io_buffer_duration_ns` との比較で変化を検知したら `bump_generation`(`8920550`で追加) | iOS 実装は `AVAudioSession.IOBufferDuration()` を起動時に1度だけキャッシュし、以後読み直さない(ソース確認済み。モジュール doc「cpal 0.18.1 が iOS で返している値の意味」参照)。この実装は読み直す箇所を増やした分、cpal より新鮮な値を使う |
+| **出力レイテンシ outputLatency**(補正項、`device_extra_latency_ns`) | macOS: `open()` で `kAudioDevicePropertyLatency` + `kAudioDevicePropertySafetyOffset` を1度だけ(既知の差分、以後固定)。iOS/tvOS: `open()` で `AVAudioSession.outputLatency()` | iOS/tvOSのみ、上の「バッファ長の項」と全く同じ箇所(ルート変化・曲の再生予約の直前・曲の再開の直前・動かし直し・作り直し)。元々はルート変化・動かし直しの2箇所しか読み直しておらず、**作り直し `rebuild()` では読み直していなかった**——セッションが落ち着く前に `open()` が読んだ値がプロセス生存中ずっと残り、Control Center 操作・背面復帰後に小さな常時のズレが残る不具合になっていた(`0f1e447`で曲の再生予約の直前・作り直しの2箇所を追加) | はい。`last_device_extra_latency_ns` との比較で変化を検知したら `bump_generation`(既存の仕組み) | cpal 0.18.1 の iOS 実装は `playback` に `outputLatency()` を**一切加算しない**(`IOBufferDuration` だけ)。この実装は意図的に cpal と異なる意味で `outputLatency` を使っている(モジュール doc「cpal 0.18.1 が iOS で返している値の意味」参照) |
+| **サンプルレート** | `open()` がデバイスとネゴシエートした値を `Renderer::set_sample_rate` で確定させる | 再オープン(`Backend::open` を丸ごとやり直す)のときだけ読み直す。通常運用中は固定(出力ユニットが内部で変換する前提のため、`Renderer` 側のレートを変える必要がない) | 直接のトリガーではない——再オープン自体が `Renderer`/`Mixer` を作り直すので、世代はそちらの経路(`MusicClockPublisher::seed_generation_after_reopen`)で扱う | cpal 版(`CpalBackend`)・Android 版・Linux 版はいずれも `open()` で `Renderer::set_sample_rate` を呼んでいたが、**Apple 版だけ呼んでいなかった**(`c9faf55`で修正)。仮置きの48kHzのまま音楽クロックが変換し続け、出力が別のレート(例: 44.1kHz)で開くと曲の時刻が実際の音からずれ続けるバグだった |
+
+🔴 **サンプルレートの見落としは、他の3項目と違って実機でしか見えない形では
+なかった**——`Renderer::render` が確定前に呼ばれたことを検知する仕組み
+(`mw_core::Renderer::provisional_sample_rate_warning_handle`。`mw-ffi` が1インスタンス
+1回だけログへ出す)を足したので、次に同じ見落としが別のバックエンド実装に
+入っても、実機を使わずログで気付けるようになった。
+
 ---
 
 ## 5. この文書の更新

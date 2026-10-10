@@ -295,6 +295,12 @@ pub(crate) struct VirtualBackendShared {
     log_output_latency_calls: AtomicU32,
     log_new_output_underruns_calls: AtomicU32,
     refresh_output_latency_calls: AtomicU32,
+    /// `Renderer::provisional_sample_rate_warning_handle` の複製(`open()` が
+    /// `set_sample_rate` を呼ぶのと同じタイミングで取る)。`VirtualBackend::open` は
+    /// 実物の `CpalBackend`/`NativeBackend` と同じく、レンダリング用スレッドを
+    /// 動かす前にサンプルレートを確定させる——この合図が一度も立たないことが、
+    /// テストダブルとしてその契約を守っていることの固定化になる。
+    provisional_sample_rate_warning: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl VirtualBackendShared {
@@ -307,6 +313,7 @@ impl VirtualBackendShared {
             log_output_latency_calls: AtomicU32::new(0),
             log_new_output_underruns_calls: AtomicU32::new(0),
             refresh_output_latency_calls: AtomicU32::new(0),
+            provisional_sample_rate_warning: Mutex::new(None),
         })
     }
 
@@ -336,6 +343,17 @@ impl VirtualBackendShared {
 
     pub(crate) fn refresh_output_latency_calls(&self) -> u32 {
         self.refresh_output_latency_calls.load(Ordering::Relaxed)
+    }
+
+    /// `open()` が確定前に `render` を走らせていたら `true`
+    /// (`Renderer::render` のドキュメント参照)。`open()` が一度も呼ばれていなければ
+    /// `false`(合図を取る機会が無かっただけで、問題は無い)。
+    pub(crate) fn provisional_sample_rate_warning_was_raised(&self) -> bool {
+        self.provisional_sample_rate_warning
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|warning| warning.load(Ordering::Relaxed))
     }
 }
 
@@ -379,6 +397,14 @@ impl Backend for VirtualBackend {
         // 実物の CpalBackend と同じく、ストリーム相当のスレッドを動かす前に
         // Renderer 側のサンプルレートを確定させる。
         renderer.set_sample_rate(VIRTUAL_SAMPLE_RATE);
+        // テスト側が上の呼び出しを本当に経由したかを後から確認できるようにする
+        // (`provisional_sample_rate_warning_was_raised` 参照)。
+        *self
+            .shared
+            .provisional_sample_rate_warning
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(renderer.provisional_sample_rate_warning_handle());
 
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);

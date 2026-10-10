@@ -16,7 +16,7 @@
 //! 追加の同期プリミティブが一切不要になる(単一の書き手のみが `&mut self` で触る)。
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::clock::{MusicClockPublisher, RenderedFrameCounter};
 use crate::config::Config;
@@ -33,6 +33,17 @@ use crate::stream::MusicStreamProducer;
 pub struct Renderer {
     mixer: Mixer,
     frame_counter: RenderedFrameCounter,
+    /// 出力デバイスの実サンプルレートが [`Renderer::set_sample_rate`] で確定したか。
+    /// `Renderer` は単一スレッドが `&mut self` で排他所有する設計(モジュール doc
+    /// 「所有権の設計」)なので、ただの `bool` で足りる(atomic は要らない)。
+    sample_rate_confirmed: bool,
+    /// 確定前に [`Renderer::render`] が呼ばれたことを、ゲームスレッドへ一度だけ
+    /// 知らせる合図。音声スレッドは確定前の各 `render` で `store(true, Relaxed)`
+    /// するだけ(ロック・アロケーション無し)。[`Renderer::
+    /// provisional_sample_rate_warning_handle`] で取った複製をゲームスレッドが
+    /// 任意のタイミングで読み、ログに出す(`mw-ffi::handle::Instance::
+    /// log_provisional_sample_rate_warning_once` 参照)。
+    provisional_sample_rate_warning: Arc<AtomicBool>,
 }
 
 impl Renderer {
@@ -67,6 +78,8 @@ impl Renderer {
             Renderer {
                 mixer,
                 frame_counter: RenderedFrameCounter::new(),
+                sample_rate_confirmed: false,
+                provisional_sample_rate_warning: Arc::new(AtomicBool::new(false)),
             },
             sender,
             reclaim,
@@ -103,6 +116,8 @@ impl Renderer {
             Renderer {
                 mixer,
                 frame_counter: RenderedFrameCounter::new(),
+                sample_rate_confirmed: false,
+                provisional_sample_rate_warning: Arc::new(AtomicBool::new(false)),
             },
             sender,
             reclaim,
@@ -123,6 +138,16 @@ impl Renderer {
     /// この関数はオーディオコールバックから直接呼ばれる想定。
     /// ロック取得・ヒープアロケーション・ブロッキング IO・パニック経路は禁止(§5.3)。
     pub fn render(&mut self, output: &mut [f32], buffer_start_host_time_ns: u64) {
+        // サンプルレートが未確定のまま render が走るのは、バックエンド実装が
+        // `Backend::open` で `set_sample_rate` を呼び忘れたことの兆候(過去に実際に
+        // 起きた——仮置きのレートのまま音楽クロックが変換し続けるバグになる)。
+        // `AtomicBool` への `store` 1回だけなのでロック・アロケーションを伴わず、
+        // §5.3 に抵触しない。確定後は分岐がそのまま外れるので恒常的なコストは無い。
+        if !self.sample_rate_confirmed {
+            self.provisional_sample_rate_warning
+                .store(true, Ordering::Relaxed);
+        }
+
         self.mixer.render(output, buffer_start_host_time_ns);
 
         // `output.len()` が CHANNELS の倍数でない場合でも、整数除算で切り捨てるだけで
@@ -140,6 +165,17 @@ impl Renderer {
     /// (`Backend::open` がストリームを `play()` する前)に一度だけ呼ぶこと。
     pub fn set_sample_rate(&mut self, sample_rate: u32) {
         self.mixer.set_sample_rate(sample_rate);
+        self.sample_rate_confirmed = true;
+    }
+
+    /// [`Renderer::render`] が確定前に呼ばれたことがあるかを読むための複製を返す
+    /// (ゲームスレッド用)。
+    ///
+    /// 🔴 他の同種ハンドル([`Renderer::se_schedule_overflow_counter`] 等)と同じ理由で、
+    /// `Backend::open` へこの `Renderer` をムーブする**前に**取ること——ムーブ後は
+    /// `Renderer` 自身に触れない。
+    pub fn provisional_sample_rate_warning_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.provisional_sample_rate_warning)
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -274,6 +310,58 @@ mod tests {
         renderer.set_sample_rate(44_100);
 
         assert_eq!(renderer.sample_rate(), 44_100);
+    }
+
+    // --- 仮置きのサンプルレートのまま render した場合の警告(`provisional_sample_rate_warning_handle`) ---
+
+    /// `set_sample_rate` を一度も呼ばずに `render` すると、警告の合図が立つ
+    /// (バックエンド実装が確定を呼び忘れたまま描画を始めたことの検知)。
+    #[test]
+    fn rendering_before_set_sample_rate_raises_the_provisional_warning() {
+        let mut renderer = renderer_for_test();
+        let warning = renderer.provisional_sample_rate_warning_handle();
+        assert!(!warning.load(std::sync::atomic::Ordering::Relaxed));
+
+        let mut buffer = vec![0.0_f32; 16 * CHANNELS];
+        renderer.render(&mut buffer, 0);
+
+        assert!(warning.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// `render` の前に `set_sample_rate` を呼んでいれば、警告は一度も立たない
+    /// (`CpalBackend::open` 等、正しく確定させてから描画を始める実装の挙動)。
+    #[test]
+    fn set_sample_rate_before_rendering_keeps_the_provisional_warning_clear() {
+        let mut renderer = renderer_for_test();
+        let warning = renderer.provisional_sample_rate_warning_handle();
+
+        renderer.set_sample_rate(44_100);
+        let mut buffer = vec![0.0_f32; 16 * CHANNELS];
+        for _ in 0..4 {
+            renderer.render(&mut buffer, 0);
+        }
+
+        assert!(!warning.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// 🔴 <b>ゲームスレッド用に取り出した合図が、レンダラ側が立てる実体と同じであること。</b>
+    /// [`se_schedule_overflow_counter_is_the_same_object_the_renderer_counts_with`] と
+    /// 同じ理由の回帰テスト——ここが別物になると、警告が<b>永久に立たないまま</b>に見える。
+    #[test]
+    fn provisional_sample_rate_warning_handle_is_the_same_object_the_renderer_writes_to() {
+        let mut renderer = renderer_for_test();
+
+        let first = renderer.provisional_sample_rate_warning_handle();
+        let second = renderer.provisional_sample_rate_warning_handle();
+        assert!(Arc::ptr_eq(&first, &second), "毎回別の Arc を返しています");
+
+        let mut buffer = vec![0.0_f32; 16 * CHANNELS];
+        renderer.render(&mut buffer, 0);
+
+        assert!(
+            first.load(std::sync::atomic::Ordering::Relaxed),
+            "render が書き込む先と、取り出した複製が食い違っています"
+        );
     }
 
     /// 🔴 <b>ゲームスレッド用に取り出したカウンタが、レンダラ側が増やす実体と同じであること。</b>

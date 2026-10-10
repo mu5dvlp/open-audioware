@@ -193,6 +193,14 @@ pub struct Instance {
     /// 作り直すので、**このフィールドも一緒に差し替える**(差し替え忘れると、誰も
     /// 増やさない古いカウンタを読み続けて「ずっと 0」に見える)。
     se_schedule_overflow_count: Arc<AtomicU64>,
+    /// [`Renderer::render`] が確定前に呼ばれたことがあるかの合図
+    /// (`mw_core::Renderer::provisional_sample_rate_warning_handle` の複製)。
+    /// バックエンド実装が `Backend::open` で `set_sample_rate` を呼び忘れた場合の
+    /// 検知(`se_schedule_overflow_count` と同じ理由で、再オープンでも一緒に差し替える)。
+    provisional_sample_rate_warning: Arc<AtomicBool>,
+    /// 上の警告を既にログへ出したか(1インスタンスにつき1回だけ出す。`logged_buffer_info`
+    /// と同じ配線パターン)。
+    logged_provisional_sample_rate_warning: AtomicBool,
 
     // --- M3「Android(AAudio)切断復旧」案A(初期構築仕様『§6』確定) ------------------
     //
@@ -291,6 +299,32 @@ impl Instance {
         let ms = frames as f64 * 1000.0 / sample_rate as f64;
         mw_backend::mw_log!(
             "[mw-ffi] audio callback buffer (measured): {frames} frames @ {sample_rate} Hz = {ms:.3} ms"
+        );
+    }
+
+    /// 出力デバイスのサンプルレートが確定する前に音声コールバックが描画を始めていたら、
+    /// 1インスタンスにつき1回だけログへ出す(`mw_core::Renderer::render` のドキュメント
+    /// 参照)。バックエンド実装が `Backend::open` で `Renderer::set_sample_rate` を
+    /// 呼び忘れたことの検知——仮置きのレートのまま音楽クロックが変換し続けるバグになる。
+    ///
+    /// ゲームスレッドから呼ぶこと(`mw_backend::mw_log!` はリアルタイム安全ではない)。
+    /// 警告の合図が立っていなければ何もしない。
+    pub fn log_provisional_sample_rate_warning_once(&self) {
+        if self
+            .logged_provisional_sample_rate_warning
+            .load(Ordering::Relaxed)
+        {
+            return;
+        }
+        if !self.provisional_sample_rate_warning.load(Ordering::Relaxed) {
+            return;
+        }
+        self.logged_provisional_sample_rate_warning
+            .store(true, Ordering::Relaxed);
+        mw_backend::mw_log!(
+            "[mw-ffi] audio callback rendered before the output sample rate was confirmed \
+             (Backend::open did not call Renderer::set_sample_rate before the first render); \
+             the music clock may have converted frames at the wrong rate"
         );
     }
 
@@ -1149,6 +1183,9 @@ fn run_reopen_worker(detached: ReopenDetached) {
     //    ⚠️ ここで取り忘れると、再オープン後は**誰も増やさない古いカウンタ**を
     //    読み続けることになり、診断値が「ずっと 0」に見える。
     let se_schedule_overflow_count = renderer.se_schedule_overflow_counter();
+    // 同じ理由で、仮置きのサンプルレートの警告の合図も先に取る
+    // (`Renderer::provisional_sample_rate_warning_handle` のドキュメント参照)。
+    let provisional_sample_rate_warning = renderer.provisional_sample_rate_warning_handle();
 
     // 4) 実際にバックエンドを開き直す(cpal のデバイスオープン。数百 ms かかりうる。
     //    ここもロック無しで行われる——今回の分割の目的そのもの)。
@@ -1174,6 +1211,7 @@ fn run_reopen_worker(detached: ReopenDetached) {
                 bgm_decode_thread_stop,
                 bgm_decode_thread_handle,
                 se_schedule_overflow_count,
+                provisional_sample_rate_warning,
                 snapshot,
                 now_ns,
             );
@@ -1206,6 +1244,7 @@ fn finalize_reopen_success(
     bgm_decode_thread_stop: Arc<AtomicBool>,
     bgm_decode_thread_handle: JoinHandle<()>,
     se_schedule_overflow_count: Arc<AtomicU64>,
+    provisional_sample_rate_warning: Arc<AtomicBool>,
     snapshot: ReopenSnapshot,
     now_ns: u64,
 ) {
@@ -1247,9 +1286,13 @@ fn finalize_reopen_success(
     instance.bgm_decode_thread_stop = bgm_decode_thread_stop;
     instance.bgm_decode_thread = Some(bgm_decode_thread_handle);
     instance.se_schedule_overflow_count = se_schedule_overflow_count;
+    instance.provisional_sample_rate_warning = provisional_sample_rate_warning;
     // 新しいセッション用に「1回だけ」ログのフラグも仕切り直す(そうしないと
     // 新しいストリームの実測値〔I/O バッファ長〕が二度とログされない)。
     instance.logged_buffer_info.store(false, Ordering::Relaxed);
+    instance
+        .logged_provisional_sample_rate_warning
+        .store(false, Ordering::Relaxed);
     // `backend_sample_rate()` のフォールバック用キャッシュを更新する
     // (`Instance::backend_sample_rate` のドキュメント参照)。
     instance
@@ -1533,6 +1576,7 @@ pub fn init() -> InitOutcome {
     // 🔴 `renderer` を `Backend::open` へムーブする**前に**取る(`run_reopen_worker` と
     // 同じ理由)。
     let se_schedule_overflow_count = renderer.se_schedule_overflow_counter();
+    let provisional_sample_rate_warning = renderer.provisional_sample_rate_warning_handle();
 
     let mut backend = make_backend();
     if let Err(err) = backend.open(renderer, Arc::clone(&events)) {
@@ -1576,6 +1620,8 @@ pub fn init() -> InitOutcome {
         events,
         next_voice_serial: AtomicU64::new(1),
         logged_buffer_info: AtomicBool::new(false),
+        provisional_sample_rate_warning,
+        logged_provisional_sample_rate_warning: AtomicBool::new(false),
         music_clock,
         music_bytes: Mutex::new(HashMap::new()),
         next_music_serial: AtomicU64::new(1),

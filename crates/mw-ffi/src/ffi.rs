@@ -1256,6 +1256,13 @@ pub unsafe extern "C" fn mw_get_output_underrun_stats(
 /// `ReopenPolicy::is_due` の安価なチェックのみで即座に戻るため、定常状態の
 /// 非ブロッキング性は保たれる。
 ///
+/// あわせて、[`crate::handle::Instance::log_provisional_sample_rate_warning_once`]
+/// (出力デバイスのサンプルレートが確定する前に音声コールバックが描画を始めていたら
+/// 1インスタンスにつき1回だけログへ出す)をこのゲームスレッド経路から呼ぶ
+/// (**コールバック内から呼んではいけない**——`mw_log!` はアロケーションとロックを
+/// 伴うため、初期構築仕様『§5.3』のリアルタイム安全性規約に抵触する。
+/// `mw_get_output_latency_ns` と同じ配線パターン)。
+///
 /// # Safety
 /// `cap > 0` の場合、`buf` は `cap` 個の [`MwEvent`] を書き込み可能な有効なポインタで
 /// なければならない。`cap <= 0` の場合は `buf` が null でもよい(書き込みを行わない。
@@ -1280,6 +1287,12 @@ pub unsafe extern "C" fn mw_poll_events(
         }
 
         let result = handle_registry::with_instance(handle, |instance| {
+            // あわせて、仮置きのサンプルレートのまま描画が始まっていたら1回だけログへ出す
+            // (`Instance::log_provisional_sample_rate_warning_once` のドキュメント参照)。
+            // `mw_poll_events` は毎フレーム呼ばれる想定(関数doc)なので、ここが
+            // ゲームスレッドの定期の口になる。
+            instance.log_provisional_sample_rate_warning_once();
+
             let mut written = 0usize;
             let (_, dropped) = instance.events.drain(cap, |event| {
                 // M3(案A): DeviceUnavailable を観測したら内部再オープンの候補として
@@ -1466,6 +1479,16 @@ mod tests {
                 .any(|device| device.refresh_output_latency_calls() != 0)
         );
         assert!(devices.iter().any(|device| device.is_open()));
+        // `VirtualBackend::open` は実物の `CpalBackend`/`NativeBackend` と同じく、
+        // レンダリング用スレッドを動かす前に `Renderer::set_sample_rate` を呼ぶ
+        // (`mw_core::Renderer::render` のドキュメント参照)。払い出された全デバイス
+        // (初回 + 再オープンの新バックエンド)でこの合図が一度も立たないことを固定化する。
+        assert!(
+            devices
+                .iter()
+                .all(|device| !device.provisional_sample_rate_warning_was_raised()),
+            "set_sample_rate を呼ぶ前に render が走っています"
+        );
 
         assert_eq!(mw_shutdown(handle_out), MwResult::Ok);
         assert!(devices.iter().all(|device| !device.is_open()));
