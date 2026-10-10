@@ -1807,7 +1807,7 @@ impl Backend for AppleBackend {
                 &self.device_extra_latency_ns,
                 &self.io_buffer_duration_ns,
                 self.sample_rate,
-                "music schedule",
+                "music schedule or resume",
             );
             // モジュール doc「オーバーサイズのコールバックからの直し」の安全な時点の
             // 一つ: 曲の再生予約の直前(世代をまたがない途中には作り直さない)。

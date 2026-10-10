@@ -894,11 +894,19 @@ pub extern "C" fn mw_music_pause(handle: u64) -> MwResult {
 ///
 /// `frames` へ再位置決めしたうえで既定ランプでフェードインする。`Loading` 中は
 /// 音声スレッド側で無視される(クラッシュしない)。
+///
+/// 再開は位置を決め直して音楽クロックの世代が進む境目なので、
+/// [`mw_music_play_scheduled`] と同じく出力レイテンシの補正項を読み直す
+/// (`mw_backend::Backend::refresh_output_latency`。iOS/tvOS ではオーバーサイズの
+/// コールバックが続いていれば、この時点で出力を作り直す)。
 #[unsafe(no_mangle)]
 pub extern "C" fn mw_music_resume_at(handle: u64, frames: u64) -> MwResult {
     send_command(
         handle,
-        |_instance| mw_core::Command::MusicResumeAt { frames },
+        |instance| {
+            instance.refresh_output_latency();
+            mw_core::Command::MusicResumeAt { frames }
+        },
         |_instance| {},
     )
 }
