@@ -80,8 +80,7 @@
 
 | 実装 | 説明 |
 |---|---|
-| **A: Unity 既定実装** | `AudioSource.PlayOneShot` によるSE再生(テンプレート仕様「オーディオ抽象化」の
-`UnityAudioService` 相当。比較のベースライン) |
+| **A: Unity 既定実装** | `AudioSource.PlayOneShot` によるSE再生(テンプレート仕様「オーディオ抽象化」の `UnityAudioService` 相当。比較のベースライン) |
 | **B: 本ミドルウェア** | `Mw.Native.MwNative.PlaySe`(本リポジトリ、初期構築仕様の核心) |
 
 ### 3.2 手順
@@ -100,7 +99,7 @@
 
 ### 3.3 記録フォーマット(例)
 
-```
+```text
 端末: iPhone <機種名>, iOS <バージョン>
 録音機材: <スマホ内蔵 / オーディオIF 等>
 SE音源: <ファイル名>, 長さ <ms>
@@ -117,7 +116,7 @@ SE音源: <ファイル名>, 長さ <ms>
 波形・フレームの目視読み取りは不要。`tools/measurement/analyze_ab_video.py` が
 動画から自動で遅延を算出する(ffmpeg / ffprobe が必要。Python 標準ライブラリのみ使用):
 
-```
+```sh
 python3 tools/measurement/analyze_ab_video.py <Aの動画> --label A
 python3 tools/measurement/analyze_ab_video.py <Bの動画> --label B
 ```
@@ -209,7 +208,7 @@ Resave は Xcode のメモリ上にある**古い**プロジェクトをディ�
 
 **apk にネイティブライブラリが入っているか必ず確認すること**
 
-```
+```sh
 unzip -l unity-sample/Build/Android/measurement.apk | grep libmw_ffi
 ```
 
@@ -312,7 +311,7 @@ iOS は §1 の成功基準を満たした(§8.5)。残るゲートは Android �
 ログを logcat へ出せるようにした直後、実機(SH-M16 / Android 11)の1本目のログで
 **ミドルウェアが Android で初期化に失敗していた**ことが分かった。B は一度も鳴らない状態。
 
-```
+```text
 [mw-backend] output stream opened: sample_rate=5512 Hz, channels=2, buffer_size=Default
 [mw-ffi] mw_init: backend open failed: failed to build stream: InvalidRate
 ```
@@ -337,7 +336,7 @@ Android は stderr がどこにも出ないため、ログ経路を用意する�
 入れて再取得した(`crates/mw-ffi/src/ffi.rs` の `install_panic_hook`。既定のフックは
 置き換えず後ろで呼ぶのでデスクトップの挙動は不変)。結果:
 
-```
+```text
 [mw-ffi] panic: panicked at ndk-context-0.1.1/src/lib.rs:72:30:
 android context was not initialized
 ```
@@ -430,7 +429,7 @@ Normal frame count 960(20ms)。AAudio が低レイテンシ経路を掴めれば
 
 ### 7.1 計測条件
 
-```
+```text
 端末(計測対象): iPad ※機種名・iOS バージョンは未記録 —— 次回計測時に必ず埋めること
 録音機材: iPhone 14 内蔵マイク / スローモーション 1080p 240fps
 撮影: 端末を机に置き、手持ちの iPhone 14 で画面と本体スピーカーを同時に撮影
@@ -477,7 +476,7 @@ Bluetooth: オン(ただし出力経路には入っていない。§7.4 参照)
 **見える**のは次の垂直同期のあと(60Hz なら 0〜16.7ms 後)。一方 SE 要求はその場で発行される。
 したがって
 
-```
+```text
 実測値 = 音の出た時刻 − フラッシュが見えた時刻 < 実際の「トリガー→出力」
 ```
 
@@ -573,7 +572,7 @@ A2DP(ステレオ)側になるため、§7.6-1 の「B が起動から終了ま�
 - 端末・録音機材・撮影条件は §7.1 と同じ(iPad + iPhone 14 の 240fps スロー、Bluetooth オフ)
 - 起動ログ(OS が実際に採用した値。撮影後に別途取得):
 
-  ```
+  ```text
   [mw-backend] AVAudioSession configured: sample_rate=48000 Hz, io_buffer=5.000 ms,
                output_latency=5.000 ms, output_channels=2
   ```
@@ -611,7 +610,7 @@ B の値がすべて負、つまり**音が白フラッシュより約 31ms 早�
 アプリはタップと同一フレームで白フラッシュと `PlaySe` を要求するが、フラッシュが実際に
 画面へ出るまでにはレンダリング・垂直同期・パネルの応答がある。式で書くと
 
-```
+```text
 実測値 = (トリガー + 音の遅延) − (トリガー + 表示の遅延) = 音の遅延 − 表示の遅延
 ```
 
@@ -669,7 +668,7 @@ I/O バッファ長はセッション単位の設定だから、ミドルウェ�
 
 **モデル**
 
-```
+```text
 音の遅延 = 次のコールバックまでの待ち + I/O バッファ長 + ハードウェア出力レイテンシ
 ```
 
@@ -692,7 +691,7 @@ I/O バッファ長はセッション単位の設定だから、ミドルウェ�
 
 §8.3 の式 `実測値 = 音の遅延 − 表示の遅延` に代入すると
 
-```
+```text
 表示の遅延 = 音の遅延 − 実測値 = 12.5 − (−31.4) = 43.9 ms
 ```
 
@@ -718,7 +717,7 @@ Unity の既定構成として説明がつく。
 
 実機(§8.1 と同じ iPad)で取得した結果:
 
-```
+```text
 [mw-backend] AVAudioSession configured: sample_rate=48000 Hz, io_buffer=5.000 ms,
              output_latency=5.000 ms, output_channels=2
 [mw-ffi] audio callback buffer (measured): 240 frames @ 48000 Hz = 5.000 ms
@@ -775,7 +774,7 @@ Normal frame count 960 = 20ms。**既定の 886 frames は Normal 側に近い**
 
 ### 9.3 絶対値の見積もり(§8.7 と同じモデル)
 
-```
+```text
 音の遅延 = 次のコールバックまでの待ち + I/O バッファ長 + ハードウェア出力レイテンシ
 ```
 
@@ -849,7 +848,7 @@ Normal frame count 960 = 20ms。**既定の 886 frames は Normal 側に近い**
 §8.3 の式 `実測値 = 音の遅延 − 表示の遅延` に、9.3 のモデルから得た音の遅延
 (2.0〜4.0ms。平均 3.0)と 9.6 の実測値(-40.6ms)を代入すると
 
-```
+```text
 表示の遅延 = 音の遅延 − 実測値 = 3.0 − (−40.6) ≒ 43.6 ms
 ```
 
@@ -944,7 +943,7 @@ iPad は §8.1 の起動ログ `output_latency=5.000 ms` を使える。
 
 iPhone 側の起動ログも取得済み(同一機・同一ビルド):
 
-```
+```text
 [mw-backend] AVAudioSession configured: sample_rate=48000 Hz, io_buffer=5.000 ms,
              output_latency=17.917 ms, output_channels=2
 ```
@@ -999,7 +998,7 @@ iPhone 側の起動ログも取得済み(同一機・同一ビルド):
 
 ### 11.2 結果
 
-```
+```text
 [ClockProbe] clock=NativeMusicClock samples=3598 span=60.02s
              drift=-16.09ms jitter_rms=0.402ms jitter_max=9.178ms monotonicity_violations=0
 ```
@@ -1057,7 +1056,7 @@ iPhone 側の起動ログも取得済み(同一機・同一ビルド):
 
 - [ ] リードイン除外後のクリーンなドリフト値を採る(時間があるときでよい。
       §11.2 の -16.09ms には一回きりの段差が含まれている)
-- [ ] Android でも同じ計測を行う(`.so` は 2026-08-25 に M2 込みで再ビルド済み)
+- [ ] Android でも同じ計測をする(`.so` は 2026-08-25 に M2 込みで再ビルド済み)
 
 ---
 

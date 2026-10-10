@@ -85,7 +85,7 @@ Unity のバージョンは **6000.4.1f1** で検証しています。
 - 遅延の実測結果 → [`docs/measurement-m1.md`](./docs/measurement-m1.md)
 - 各クレートの設計・不変条件(特に**リアルタイム安全性規約**)→ `crates/<name>/COMMON.md`
 
-📌 [`COMMON.md`](./COMMON.md) / [`CLAUDE.md`](./CLAUDE.md) / [AGENTS.md](./AGENTS.md) はこのリポジトリで作業するとき(AI エージェント含む)の運用ルールです。**使うだけなら読む必要はありません。**
+📌 [`COMMON.md`](./COMMON.md) / `CLAUDE.md` / `AGENTS.md` はこのリポジトリで作業するとき(AI エージェント含む)の運用ルールです。**使うだけなら読む必要はありません。**
 
 ## ライセンス
 
@@ -275,7 +275,7 @@ Makefile・コードのどちらもアーチ非依存に書いてあります。
 
 ## リポジトリ構成
 
-```
+```text
 open-audioware/
   crates/
     mw-core/     … OS 非依存のミキサ・クロック・デコードコア

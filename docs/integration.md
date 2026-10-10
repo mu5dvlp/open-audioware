@@ -18,7 +18,7 @@
 `unity/` ディレクトリ**そのもの**が UPM パッケージ(`com.mu5dvlp.open-audioware`)。
 別途アーカイブを作る必要はなく、`file:` 参照で読み込む。
 
-```
+```text
 open-audioware/
   crates/            ← Rust 実装(mw-core / mw-backend / mw-ffi)
   unity/             ← 🔴 これが UPM パッケージ
@@ -37,7 +37,7 @@ open-audioware/
 
 ## 2. セットアップ(初回のみ)
 
-```
+```sh
 make setup      # Rust ツールチェイン・ターゲット・cargo-ndk 等の導入
 make lint       # 動く状態か確認(clippy)
 make test       # cargo test --workspace
@@ -116,7 +116,7 @@ Unity 側が `.meta` で対象プラットフォームを既に絞ってある�
 **片方の構成しか回さないと、もう片方だけで壊れる配線に気付けない**(実際に踏んでいる)。
 テンプレート側には一時的にパッケージ参照を外して回す仕組みがある:
 
-```
+```sh
 make test-no-middleware            # EditMode
 make test-no-middleware-playmode   # PlayMode(任意・スモーク)
 ```
@@ -130,7 +130,7 @@ make test-no-middleware-playmode   # PlayMode(任意・スモーク)
 
 ### 5-1. サンプルプロジェクトで確認する
 
-```
+```sh
 make unity-sample-create   # 空の Unity プロジェクトを作る(初回のみ)
 make unity-test            # EditMode テストを回す
 ```

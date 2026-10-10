@@ -29,7 +29,7 @@
 
 ### 7.2 リポジトリ構成 【仮】
 
-```
+```text
 open-audioware/
   crates/
     mw-core/
@@ -45,7 +45,7 @@ open-audioware/
 
 ### 7.3 Makefile 【確定】
 
-```
+```sh
 make setup            # ツールチェーン・ターゲット・cargo-ndk 等の導入確認
 make lint / format    # fmt + clippy + cargo-deny / 自動整形
 make test             # cargo test(mw-core のオフラインレンダリングが主)

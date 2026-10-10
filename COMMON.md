@@ -1,7 +1,7 @@
 # COMMON.md — open-audioware 運用ルール
 
 🔴 **Claude Code / Codex のどちらで作業していても、このファイルの内容は必ず守ること。**
-ツール固有の指示は [`CLAUDE.md`](CLAUDE.md)(Claude Code)/ [`AGENTS.md`](AGENTS.md)(Codex)にある。
+ツール固有の指示は `CLAUDE.md`(Claude Code)/ `AGENTS.md`(Codex)にある。
 
 このファイルは短く保つ。詳細は索引先のドキュメントを参照すること。
 
@@ -33,7 +33,7 @@
 
 - [`docs/spec/`](./docs/spec/README.md) — **初期構築仕様(唯一の正)**。§番号 → 文書の索引はここ。
   🔴 旧 `init.md` の移管先(2026-09-11)。**§番号は移管前と同じ**
-- [`README.md`](./README.md) — 概要・セットアップ・Makefile 一覧
+- `README.md` — 概要・セットアップ・Makefile 一覧
 - [`crates/mw-core/COMMON.md`](./crates/mw-core/COMMON.md) — ミキサ・クロック・デコードコア。
   **リアルタイム安全性規約(音声スレッドでの禁止事項)はここに常設**
 - [`crates/mw-backend/COMMON.md`](./crates/mw-backend/COMMON.md) — 出力デバイス抽象と cpal 実装
@@ -100,7 +100,7 @@ csbindgen が生成する `NativeMethods.g.cs` を前後で diff して同一か
 
 - 並列化して効率が上がる作業は、サブエージェントを並列で動かす
 - 🔴 **どのモデルに計画/実装を割り振るかはツールごとに違う** ——
-  [`CLAUDE.md`](CLAUDE.md)(Claude Code)/ [`AGENTS.md`](AGENTS.md)(Codex)が正
+  `CLAUDE.md`(Claude Code)/ `AGENTS.md`(Codex)が正
 - **`.env` 等の秘密情報を出力しない。** 明示的な許可があった場合のみ読み取り・使用を許可する
 - 作業の区切りごとに git コミットする
 - **動作確認はまとめて後で行う。実装中にユーザーの手を止めない。** 例外は実機系のみ:
