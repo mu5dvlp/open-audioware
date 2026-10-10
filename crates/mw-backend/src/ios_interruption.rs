@@ -177,6 +177,17 @@
 //! 既存の `attempt_recovery` そのものなので、復帰の効き自体は上の1〜3と同じ土俵に乗る。
 //! 閾値([`WATCHDOG_STALL_SAMPLES`] × [`WATCHDOG_POLL_INTERVAL_MS`] = 1秒)が
 //! 短すぎて正常時に誤検知しないかも、実機でのみ確認できる。
+//!
+//! **8つ目: ウォッチドッグが検知したときの `AudioInterruptionBegan` 通知
+//! ([`InterruptionState::on_output_stalled`])。** 当初はこの経路が
+//! `AudioInterruptionEnded` だけを出し、対応する `Began` を一度も出していなかった——
+//! アプリが非アクティブにならない停止(通知が来ない停止そのもの)では、ホスト側が
+//! 自動ポーズに乗れなかった。二重に出ないことは状態機械側で保証する:
+//! `on_output_stalled` に到達するのは [`InterruptionState::allows_stall_watchdog`] が
+//! `true` を返す3状態(`Running`/`Recovered`/`RecoveryFailed`)からだけで、
+//! 通知経由の `Began`(`on_interruption_began` → `Interrupted`)が先に来ていれば
+//! `allows_stall_watchdog` が `false` を返すため、ウォッチドッグ自身がそこで観測を
+//! リセットしてこの遷移に到達しない。
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -2104,5 +2115,51 @@ mod tests {
 
         let state = state.on_app_became_active();
         assert_eq!(state, InterruptionState::RecoveryPending);
+    }
+
+    // --- 出力停止ウォッチドッグが検知したときの `AudioInterruptionBegan`
+    // (`InterruptionState::on_output_stalled`。モジュール doc「8つ目」参照) ---
+
+    /// ウォッチドッグが実際に観測しうる3状態(`allows_stall_watchdog()` が `true` を
+    /// 返す状態)のいずれからでも、`Interrupted` を経由せず直接 `RecoveryPending` へ進む。
+    #[test]
+    fn output_stalled_requests_recovery_from_every_state_the_watchdog_may_observe() {
+        for state in [
+            InterruptionState::Running,
+            InterruptionState::Recovered,
+            InterruptionState::RecoveryFailed,
+        ] {
+            assert!(
+                state.allows_stall_watchdog(),
+                "このテストが対象にすべきでない状態です: {state:?}"
+            );
+            let next = state.on_output_stalled();
+            assert_eq!(next, InterruptionState::RecoveryPending, "from {state:?}");
+            assert!(next.needs_recovery_attempt(), "from {state:?}");
+        }
+    }
+
+    /// 出力停止ウォッチドッグ起点の復帰が失敗しても、他の起点(割り込み・ルート変化)と
+    /// 同じく次の前面復帰で再試行できる。
+    #[test]
+    fn output_stalled_recovery_failure_can_be_retried_when_the_app_becomes_active_again() {
+        let state = InterruptionState::Running
+            .on_output_stalled()
+            .on_recovery_attempted(false);
+        assert_eq!(state, InterruptionState::RecoveryFailed);
+
+        let state = state.on_app_became_active();
+        assert_eq!(state, InterruptionState::RecoveryPending);
+        assert!(state.needs_recovery_attempt());
+    }
+
+    /// 通知経由の割り込みが先に `Began` を出していれば(`Interrupted`)、
+    /// ウォッチドッグはそこへ到達しない——`allows_stall_watchdog` が `false` を返すため、
+    /// 二重に `Began` を出す経路が無いことの直接の裏付け。
+    #[test]
+    fn output_stalled_is_unreachable_once_a_notification_began_is_already_in_flight() {
+        let state = InterruptionState::new().on_interruption_began();
+        assert_eq!(state, InterruptionState::Interrupted);
+        assert!(!state.allows_stall_watchdog());
     }
 }
