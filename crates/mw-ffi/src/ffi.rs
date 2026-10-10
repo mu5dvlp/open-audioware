@@ -689,12 +689,21 @@ pub unsafe extern "C" fn mw_bus_get_volume(
 /// 現状はこの呼び出しだけでは実際に音は鳴らない(楽曲ボイスが `Loading` のまま予約が
 /// 繰り下げられ続ける)。予約発火の仕組み自体は `mw-core` のオフラインレンダリング
 /// テストで検証済み。
+///
+/// **呼ぶたびに出力レイテンシの補正項を読み直す**(`mw_backend::Backend::
+/// refresh_output_latency` へ委譲。既定は no-op、iOS/tvOS の `backend-native` だけが
+/// 実際に読み直す)。セッションが
+/// 落ち着く前に `open()` 直後の値を読んだまま固定されることへの対処で、曲の再生中
+/// (世代をまたがない途中)に値が変わって音楽クロックが跳ぶことを避けるため、
+/// 読み直すのは「予約」というこの境目だけに絞ってある
+/// (`mw_backend::native_backend::apple` モジュール doc「タイムスタンプの扱い」参照)。
 #[unsafe(no_mangle)]
 pub extern "C" fn mw_music_play_scheduled(handle: u64, host_time_ns: u64) -> MwResult {
     send_command(
         handle,
         |instance| {
             instance.drain_reclaimed();
+            instance.refresh_output_latency();
             mw_core::Command::MusicPlayScheduled { host_time_ns }
         },
         |_instance| {},
@@ -1438,6 +1447,15 @@ mod tests {
             devices
                 .iter()
                 .any(|device| device.log_new_output_underruns_calls() != 0)
+        );
+        // `mw_music_play_scheduled`(`run_se_lifecycle` が呼ぶ)が曲の再生予約の直前に
+        // `Backend::refresh_output_latency` を呼ぶ配線になっていることの固定化
+        // (`crates/mw-backend/src/native_backend/apple.rs` モジュール doc
+        // 「タイムスタンプの扱い」参照)。
+        assert!(
+            devices
+                .iter()
+                .any(|device| device.refresh_output_latency_calls() != 0)
         );
         assert!(devices.iter().any(|device| device.is_open()));
 

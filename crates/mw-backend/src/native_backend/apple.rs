@@ -34,7 +34,8 @@
 //!   古いユニットを止めてから新しいユニットを開始するまでの間はコールバックが走らないので、
 //!   context の排他所有(単一の書き手)は崩れない。サンプルレートは開いたときの値のまま
 //!   (ハードウェアと違えば AudioUnit が変換する)——`Renderer` のサンプルレートを
-//!   変えずに済ませるため。
+//!   変えずに済ませるため。動かし直しと同じく、直前に補正項(`outputLatency`)を
+//!   読み直す。
 //!
 //! 動かし直し・作り直しのたびにホスト時刻の相関点が飛ぶので、音声スレッドが次の
 //! コールバックで音楽クロックの世代を進める(補正項の変化と同じ経路。
@@ -74,7 +75,15 @@
 //!   (`AVAudioSession.outputLatency()`)を読んで初期化し、以後は
 //!   `IosOutputLatencyWatcher` が `AVAudioSessionRouteChangeNotification` を監視して
 //!   ルート(スピーカー/有線/Bluetooth)が変わるたびに読み直す——これが HANDOFF 0f の
-//!   「補正項をルート変化で更新する」。
+//!   「補正項をルート変化で更新する」。それ以外で読み直すのは次の3箇所だけに絞っている:
+//!   `Backend::refresh_output_latency`(曲の再生予約の直前。`mw-ffi` の
+//!   `mw_music_play_scheduled` から呼ばれる)、`RecoverableOutput::play` の
+//!   動かし直し、`RecoverableOutput::rebuild` の作り直し。いずれも音楽クロックの
+//!   世代(`restart_epoch`)が進むタイミングと一致させてある——**曲の再生中(世代を
+//!   またがない途中)に補正項だけを変えるとクロックが跳ぶため**、意図的にこの3箇所+
+//!   ルート変化以外では読み直さない。セッションが落ち着く前に `open()` が読んだ値が
+//!   プロセス生存中ずっと残ってしまう(Control Center 操作・背面復帰後に小さな
+//!   常時のズレが残り続ける)問題への対処。
 //!
 //! **cpal 0.18.1(固定中)が iOS で返している値の意味、および 0.18.2 でそれが壊れた理由**
 //! (ソースを確認済み。`~/.cargo/registry/.../cpal-0.18.{1,2}/src/host/coreaudio/ios/mod.rs`):
@@ -575,8 +584,8 @@ fn query_device_extra_latency_frames(unit: AudioUnit) -> u32 {
 
 /// `AVAudioSession.outputLatency()`(秒)を ns 化して返す——iOS/tvOS の「補正項」の
 /// 出し方そのもの(モジュール doc「タイムスタンプの扱い」参照)。[`AppleBackend::open`]
-/// が初期化時に1度読み、`IosOutputLatencyWatcher` がルート変化のたびに読み直して
-/// `device_extra_latency_ns` を更新する。
+/// が初期化時に1度読み、[`refresh_ios_output_latency`] がそれ以外の読み直し箇所
+/// (ルート変化・曲の再生予約・動かし直し・作り直し)から同じ関数を呼ぶ。
 ///
 /// **`IOBufferDuration` はここでは読まない**(`+ IOBufferDuration` を別途足すと二重計上に
 /// なる)——このバッファの長さは [`compute_timestamps`] がレンダーコールバックの
@@ -594,6 +603,39 @@ fn query_ios_output_latency_ns() -> u64 {
     // だけの呼び出しで、`outputLatency()` は NSError を返さない単純なゲッタ。
     let seconds = unsafe { objc2_avf_audio::AVAudioSession::sharedInstance().outputLatency() };
     seconds_to_ns(seconds)
+}
+
+/// 補正項(`device_extra_latency_ns`)を [`query_ios_output_latency_ns`] で読み直し、
+/// 書き込んだうえで、変化をログへ出す——ルート変化(`ios_impl::Watcher`)・曲の再生予約
+/// (`AppleBackend::refresh_output_latency`)・動かし直し(`UnitControl::play`)・
+/// 作り直し(`UnitControl::rebuild`)の4箇所が共有する実体(モジュール doc「タイムスタンプの
+/// 扱い」参照)。
+///
+/// `reason` はどの経路からの読み直しかをログに残すための短い文言(例:
+/// `"music schedule"`)。`IOBufferDuration` はタイムスタンプの計算には使わない
+/// ([`query_ios_output_latency_ns`] の doc「二重計上」参照)——ここでは実機ログからの
+/// 診断用に読むだけ。
+///
+/// **呼び出し元はゲームスレッド・通知ハンドラ・復帰ワーカーといった非リアルタイムスレッド
+/// であること**(`mw_log!` はアロケーションとロックを伴う。音声スレッドから呼んでは
+/// ならない)。
+#[cfg(any(target_os = "ios", target_os = "tvos"))]
+fn refresh_ios_output_latency(device_extra_latency_ns: &AtomicU64, sample_rate: u32, reason: &str) {
+    let previous_ns = device_extra_latency_ns.load(Ordering::Relaxed);
+    let new_ns = query_ios_output_latency_ns();
+    device_extra_latency_ns.store(new_ns, Ordering::Relaxed);
+    // SAFETY: `AVAudioSession::sharedInstance()` はプロセス唯一の共有インスタンスを返す
+    // だけの呼び出しで、`IOBufferDuration()` は NSError を返さない単純なゲッタ
+    // (`query_ios_output_latency_ns` と同じ前提)。
+    let io_buffer_ms =
+        unsafe { objc2_avf_audio::AVAudioSession::sharedInstance().IOBufferDuration() } * 1000.0;
+    crate::mw_log!(
+        "[mw-backend] (native/apple ios) output latency correction refreshed ({reason}): \
+         {:.3} ms -> {:.3} ms (io_buffer={:.3} ms, sample_rate={sample_rate} Hz)",
+        previous_ns as f64 / 1_000_000.0,
+        new_ns as f64 / 1_000_000.0,
+        io_buffer_ms,
+    );
 }
 
 // ============================================================================
@@ -915,7 +957,8 @@ struct UnitControl {
     sample_rate: f64,
     /// [`AppleBackend::restart_epoch`] と同じ `Arc`。
     restart_epoch: Arc<AtomicU64>,
-    /// 補正項。iOS/tvOS では動かし直しの直前に読み直す。
+    /// 補正項。iOS/tvOS では動かし直し・作り直しの直前に読み直す
+    /// (`refresh_ios_output_latency`)。
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     device_extra_latency_ns: Arc<AtomicU64>,
     /// 古いユニットを捨ててから context を新しいユニットへ渡すときの同期点
@@ -961,8 +1004,11 @@ impl RecoverableOutput for UnitControl {
         // 背面にいる間・割り込みの間にルートが変わっていることがあるので、補正項を
         // 読み直してから動かす(最初のコールバックから新しい値を使わせる)。
         #[cfg(any(target_os = "ios", target_os = "tvos"))]
-        self.device_extra_latency_ns
-            .store(query_ios_output_latency_ns(), Ordering::Relaxed);
+        refresh_ios_output_latency(
+            &self.device_extra_latency_ns,
+            self.sample_rate as u32,
+            "resume play()",
+        );
         // 止まっていた間のぶんホスト時刻の相関点が飛ぶので、次のコールバックで世代を
         // 進めさせる(`CallbackContext::last_restart_epoch`)。
         self.restart_epoch.fetch_add(1, Ordering::Relaxed);
@@ -1008,6 +1054,16 @@ impl RecoverableOutput for UnitControl {
         let Some(open) = guard.as_mut() else {
             return Err(UNIT_CLOSED.to_owned());
         };
+
+        // 動かし直し(`play`)と同じ理由——作り直している間にルートが変わっている
+        // ことがあるので、新しいユニットが最初のコールバックから新しい値を使えるよう
+        // 先に補正項を読み直す。
+        #[cfg(any(target_os = "ios", target_os = "tvos"))]
+        refresh_ios_output_latency(
+            &self.device_extra_latency_ns,
+            self.sample_rate as u32,
+            "rebuild",
+        );
 
         // 古いユニットを先に止める——ここから新しいユニットの Start までコールバックは
         // 走らないので、同じ context を新しいユニットへ渡しても書き手は1人のまま。
@@ -1238,9 +1294,10 @@ impl Backend for AppleBackend {
         // 「Start した直後、監視がまだ無い間にルート変化が来て取り逃す」窓を塞ぐ
         // (macOS では `IosOutputLatencyWatcher::new` 自体が no-op なのでコストは無い)。
         // `close()` は依然これを一番最初に止める(逆順で対称)。
-        self.ios_output_latency_watcher = Some(IosOutputLatencyWatcher::new(Arc::clone(
-            &self.device_extra_latency_ns,
-        )));
+        self.ios_output_latency_watcher = Some(IosOutputLatencyWatcher::new(
+            Arc::clone(&self.device_extra_latency_ns),
+            sample_rate as u32,
+        ));
 
         // SAFETY: `unit` は初期化済み。
         let status = unsafe { AudioOutputUnitStart(unit) };
@@ -1366,6 +1423,21 @@ impl Backend for AppleBackend {
         self.sample_rate
     }
 
+    fn refresh_output_latency(&self) {
+        // macOS は未オープンのときも含めて何もしない——補正項は `open()` で1度
+        // 読んだあと固定の既知の差分(モジュール doc「cpal 版との既知の差分」参照)。
+        // iOS/tvOS だけが曲の再生予約の直前にここを通る
+        // (`crates/mw-ffi/src/ffi.rs::mw_music_play_scheduled` から)。
+        #[cfg(any(target_os = "ios", target_os = "tvos"))]
+        if self.control.is_some() {
+            refresh_ios_output_latency(
+                &self.device_extra_latency_ns,
+                self.sample_rate,
+                "music schedule",
+            );
+        }
+    }
+
     fn output_latency_ns(&self) -> u64 {
         self.output_latency_ns.load(Ordering::Relaxed)
     }
@@ -1440,18 +1512,19 @@ pub(super) struct IosOutputLatencyWatcher {
 
 impl IosOutputLatencyWatcher {
     /// `device_extra_latency_ns` はルート変化のたびに書き直す先(`AppleBackend`/
-    /// `CallbackContext` と同じ `Arc` を指す)。
+    /// `CallbackContext` と同じ `Arc` を指す)。`sample_rate` はログ出力用
+    /// (`refresh_ios_output_latency` へそのまま渡す)。
     #[cfg(any(target_os = "ios", target_os = "tvos"))]
-    fn new(device_extra_latency_ns: Arc<AtomicU64>) -> Self {
+    fn new(device_extra_latency_ns: Arc<AtomicU64>, sample_rate: u32) -> Self {
         Self {
-            inner: ios_impl::Watcher::new(device_extra_latency_ns),
+            inner: ios_impl::Watcher::new(device_extra_latency_ns, sample_rate),
         }
     }
 
     /// macOS では何もしない(常に `Some(IosOutputLatencyWatcher::new(..))` を構築しても
     /// コストが無いようにするための no-op。`ios_interruption::Watcher` と同じ設計)。
     #[cfg(not(any(target_os = "ios", target_os = "tvos")))]
-    fn new(_device_extra_latency_ns: Arc<AtomicU64>) -> Self {
+    fn new(_device_extra_latency_ns: Arc<AtomicU64>, _sample_rate: u32) -> Self {
         Self {}
     }
 }
@@ -1461,7 +1534,7 @@ mod ios_impl {
     use std::panic::{self, AssertUnwindSafe};
     use std::ptr::NonNull;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
 
     use block2::RcBlock;
     use objc2::rc::Retained;
@@ -1470,7 +1543,7 @@ mod ios_impl {
     use objc2_avf_audio::AVAudioSessionRouteChangeNotification;
     use objc2_foundation::{NSNotification, NSNotificationCenter};
 
-    use super::query_ios_output_latency_ns;
+    use super::refresh_ios_output_latency;
 
     pub(super) struct Watcher {
         /// 通知を受け取らなくなったら即座に `removeObserver` できるよう保持する
@@ -1486,18 +1559,16 @@ mod ios_impl {
     unsafe impl Sync for Watcher {}
 
     impl Watcher {
-        pub(super) fn new(device_extra_latency_ns: Arc<AtomicU64>) -> Self {
+        pub(super) fn new(device_extra_latency_ns: Arc<AtomicU64>, sample_rate: u32) -> Self {
             let nc = NSNotificationCenter::defaultCenter();
             let block = RcBlock::new(move |_: NonNull<NSNotification>| {
                 // パニックは Objective-C ランタイムの外へ絶対に漏らさない
                 // (`ios_interruption.rs` と同じ方針)。
                 let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-                    let ns = query_ios_output_latency_ns();
-                    device_extra_latency_ns.store(ns, Ordering::Relaxed);
-                    crate::mw_log!(
-                        "[mw-backend] (native/apple ios) output latency correction updated \
-                         after a route change: {:.3} ms",
-                        ns as f64 / 1_000_000.0,
+                    refresh_ios_output_latency(
+                        &device_extra_latency_ns,
+                        sample_rate,
+                        "route change",
                     );
                 }));
                 if outcome.is_err() {

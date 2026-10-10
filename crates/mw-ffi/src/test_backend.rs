@@ -294,6 +294,7 @@ pub(crate) struct VirtualBackendShared {
     last_callback_frames: AtomicU32,
     log_output_latency_calls: AtomicU32,
     log_new_output_underruns_calls: AtomicU32,
+    refresh_output_latency_calls: AtomicU32,
 }
 
 impl VirtualBackendShared {
@@ -305,6 +306,7 @@ impl VirtualBackendShared {
             last_callback_frames: AtomicU32::new(0),
             log_output_latency_calls: AtomicU32::new(0),
             log_new_output_underruns_calls: AtomicU32::new(0),
+            refresh_output_latency_calls: AtomicU32::new(0),
         })
     }
 
@@ -330,6 +332,10 @@ impl VirtualBackendShared {
 
     pub(crate) fn log_new_output_underruns_calls(&self) -> u32 {
         self.log_new_output_underruns_calls.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn refresh_output_latency_calls(&self) -> u32 {
+        self.refresh_output_latency_calls.load(Ordering::Relaxed)
     }
 }
 
@@ -454,6 +460,15 @@ impl Backend for VirtualBackend {
         } else {
             0
         }
+    }
+
+    fn refresh_output_latency(&self) {
+        // 既定実装(no-op)の代わりに、呼ばれたこと自体を観測できるようにする——
+        // `mw_music_play_scheduled` が実際にこの経路を配線していることを
+        // `se_and_music_lifecycles_over_a_virtual_device` が固定化する。
+        self.shared
+            .refresh_output_latency_calls
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn log_output_latency_once(&self) {

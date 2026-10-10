@@ -451,6 +451,15 @@ impl Instance {
         self.backend.output_latency_ns()
     }
 
+    /// 出力レイテンシの補正項を読み直す機会を与える([`Backend::refresh_output_latency`]
+    /// へ委譲)。`mw_music_play_scheduled`(曲の再生予約の直前、ゲームスレッド経路)
+    /// から呼ぶこと——曲の再生中に呼んで世代をまたがないタイミングで補正項を変えると
+    /// 音楽クロックが跳ぶ(トレイト側のドキュメント参照)。既定実装(cpal 版・Android 版)
+    /// は no-op。
+    pub fn refresh_output_latency(&self) {
+        self.backend.refresh_output_latency();
+    }
+
     /// 出力レイテンシの実測値を1回だけログへ出す
     /// (`Backend::log_output_latency_once` へ委譲)。`mw_get_output_latency_ns`
     /// (ゲームスレッド経路)から呼ぶこと。コールバック内から呼んではいけない
