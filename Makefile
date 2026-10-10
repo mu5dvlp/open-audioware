@@ -42,6 +42,15 @@ MARKDOWNLINT_CLI2_VERSION := 0.18.1
 # (このリポジトリで実測して確認した)。
 CARGO_MACHETE_VERSION := 0.9.2
 
+# cargo-cyclonedx(SBOM の書き出し。`make sbom`)。版はここ1箇所で固定する。
+CARGO_CYCLONEDX_VERSION := 0.5.9
+
+# SBOM(CycloneDX JSON)の出力先と対象ターゲット。生成物は追跡しない(.gitignore)。
+# ターゲットは scripts/gen-third-party-licenses.py の配布対象3ターゲットと同じ
+# (macOS は Apple Silicon の1本だけ。x86_64 は依存集合が同じ)。
+SBOM_DIR     ?= sbom
+SBOM_TARGETS ?= aarch64-apple-ios aarch64-linux-android aarch64-apple-darwin
+
 # README.md はユーザー(人・外部コントリビューター)向けの文書として docs-lint の緑の対象には
 # 含めず、件数だけを別枠で見る(ワークスペース COMMON.md と同じ方針。2026-10-10)。
 # CONTRIBUTING.md / CODE_OF_CONDUCT.md / SECURITY.md も同じく人向けなので同じ扱いにする。
@@ -55,13 +64,14 @@ DOCS_LINT_READMES := README.md CONTRIBUTING.md CODE_OF_CONDUCT.md SECURITY.md
         fuzz-toolchain fuzz-build fuzz-corpus fuzz-run fuzz-seeds \
         tsan \
         docs-check docs-lint docs-lint-md docs-lint-text docs-lint-rules docs-lint-readme-report \
-        cargo-machete
+        cargo-machete sbom
 
 help:
 	@echo "open-audioware — make ターゲット"
 	@echo "  make setup          - ツールチェーン・ターゲット・cargo-ndk 等の導入確認"
 	@echo "  make lint           - fmt --check + clippy -D warnings + cargo-deny + cargo-machete + 第三者表記の鮮度検査 + C# ラッパのコンパイル + docs-check + docs-lint"
 	@echo "  make cargo-machete  - 使っていない依存の検査(版は固定。導入済みでなければ導入する)"
+	@echo "  make sbom           - Rust 依存の SBOM(CycloneDX JSON)を $(SBOM_DIR)/ へ書き出す(配布3ターゲット別。版は固定)"
 	@echo "  make csharp-check   - unity/Runtime/MwNative.cs を Unity 無しでコンパイル(P3-8)"
 	@echo "  make docs-check     - docs を docs-graph で検査(リンク切れ・外へのリンク・循環・禁止の向き)"
 	@echo "  make docs-lint      - docs の整形 + 日本語の書き方 + 独自規約(scripts/docs-lint/ 参照)"
@@ -330,6 +340,31 @@ third-party-licenses-check:
 		exit 1; \
 	fi
 	@echo "[ok] THIRD-PARTY-LICENSES.md / THIRD-PARTY-LICENSES.txt は最新です"
+
+# --- SBOM -----------------------------------------------------------------
+
+# 配布物は mw-ffi(cdylib / staticlib)ただ1つで、mw-core / mw-backend はその依存として
+# 含まれる。そのため SBOM は **mw-ffi を根にしたターゲット別の1ファイル**(合計 SBOM_TARGETS 本)。
+# 3クレートを別々に出すと同じ依存が3重に載り、ターゲットを混ぜると実際には
+# どのバイナリにも入らない依存の和集合になる(実物と一致しない)ため。
+# ビルド時依存(build.rs 用の csbindgen 等)も含める —— THIRD-PARTY-LICENSES.md の
+# 一覧と同じ集合(差は自クレート mw-core / mw-backend のみ)。
+# ⚠️ cargo-cyclonedx は依存の自クレート(mw-core / mw-backend)の隣にも同名のファイルを
+# 書くので、移した後に消している。
+# ⚠️ 毎回の生成物にはタイムスタンプとシリアル番号が入るので、差分検査(CI)には向かない。
+sbom:
+	@if [ "$$(cargo cyclonedx --version 2>/dev/null | awk '{print $$NF}')" != "$(CARGO_CYCLONEDX_VERSION)" ]; then \
+		echo "cargo-cyclonedx $(CARGO_CYCLONEDX_VERSION) を導入します"; \
+		cargo install --locked cargo-cyclonedx@$(CARGO_CYCLONEDX_VERSION); \
+	fi
+	@mkdir -p $(SBOM_DIR)
+	@for t in $(SBOM_TARGETS); do \
+		cargo cyclonedx --manifest-path crates/mw-ffi/Cargo.toml --format json --spec-version 1.5 \
+			--all --target $$t --override-filename sbom-$$t >/dev/null || exit 1; \
+		mv crates/mw-ffi/sbom-$$t.json $(SBOM_DIR)/mw-ffi.$$t.cdx.json || exit 1; \
+		rm -f crates/*/sbom-$$t.json; \
+		echo "[ok] $(SBOM_DIR)/mw-ffi.$$t.cdx.json"; \
+	done
 
 format:
 	cargo fmt --all

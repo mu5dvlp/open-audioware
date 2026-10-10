@@ -239,6 +239,7 @@ Makefile・コードのどちらもアーチ非依存に書いてあります。
 |---|---|
 | rustfmt / clippy | フォーマット・静的解析(`make lint`) |
 | cargo-deny | 依存ライセンス・脆弱性の検査(`deny.toml`) |
+| cargo-cyclonedx 0.5.9 | Rust 依存の SBOM(CycloneDX JSON)の書き出し(`make sbom`。版は Makefile の `CARGO_CYCLONEDX_VERSION` で固定。無ければ自動で導入) |
 | cargo-llvm-cov | テスト実行とカバレッジ計測を兼ねる(CI) |
 | Codecov | カバレッジレポートのアップロード・可視化 |
 | Semgrep CE | 静的解析(`make semgrep`。🔴 CI には載せない。main へ入れる前に手元で回す) |

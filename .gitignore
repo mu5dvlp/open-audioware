@@ -4,6 +4,9 @@
 Cargo.lock.bak
 *.pdb
 
+# --- SBOM(make sbom の出力) ---
+/sbom/
+
 # --- Python(scripts/docs-graph・scripts/docs-lint) ---
 __pycache__/
 *.pyc
