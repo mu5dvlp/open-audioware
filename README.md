@@ -83,9 +83,9 @@ Unity のバージョンは **6000.4.1f1** で検証しています。
 - 仕様(何を作るか・なぜそう決めたか)→ [`docs/spec/`](./docs/spec/README.md)
 - 実装の経緯(いつ・なぜそうしたか)→ [`docs/history.md`](./docs/history.md)
 - 遅延の実測結果 → [`docs/measurement-m1.md`](./docs/measurement-m1.md)
-- 各クレートの設計・不変条件(特に**リアルタイム安全性規約**)→ `crates/<name>/CLAUDE.md`
+- 各クレートの設計・不変条件(特に**リアルタイム安全性規約**)→ `crates/<name>/COMMON.md`
 
-📌 [`CLAUDE.md`](./CLAUDE.md) および [AGENTS.md](./AGENTS.md) はこのリポジトリで作業するとき(AI エージェント含む)の運用ルールです。**使うだけなら読む必要はありません。**
+📌 [`COMMON.md`](./COMMON.md) / [`CLAUDE.md`](./CLAUDE.md) / [AGENTS.md](./AGENTS.md) はこのリポジトリで作業するとき(AI エージェント含む)の運用ルールです。**使うだけなら読む必要はありません。**
 
 ## ライセンス
 
@@ -294,7 +294,7 @@ open-audioware/
   deny.toml      … cargo-deny 設定(ライセンス allow リスト・アドバイザリ)
 ```
 
-各クレートの設計・不変条件(特に**リアルタイム安全性規約** —— 音声スレッドで何をしてはいけないか)は `crates/<name>/CLAUDE.md` にあります。**改造するなら必ず目を通してください。**
+各クレートの設計・不変条件(特に**リアルタイム安全性規約** —— 音声スレッドで何をしてはいけないか)は `crates/<name>/COMMON.md` にあります。**改造するなら必ず目を通してください。**
 
 ## 貢献について
 

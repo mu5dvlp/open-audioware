@@ -896,7 +896,7 @@ struct CallbackContext {
 /// - `in_time_stamp`/`io_data` はこの呼び出しの間だけ有効な、CoreAudio 所有のポインタ。
 ///
 /// パニックは FFI 境界(CoreAudio の C フレーム)の外へ絶対に漏らさない
-/// (`mw-ffi/CLAUDE.md` の「不変条件」と同じ方針をここでも適用する)。`Renderer::render`
+/// (`mw-ffi/COMMON.md` の「不変条件」と同じ方針をここでも適用する)。`Renderer::render`
 /// 自体はパニックしない契約(§5.3)だが、ここでは契約が破られた場合の最後の防波堤として
 /// `catch_unwind` で包む——巻き戻りが実際に起きない限りアロケーション・ロックを
 /// 行わないため、リアルタイム安全性規約には抵触しない。
@@ -1047,7 +1047,7 @@ unsafe extern "C" fn render_proc(
 
         // 音声スレッド上で呼ぶ mw-core 側の経路は `Renderer::render` と、直前の
         // `MusicClockPublisher::bump_generation`(呼ぶのはこのコールバック自身、つまり
-        // 音声スレッドからのみ)に限る(`mw-backend/CLAUDE.md` の設計意図)。
+        // 音声スレッドからのみ)に限る(`mw-backend/COMMON.md` の設計意図)。
         // いずれもロック・アロケーションを伴わない atomic ストアのみで、
         // リアルタイム安全性規約(§5.3)に抵触しない。
         context.renderer.render(output, buffer_start_host_time_ns);
@@ -1461,7 +1461,7 @@ pub struct AppleBackend {
 // `UnitControl` の `Mutex` を通してしか触れない。そのうえで、`mw-ffi::handle::Instance` がグローバル
 // レジストリの `Mutex` 経由で単一所有を保証するため、`AppleBackend` の `&mut self`
 // メソッドが複数スレッドから同時に呼ばれることは無い(`cpal_backend::CpalBackend` と同じ
-// 理由。`mw-ffi/CLAUDE.md` の「バックエンドをトレイトオブジェクトで持つ理由」参照)。
+// 理由。`mw-ffi/COMMON.md` の「バックエンドをトレイトオブジェクトで持つ理由」参照)。
 // `Sync` は要らない。
 unsafe impl Send for AppleBackend {}
 

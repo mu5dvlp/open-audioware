@@ -2,7 +2,7 @@
 
 マイルストーン M5(ハードニング)の成果物。**この文書だけを読んで導入できる**ことを目標に書いてある。
 実装方針・決定事項の唯一の正は初期構築仕様、各クレートの設計は
-`crates/*/CLAUDE.md`、作業の経緯は [`history.md`](history.md)。
+`crates/*/COMMON.md`、作業の経緯は [`history.md`](history.md)。
 
 🔴 **前提として押さえておくべき性質が2つある。**
 
@@ -157,9 +157,9 @@ make unity-test            # EditMode テストを回す
 | **C# から見える形** | `unity/Runtime/Generated/NativeMethods.g.cs`(csbindgen 生成)。`make bindgen` で作る |
 
 境界の約束(エラーモデル・ハンドル管理・所有権)は
-[`crates/mw-ffi/CLAUDE.md`](../crates/mw-ffi/CLAUDE.md) が正。
+[`crates/mw-ffi/COMMON.md`](../crates/mw-ffi/COMMON.md) が正。
 ⚠️ **音声スレッドでの禁止事項(リアルタイム安全性)**は
-[`crates/mw-core/CLAUDE.md`](../crates/mw-core/CLAUDE.md) に常設 —— 拡張する前に必ず読むこと。
+[`crates/mw-core/COMMON.md`](../crates/mw-core/COMMON.md) に常設 —— 拡張する前に必ず読むこと。
 
 ---
 
@@ -171,4 +171,4 @@ make unity-test            # EditMode テストを回す
 | 長時間試験 | ⬜ 実機で放置して確認する類のもの |
 | UPM パッケージ名 / 組織 ID | ✅ **決定**(MU7。ユーザー判断 2026-09-23「Open Audioware か Open Source Audio Middleware になっていれば大丈夫」)—— `displayName` は **Open Source Audio Middleware**、`name` は `com.mu5dvlp.open-audioware` のまま(load-bearing なのは `name` のほう)|
 | リリース自動化 | ⬜ 未着手。`make package` は現状「必須ファイルの存在確認」まで |
-| 設計 ADR | ⬜ 未着手。⚠️ **初期構築仕様と各クレートの `CLAUDE.md` に既に書かれている決定を ADR へ写すと、正が2つになる。** 何を ADR に切り出すかを決めてから作ること |
+| 設計 ADR | ⬜ 未着手。⚠️ **初期構築仕様と各クレートの `COMMON.md` に既に書かれている決定を ADR へ写すと、正が2つになる。** 何を ADR に切り出すかを決めてから作ること |

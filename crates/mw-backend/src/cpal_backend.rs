@@ -571,7 +571,7 @@ fn build_output_stream(
                 // ここが音声スレッド上のオーディオコールバック本体。`renderer` はこの
                 // クロージャへムーブ済みで、以後は音声スレッドの単一の書き手が
                 // `&mut` で触るだけ(ロックも `Arc` 共有も無い。§5.3)。呼ぶのは
-                // `Renderer::render` のみに保つ(`crates/mw-backend/CLAUDE.md` の設計意図。
+                // `Renderer::render` のみに保つ(`crates/mw-backend/COMMON.md` の設計意図。
                 // 上の数行は cpal が既に計算済みの構造体を読んでアトミックストアするだけで、
                 // mw-core の別関数を追加で呼んではいない)。
                 // `Renderer::render` はリアルタイム安全性規約(§5.3)を満たす実装である前提。

@@ -1,6 +1,6 @@
 # コントリビュートガイド
 
-open-audioware への貢献を歓迎します。変更を始める前に、[README.md](./README.md) と、変更対象クレートの `CLAUDE.md` を確認してください。特に、音声コールバック経路のリアルタイム安全性と、Rust/C# 間の ABI は機能変更と同じくらい重要です。
+open-audioware への貢献を歓迎します。変更を始める前に、[README.md](./README.md) と、変更対象クレートの `COMMON.md` を確認してください。特に、音声コールバック経路のリアルタイム安全性と、Rust/C# 間の ABI は機能変更と同じくらい重要です。
 
 ## 開発環境の準備
 
@@ -51,7 +51,7 @@ Codecov の設定は [`codecov.yml`](./codecov.yml) が正です。PR の変更�
 - ファイル・ネットワーク I/O、一般的なシステムコール、`println!` 系を行わない
 - `unwrap`、`expect`、添字アクセスなどのパニック経路を作らない
 
-コマンド、イベント、PCM の受け渡しは固定容量のキューやロックフリーの仕組みを使い、重い処理は音声スレッドの外へ置きます。詳細な不変条件と検証方法は、[`docs/spec/architecture.md の §5.2〜§5.4`](./docs/spec/architecture.md)、[`crates/mw-core/CLAUDE.md`](./crates/mw-core/CLAUDE.md)、および [`crates/mw-core/tests/realtime_safety.rs`](./crates/mw-core/tests/realtime_safety.rs)を参照してください。
+コマンド、イベント、PCM の受け渡しは固定容量のキューやロックフリーの仕組みを使い、重い処理は音声スレッドの外へ置きます。詳細な不変条件と検証方法は、[`docs/spec/architecture.md の §5.2〜§5.4`](./docs/spec/architecture.md)、[`crates/mw-core/COMMON.md`](./crates/mw-core/COMMON.md)、および [`crates/mw-core/tests/realtime_safety.rs`](./crates/mw-core/tests/realtime_safety.rs)を参照してください。
 
 ## FFI と ABI
 
@@ -63,7 +63,7 @@ Rust/C# 境界を変更する場合は、次の原則を守ってください。
 - `mw_` プレフィックス、blittable なデータ、呼び出し側バッファの規約を維持する
 - `NativeMethods.g.cs` は生成物なので手編集・コミットしない。シグネチャや公開関数の doc コメントを変更したら `make bindgen` を実行する
 
-ABI の確認は二つの層で行います。`make csharp-check` / [`tools/csharp-abi-check/README.md`](./tools/csharp-abi-check/README.md) が C# のフィールド名・型・シグネチャと iOS 分岐を確認し、[`crates/mw-ffi/src/csharp_abi_sync.rs`](./crates/mw-ffi/src/csharp_abi_sync.rs) のテストが列挙値、オフセット、サイズ、アライメント、ABI バージョンを固定します。ABI を変更する PR では、互換性への影響と更新内容を本文に明記してください。FFI の詳細は [`crates/mw-ffi/CLAUDE.md`](./crates/mw-ffi/CLAUDE.md)を参照してください。
+ABI の確認は二つの層で行います。`make csharp-check` / [`tools/csharp-abi-check/README.md`](./tools/csharp-abi-check/README.md) が C# のフィールド名・型・シグネチャと iOS 分岐を確認し、[`crates/mw-ffi/src/csharp_abi_sync.rs`](./crates/mw-ffi/src/csharp_abi_sync.rs) のテストが列挙値、オフセット、サイズ、アライメント、ABI バージョンを固定します。ABI を変更する PR では、互換性への影響と更新内容を本文に明記してください。FFI の詳細は [`crates/mw-ffi/COMMON.md`](./crates/mw-ffi/COMMON.md)を参照してください。
 
 ## コミットメッセージ
 

@@ -30,7 +30,7 @@
 //!
 //! 1. **cpal の `Stream`/`Backend` を丸ごと作り直す(閉じて再オープン)。**
 //!    `mw-backend::Backend::open` は `mw_core::Renderer` を値渡し(ムーブ)で受け取り、
-//!    音声コールバックのクロージャへ排他的に所有させる設計(`crates/mw-backend/CLAUDE.md`
+//!    音声コールバックのクロージャへ排他的に所有させる設計(`crates/mw-backend/COMMON.md`
 //!    「M0 からの変更点」)。一度ムーブした `Renderer` を後から取り戻す経路が無いため、
 //!    ストリームを閉じて作り直すと Renderer ごと(=全ボイス・バス音量・楽曲の再生位置)
 //!    失われる。これを避けるには `mw-ffi::handle::Instance` 側にも大きな再設計が要る
@@ -40,7 +40,7 @@
 //!    経路)。cpal 0.18 は既に `objc2` 系クレート(`objc2-avf-audio`/`objc2-foundation`/
 //!    `block2`)を iOS 実装の依存に持ち込んでいる(`ios_session.rs` が既に同じ理由で
 //!    直接利用している)。Obj-C ファイルを追加すると依存ツリーが増えないという利点を
-//!    捨てることになり、`crates/mw-backend/CLAUDE.md`「§1 M1【確定】コア・プラットフォーム
+//!    捨てることになり、`crates/mw-backend/COMMON.md`「§1 M1【確定】コア・プラットフォーム
 //!    層とも Rust で書き、OS 依存部のみ薄いシムを許容」の精神にも反する。
 //! 3. **(採用)同じ `cpal::Stream` を維持したまま、`objc2-foundation` の
 //!    `NSNotificationCenter` へ Rust から直接 observer を登録し、復帰時に
@@ -117,7 +117,7 @@
 //! Objective-C ランタイムから直接呼ばれるブロックの内部で panic が Rust スタックを
 //! 越えて Obj-C フレームを巻き戻すのは未定義動作になりうる。`std::panic::catch_unwind`
 //! で内容を必ず包む(`mw-ffi` が FFI 境界の外へ panic を漏らさないのと同じ考え方、
-//! `crates/mw-ffi/CLAUDE.md` 参照)。ここは音声スレッドではない(§5.3 の対象外)ので
+//! `crates/mw-ffi/COMMON.md` 参照)。ここは音声スレッドではない(§5.3 の対象外)ので
 //! `catch_unwind` のコスト自体は問題にならない。
 //!
 //! ## 自動テストで守れる範囲・守れない範囲
@@ -382,6 +382,23 @@ impl InterruptionState {
     /// ウォッチドッグはまさにこの穴を塞ぐために入れた(モジュール doc の不変条件4)。
     pub fn allows_stall_watchdog(self) -> bool {
         matches!(self, Self::Running | Self::Recovered | Self::RecoveryFailed)
+    }
+
+    /// 出力停止のウォッチドッグが、通知を介さず「進んでいない」ことを実測だけで検知して、
+    /// 復帰を試みることを決めた。
+    ///
+    /// `on_interruption_began`(止まった)と `on_interruption_ended(true)`(復帰すべき)の
+    /// 2段を1段にまとめたもの——ウォッチドッグが呼ぶ時点で復帰を試みることは既に
+    /// 決まっているため、素通りする `Interrupted` を経由しない。
+    ///
+    /// 呼び出し元は [`Self::allows_stall_watchdog`] が `true` の状態(`Running`/
+    /// `Recovered`/`RecoveryFailed`)でしか呼ばないため、この遷移に到達する時点で
+    /// 「このエピソードに対する `AudioInterruptionBegan` をまだ一度も出していない」が
+    /// 保証される——通知経由の Began が先に来ていれば状態は `Interrupted` になっており、
+    /// `allows_stall_watchdog` が `false` を返してウォッチドッグ自身がそこで観測を
+    /// リセットする(呼び出し元には到達しない)。
+    pub fn on_output_stalled(self) -> Self {
+        Self::RecoveryPending
     }
 }
 
@@ -1244,11 +1261,21 @@ mod imp {
                          state={current:?}); attempting recovery"
                     );
 
+                    // 通知を介さず検知したエピソードなので、復帰を試みる前に
+                    // `AudioInterruptionBegan` をここで出す——アプリが非アクティブに
+                    // ならない停止(通知経路の Began が一度も来ない停止)でも、ホスト側が
+                    // 自動ポーズに乗れるようにする。二重に出ないことは
+                    // `InterruptionState::on_output_stalled` のドキュメントが保証する
+                    // 前提(ここへ来る時点で `current` は `allows_stall_watchdog()` を
+                    // 満たす3状態に限られ、そのいずれも今回のエピソードに対する Began を
+                    // まだ出していない)に依拠する。
+                    events.push_side_channel(Event::AudioInterruptionBegan);
+
                     // 通知ハンドラと二重に走らないよう、先に「これから復帰する」状態にする
                     // (他の経路が `needs_recovery_attempt()` で自分の番だと誤認しないため)。
                     {
                         let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
-                        *guard = InterruptionState::RecoveryPending;
+                        *guard = guard.on_output_stalled();
                     }
 
                     attempt_recovery(

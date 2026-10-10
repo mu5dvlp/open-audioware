@@ -10,7 +10,7 @@
 //! `setDataCallback` / `setErrorCallback` → `AAudioStreamBuilder_openStream` →
 //! `AAudioStream_requestStart`。`cpal` の Android 実装(`cpal/realtime` feature)が
 //! 低遅延を得るためだけに performance mode を設定していた経緯
-//! (`crates/mw-backend/CLAUDE.md` の「Android ビルド時の依存について」参照)が、
+//! (`crates/mw-backend/COMMON.md` の「Android ビルド時の依存について」参照)が、
 //! ここでは1行の `extern "C"` 呼び出しに置き換わる——`audio_thread_priority`
 //! (MPL)も `jni`/`ndk-context`(`crate::android_context`)も、この実装のコード自体は
 //! 使わない(`backend-cpal` feature を選ぶ限り cpal 版は引き続き両方使う。
@@ -134,7 +134,7 @@ pub const REQUESTED_SAMPLE_RATE_HZ: u32 = 48_000;
 /// 参照)。`sample_rate == 0`(未確定)は除算を避けて `anchor_time_ns` をそのまま
 /// 返す——呼び出し元([`render_proc`])はオープン時に確定した非0のサンプルレートしか
 /// 渡さない想定だが、音声スレッドを絶対にパニックさせないための防御
-/// (`crates/mw-core/CLAUDE.md` のリアルタイム安全性規約、§4.8 の思想)。計算結果が
+/// (`crates/mw-core/COMMON.md` のリアルタイム安全性規約、§4.8 の思想)。計算結果が
 /// 負、または `u64` の範囲を超える場合は両端にクランプする(cpal 側の `.max(0)` に
 /// 加え、上限クランプも足してオーバーフローを防ぐ——`host_time::
 /// ticks_to_ns_with_timebase` と同じ saturating の方針)。
@@ -596,7 +596,7 @@ unsafe extern "C" fn render_proc(
         );
 
         // 音声スレッド上で呼ぶ mw-core 側の経路は `Renderer::render` のみに保つ
-        // (`mw-backend/CLAUDE.md` の設計意図)。
+        // (`mw-backend/COMMON.md` の設計意図)。
         context.renderer.render(output, buffer_start_host_time_ns);
 
         context.render_completions.fetch_add(1, Ordering::Release);

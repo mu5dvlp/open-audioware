@@ -87,7 +87,7 @@ jobs:
       # `cargo llvm-cov` は「テストを走らせたうえで計測する」ので、これ1本で
       # 従来の `cargo test --workspace` と同じ検証になる。
       # ⚠️ **`cargo test` を別ステップとして残さないこと** —— 同じテストが2回走り、
-      # CLAUDE.md の「CI はコーヒー基準(3〜5分)」を確実に割る。
+      # ワークスペース COMMON.md の「CI はコーヒー基準(3〜5分)」を確実に割る。
       # ⚠️ **`--all-features` は付けない** —— 従来の `cargo test --workspace` と
       # 検証範囲を変えないため(ゲートの意味を静かに広げない)。
       # 📌 計装ビルドは `Swatinem/rust-cache` のキャッシュに乗らない(プロファイルが

@@ -103,7 +103,7 @@ fn install_panic_hook() {
 // 繰り返していた(`REFACTOR-PLAN.md` P1-6)。この2つへ集約する。
 
 /// FFI 関数の本体を `catch_unwind` で包み、Rust panic を FFI 境界の外(C#/IL2CPP)へ
-/// 絶対に漏らさない(不変条件、`crates/mw-ffi/CLAUDE.md`)。捕捉した場合は
+/// 絶対に漏らさない(不変条件、`crates/mw-ffi/COMMON.md`)。捕捉した場合は
 /// `on_panic` を返す——`MwResult` を返す関数がほとんどだが、`mw_init`(`None` vs
 /// panic を区別する必要がある)や `mw_poll_events`(戻り値が `i32`)のように
 /// `on_panic` の値自体が関数ごとに違うため、固定値にせず引数として受け取る。
@@ -837,7 +837,7 @@ fn set_music_track(handle: u64, sound_id: u64, target: MusicTarget) -> MwResult 
 ///
 /// `out_state` には [`crate::types::MwMusicState`] の判別子(`Loading=0` /
 /// `Ready=1` / `Playing=2` / `Paused=3`)を書き込む。素の `i32` として渡す理由は
-/// `crates/mw-ffi/CLAUDE.md`「enum を FFI 引数に直接使わない理由」を参照
+/// `crates/mw-ffi/COMMON.md`「enum を FFI 引数に直接使わない理由」を参照
 /// (`MwMusicState` 自体は csbindgen が C# enum を生成するので、呼び出し側は
 /// 受け取った `int` をそのままキャストして使える)。
 ///
@@ -1062,7 +1062,7 @@ pub extern "C" fn mw_bgm_set(handle: u64, sound_id: u64) -> MwResult {
 /// BGM ボイスの再生状態を取得する(`mw_music_state` の BGM 版)。
 ///
 /// `out_state` には [`crate::types::MwMusicState`] の判別子を書き込む(`mw_music_state`
-/// と同じ理由で素の `i32`。`crates/mw-ffi/CLAUDE.md`「enum を FFI 引数に直接使わない
+/// と同じ理由で素の `i32`。`crates/mw-ffi/COMMON.md`「enum を FFI 引数に直接使わない
 /// 理由」参照)。**クロックの一部ではない**——BGM は曲位置・世代カウンタを持たない
 /// (M14)ため、`mw_music_get_position` に相当する BGM 版の関数は無い。
 ///

@@ -7,7 +7,7 @@
 //! `extern "C"` 関数は `src/ffi.rs` にあり、`build.rs` がそこから
 //! `unity/Runtime/Generated/NativeMethods.g.cs` を自動生成する。
 //!
-//! 設計・不変条件の詳細は `crates/mw-ffi/CLAUDE.md` を参照。
+//! 設計・不変条件の詳細は `crates/mw-ffi/COMMON.md` を参照。
 
 #![deny(unsafe_op_in_unsafe_fn)]
 

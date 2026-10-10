@@ -56,7 +56,7 @@
 //! # なぜ `unity-sample` の EditMode テストではなくこの形にしたか
 //!
 //! `unity-sample` の EditMode テストは Unity の起動が要るため CI では回らない方針
-//! (`CLAUDE.md`)。このモジュールは `cargo test --workspace` だけで完結し、
+//! (`COMMON.md`)。このモジュールは `cargo test --workspace` だけで完結し、
 //! Unity にもネットワークにも依存しない(`include_str!` はコンパイル時にソースへ
 //! 埋め込まれるため、実行時のファイル探索も不要)。
 

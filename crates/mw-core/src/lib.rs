@@ -6,7 +6,7 @@
 //! テストの主戦場になる(§8)。
 //!
 //! リアルタイム安全性規約(§5.3)はこのクレート全体の不変条件。
-//! 詳細は `crates/mw-core/CLAUDE.md` を参照。
+//! 詳細は `crates/mw-core/COMMON.md` を参照。
 
 #![deny(unsafe_op_in_unsafe_fn)]
 

@@ -1,3 +1,24 @@
-# AGENTS
+# AGENTS —— Codex 固有の指示
 
-[CLAUDE.md](./CLAUDE.md)を参照すること。
+🔴🔴 **まず [`COMMON.md`](COMMON.md) を読むこと。**
+運用ルール(唯一の正・ドキュメント索引・Git 運用・リアルタイム安全性・Unity 起動の直列化・
+【仮】【未定】の扱い・エージェント運用)は**すべてあちらが正**で、このファイルには
+**Codex でしか意味を持たない話だけ**を置く
+(同じことを2箇所に書かない —— 片方だけ古くなるため)。
+
+---
+
+## ⚠️ Claude Code から呼ばれて動いているとき
+
+**このリポジトリでも、Claude Code が `codex exec --profile claude-subagent` で
+Codex を実装サブエージェントとして起動することがある**(ユーザー指示 2026-09-23)。
+そのときは次が前提になっている:
+
+- **承認を求めずに進む**(`approval_policy = "never"`)。止まって待たないこと
+- **書き込みはワークスペース内だけ**(`sandbox_mode = "workspace-write"`)
+- 🔴 **Unity を起動するコマンド(`make unity-sample-create` / `make unity-test`)は絶対に実行しない** ——
+  Unity ロックはマシン全体で1本で、呼び出し元の Claude Code が持っている
+- 🔴 **コミットしない。** 作業ツリーを汚したまま返し、コミットは呼び出し元に任せる
+- **終わったら「変更したファイルと理由 / 実測したテスト結果の数字 / 確かめられなかったこと」を報告する**
+
+📌 呼び出し側の手順は1つ上の階層の [`docs/handoff/subagents.md`](../docs/handoff/subagents.md) が正。

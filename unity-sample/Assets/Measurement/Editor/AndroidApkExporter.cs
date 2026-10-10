@@ -31,7 +31,7 @@ namespace Measurement.EditorTools
         /// UPM パッケージ側のネイティブプラグイン(<c>libmw_ffi.so</c>)のインポータ設定を
         /// Android / ARM64 に揃える。
         /// <para>
-        /// <c>.so</c> はビルド成果物なのでコミットしない(CLAUDE.md)。そのため
+        /// <c>.so</c> はビルド成果物なのでコミットしない(COMMON.md)。そのため
         /// <c>.meta</c> にインポータ設定が入っておらず、そのままでは Unity が
         /// 「どのプラットフォーム向けのプラグインか」を判断できず apk に同梱されない
         /// <c>lib/arm64-v8a/</c> に libmw_ffi.so が入らないと B が動かない apk になるため、

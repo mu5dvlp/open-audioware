@@ -15,7 +15,7 @@ namespace Measurement.EditorTools
     /// 再現可能にするため、GameObject 階層はすべてこのスクリプトで生成する。
     /// <para>
     /// バッチモードから <c>-executeMethod Measurement.EditorTools.MeasurementSceneBuilder.Build</c>
-    /// で実行する想定(いかなる Unity 起動も CLAUDE.md のロック手順に従うこと)。
+    /// で実行する想定(いかなる Unity 起動も COMMON.md のロック手順に従うこと)。
     /// エディタ上からは Measurement/Build M1 Scene メニューからも実行できる。
     /// </para>
     /// </summary>

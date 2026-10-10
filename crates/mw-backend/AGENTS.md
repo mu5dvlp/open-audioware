@@ -1,5 +1,5 @@
-# CLAUDE —— Claude Code 固有の指示(mw-backend)
+# AGENTS —— Codex 固有の指示(mw-backend)
 
 🔴🔴 **まず [`COMMON.md`](COMMON.md) を読むこと。**
 出力デバイス抽象と cpal/自前バックエンド実装の設計・不変条件は**あちらが正**で、
-このファイルには **Claude Code でしか意味を持たない話だけ**を置く(いまは無い)。
+このファイルには **Codex でしか意味を持たない話だけ**を置く(いまは無い)。

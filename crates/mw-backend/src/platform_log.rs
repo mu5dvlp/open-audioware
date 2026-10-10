@@ -8,7 +8,7 @@
 //!
 //! **ゲームスレッドから呼ぶこと。** `format!` のヒープアロケーションと
 //! stderr / logcat のロックを伴うため、音声コールバック経路では使えない
-//! (`crates/mw-core/CLAUDE.md` のリアルタイム安全性規約)。これは
+//! (`crates/mw-core/COMMON.md` のリアルタイム安全性規約)。これは
 //! 置き換え前の `eprintln!` と同じ制約で、新たな制約は増えていない。
 
 /// 1行の診断ログを出す。Android は logcat(タグ `mw`)、それ以外は stderr。

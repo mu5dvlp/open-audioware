@@ -7,7 +7,7 @@
 //!
 //! `MwSoundMode`/`MwBus` はこれまで「extern 関数の引数型としては使わず(`i32` を
 //! 受け取って `from_raw` で検証する)、値としても C# 側へ渡らない内部専用の型」
-//! だったため、csbindgen の入力から意図的に外してあった(`crates/mw-ffi/CLAUDE.md`
+//! だったため、csbindgen の入力から意図的に外してあった(`crates/mw-ffi/COMMON.md`
 //! 参照)。M2-7 でここに [`MwMusicState`]/[`MwMusicPosition`] を追加したことで
 //! 事情が変わった: [`MwMusicPosition`] は `mw_music_get_position` の out 引数の
 //! 実際の型として extern 関数シグネチャに現れる(`event.rs::MwEvent` と同じ理由で
@@ -137,7 +137,7 @@ impl MwMusicState {
 /// (フィールドごとに `[MarshalAs(UnmanagedType.U1)]` を明示すれば一致させられるが、
 /// csbindgen の自動生成コードにその指定をさせる仕組みは無く、手で後から
 /// 付け足すのは「手書きの宣言ズレを構造的に排除する」という csbindgen 採用の目的
-/// (`crates/mw-ffi/CLAUDE.md`)に反する)。そこで `event.rs::MwEvent` の
+/// (`crates/mw-ffi/COMMON.md`)に反する)。そこで `event.rs::MwEvent` の
 /// `payload: u64` と同じ考え方で、素の `u8`(0 または 1)として持たせ、C# 側の
 /// bool への解釈は呼び出し側(手書きの薄いラッパ `Mw.Native`)の責務にする——
 /// これで構造体全体が疑いなく blittable になる。

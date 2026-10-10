@@ -80,7 +80,7 @@ pub fn is_music_id(id: u64) -> bool {
 /// `mw_music_seek`/`mw_music_play_scheduled`/`mw_music_get_position`/`mw_bgm_play`
 /// は BGM 側(または楽曲側)に対応する API 自体が無い(`mw_core::Command` に
 /// `BgmPause`/`BgmResumeAt`/公開版の `BgmSeek`/`BgmPlayScheduled` が無い。理由は
-/// `crates/mw-ffi/CLAUDE.md`「BGM との分担 —— 共有するもの・分けるもの」参照)ため、
+/// `crates/mw-ffi/COMMON.md`「BGM との分担 —— 共有するもの・分けるもの」参照)ため、
 /// 共有化すると存在しない対称性を捏造することになる。個別のまま残す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MusicTarget {
@@ -158,7 +158,7 @@ pub struct Instance {
     /// 楽曲(圧縮バイト列)のストレージ。`mw_core::SoundStorage` には持たせない
     /// ——mw-core は「オフラインレンダリングだけで完結する層」という位置づけで、
     /// 未デコードの圧縮バイト列(ファイル形式のパースすら済んでいないもの)は
-    /// そこに属さない(`crates/mw-core/CLAUDE.md` 参照)。
+    /// そこに属さない(`crates/mw-core/COMMON.md` 参照)。
     music_bytes: Mutex<HashMap<u64, Arc<Vec<u8>>>>,
     next_music_serial: AtomicU64,
     /// デコードスレッドへ新しいデコーダを渡すハンドル(`mw_music_set` から使う。
@@ -435,7 +435,7 @@ impl Instance {
     /// **格納場所の非対称性は温存する**: 楽曲は音楽クロック
     /// (`music_clock_snapshot().state`、seqlock)、BGM は専用の
     /// `BgmStatePublisher::read`——BGM はクロック(位置・世代)を持たない
-    /// (`crates/mw-ffi/CLAUDE.md`「共有するもの・分けるもの」参照)ため、ここを
+    /// (`crates/mw-ffi/COMMON.md`「共有するもの・分けるもの」参照)ため、ここを
     /// `bgm_state()` 相当の一本化されたストレージに統合することはできない
     /// (統合すると BGM が誤って音楽クロックの世代・位置を持つかのようになってしまう)。
     pub(crate) fn track_state(&self, target: MusicTarget) -> MusicState {

@@ -318,7 +318,7 @@ struct WriterContext {
 
 /// 書き込みスレッドの本体。
 ///
-/// 音声スレッドの規約(`mw-core/CLAUDE.md`): ループの中でロック・ヒープ確保をしない
+/// 音声スレッドの規約(`mw-core/COMMON.md`): ループの中でロック・ヒープ確保をしない
 /// (バッファは入る前に確保済み。`mw_log!` も呼ばない)。例外は終了時の致命的エラー通知
 /// だけ(`push_side_channel` は `Mutex` を使うが、そのあとスレッドは終わる)。
 #[cfg(target_os = "linux")]

@@ -61,7 +61,7 @@ namespace Measurement
         private void OnDestroy()
         {
             // mw_sound_release / mw_shutdown は冪等ではないため、成功した初期化状態のときだけ呼ぶ
-            // (crates/mw-ffi/CLAUDE.md, unity/Runtime/MwNative.cs)。
+            // (crates/mw-ffi/COMMON.md, unity/Runtime/MwNative.cs)。
             if (_nativeReady)
             {
                 MwNative.ReleaseSound(_handle, _soundId);
