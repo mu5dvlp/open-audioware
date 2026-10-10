@@ -77,6 +77,8 @@ AUDIOWARE-DEPS-PLAN.md ステップ4-3)へ差し替える前に、**cpal 版と�
 ## 2. 4-4(cpal の削除)の前に足すべきもの
 
 cpal 版が**黙ってやっていた**のに自前に無かったもの。1〜5 は `44e29cf` / `f046dc1` で入れた。
+**1〜5 はすべて「実装済み・実機未確認」**(C1〜C13 は未実施。2026-10-10 に `cargo check` / `clippy`
+を `aarch64-linux-android` + `backend-native` で通し、ホストの単体テストが緑なことまでを確認)。
 
 1. ✅ **サンプルレートの扱いを cpal 版に揃える(A3 / A22)。**
    `AAudioStreamBuilder_setSampleRate(48000)` で 48kHz を要求する。端末のレートが違えば AAudio の変換に任せる
