@@ -217,6 +217,15 @@ pub trait RecoverableOutput: Send + Sync {
     fn rebuild(&self) -> Result<(), String> {
         Err("rebuild is not supported by this output".to_owned())
     }
+
+    /// `native_backend::apple` モジュール doc「オーバーサイズのコールバックからの直し」の
+    /// 安全な時点の一つ(このファイルの [`attempt_recovery`] が復帰確認後に呼ぶ)。
+    /// 継続的なバッファ長異常を検知していれば、この呼び出しの中で作り直してよい。
+    ///
+    /// 既定は no-op(この概念を持たないバックエンド——cpal 版。`attempt_recovery` は
+    /// バックエンドの種類を問わずこのメソッドを呼ぶため、トレイトオブジェクト越しに
+    /// 安全に呼べるよう既定実装を設けている)。
+    fn rebuild_if_oversized_callbacks(&self) {}
 }
 
 /// 割り込みからの復帰を表す状態機械(OS API 呼び出しを一切含まない、純粋な値型)。
@@ -1447,8 +1456,17 @@ mod imp {
                 };
 
                 let mut guard = worker_state.lock().unwrap_or_else(|p| p.into_inner());
+                let was_backgrounded = *guard == InterruptionState::Backgrounded;
                 *guard = guard.on_recovery_attempted(success);
                 drop(guard);
+                // `native_backend::apple` モジュール doc「オーバーサイズのコールバックからの
+                // 直し」の安全な時点の一つ: 復帰がコールバックの前進で確認できた直後。
+                // ガード取得時点でアプリが背面(`Backgrounded`)にいた場合は触らない——
+                // 背面では前面復帰時にもう一度復帰処理が走るため、ここで作り直しても
+                // 次の前面復帰で状態が上書きされるだけで、背面のまま作り直す利点が無い。
+                if success && !was_backgrounded {
+                    worker_stream.rebuild_if_oversized_callbacks();
+                }
                 worker_events
                     .push_side_channel(Event::AudioInterruptionEnded { recovered: success });
             });

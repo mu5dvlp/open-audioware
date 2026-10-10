@@ -133,10 +133,58 @@
 //! `outputLatency` 由来の手動オフセットが別途存在しないか)は確認済み
 //! (`AudioOffsetSeconds` はプレイヤー入力遅延の校正専用で、出力レイテンシ由来の値は
 //! 一切含まない)。
+//!
+//! # 診断用プローブ(io probe)
+//!
+//! Control Center を開く等で `ios_interruption::OutputStallDetector` のウォッチドッグが
+//! 止め直し→動かし直しを行ったあと、レンダーコールバックが
+//! `in_number_frames`(希望値、通常 240 フレーム=5ms)より大きい値(観測上 2048 前後)の
+//! まま戻らない状態に入ることがある(「バッファ長の項の出し方」節の既知の症状)。
+//! この状態では `AudioTimeStamp.mHostTime` が実際に聞こえる時刻より遅れる側にずれる
+//! らしく、校正済みの音楽クロックが実機でずれる(判定が FAST 側へ偏る)——との仮説を
+//! 実機ログで裏取りするための最小限の診断値を、音声スレッドはアトミックへ書くだけ、
+//! ゲームスレッドが日和見的に読んで1行出す構成で持つ:
+//!
+//! - `in_number_frames`([`AppleBackend::callback_frames`]。既存)。
+//! - **lead**: このコールバックの相関点(`AudioTimeStamp.mHostTime` を ns 化した値)から、
+//!   コールバックへ入った直後に読んだ [`crate::host_time::host_time_ns`] を引いた差
+//!   (ns、符号付き)。`mHostTime` が「今」からどれだけ離れているかを示す
+//!   ([`CallbackContext::io_probe_lead_ns`])。
+//! - **mSampleTime の連続性**: 今回の `AudioTimeStamp.sample_time` から「前回の
+//!   `sample_time` + 前回のフレーム数」を引いた差(フレーム数、符号付き)。0 なら
+//!   コールバックが途切れなく続いている([`CallbackContext::io_probe_sample_time_gap_frames`])。
+//! - `AudioTimeStamp.flags`(生のビットマスク、[`CallbackContext::io_probe_flags`])。
+//!
+//! ログの口は新設せず、既存の[`Backend::log_new_output_underruns`]
+//! (ゲームスレッドから日和見的に呼ばれる既存の口。`client` 側は
+//! `mw_get_output_underrun_stats` を1秒に1回呼ぶことでこれを駆動する)に相乗りする。
+//! 1行だけ出す条件は「`restart_epoch` が変わった直後」「`in_number_frames` が
+//! 変わったとき」「前回のログから5秒以上経過したとき」のいずれか
+//! ([`should_log_io_probe`]、純関数)。文言の頭は
+//! `[mw-backend] (native/apple) io probe:` に固定してある(実機ログを `grep` する前提)。
+//!
+//! # オーバーサイズのコールバックからの直し(iOS/tvOS)
+//!
+//! 上の診断で捉えようとしている状態そのものへの対処。`in_number_frames` が
+//! `AVAudioSession.IOBufferDuration()` から換算した期待フレーム数の2倍を超える状態が
+//! 連続して続いていれば([`is_oversized_callback`]/[`should_rebuild_for_oversized_callbacks`]、
+//! いずれも純関数)、**安全な時点でだけ** [`UnitControl::rebuild`] で出力を作り直して
+//! 普段の状態へ戻す([`UnitControl::rebuild_if_oversized_callbacks`])。安全な時点は2箇所に
+//! 絞ってある(曲の再生中〔世代をまたがない途中〕には作り直さない——音楽クロックが跳ぶため):
+//!
+//! 1. 曲の再生予約の直前([`Backend::refresh_output_latency`] が呼ばれる口。
+//!    すでにゲームスレッド)。
+//! 2. `OutputStalled` 等の復帰(止め直し・動かし直し、または最後の手段としての作り直し)が
+//!    コールバックの前進で確認できた直後(`ios_interruption::attempt_recovery` の復帰確認
+//!    ワーカースレッド)で、確認した時点でアプリが背面(`Backgrounded`)にいなかったとき。
+//!
+//! macOS は `io_buffer_duration_ns` が常に0のため期待フレーム数も常に0になり、
+//! この仕組みは target_os の分岐無しで実質的に no-op になる(`is_oversized_callback` の
+//! ドキュメント参照)。
 
 use std::ffi::c_void;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use mw_core::{CHANNELS, EventQueue, MusicClockPublisher, Renderer};
@@ -490,6 +538,57 @@ pub fn seconds_to_ns(seconds: f64) -> u64 {
     (seconds * 1_000_000_000.0) as u64
 }
 
+/// ns の時間幅を、サンプルレートで割ってフレーム数へ変換する。モジュール doc「オーバーサイズの
+/// コールバックからの直し」の期待フレーム数(`io_buffer_duration_ns` から求める)を導くために
+/// 使う。`sample_rate == 0`(未確定)なら 0(致命傷にしない。§4.8 の思想)。`u32::MAX` を
+/// 超える結果は `u32::MAX` に飽和させる(診断用の値であり、ここで異常終了させる必要は無い)。
+/// 純関数——ハードウェア不要で単体テストできる。
+fn ns_to_frames(duration_ns: u64, sample_rate: u32) -> u32 {
+    if sample_rate == 0 {
+        return 0;
+    }
+    let frames = duration_ns.saturating_mul(sample_rate as u64) / 1_000_000_000;
+    frames.min(u32::MAX as u64) as u32
+}
+
+/// このコールバックの `in_number_frames` が、バッファ長から期待されるフレーム数
+/// (`expected_frames`、[`ns_to_frames`] が `io_buffer_duration_ns` から求める)の2倍を
+/// 超えているか。`expected_frames == 0`(macOS。モジュール doc「オーバーサイズの
+/// コールバックからの直し」参照、または iOS/tvOS でまだ一度も `IOBufferDuration` を
+/// 読んでいない)では判定しない(意味のある基準が無いため)。純関数——ハードウェア不要で
+/// 単体テストできる。
+fn is_oversized_callback(in_number_frames: u32, expected_frames: u32) -> bool {
+    expected_frames > 0 && in_number_frames > expected_frames.saturating_mul(2)
+}
+
+/// [`is_oversized_callback`] が連続して何回 `true` を返したか
+/// (`CallbackContext::consecutive_oversized_callbacks`)が、出力を作り直すべき閾値に
+/// 達したか。
+///
+/// 【仮】閾値: iOS/tvOS の既定 `IOBufferDuration`(5ms)に対し通常のコールバック間隔
+/// (`crate::underrun::OutputUnderrunTracker` と同様、実測ジッタは1ms未満)を踏まえ、
+/// 一時的な単発の揺れでは誤発火しない程度に大きく、かつ実機症状(押しっぱなしだと
+/// 判定が FAST に倒れ続ける)を長時間放置しない程度に小さい値として選んだ——根拠は
+/// 実機ログで裏取りが取れたら見直す前提の値。純関数——ハードウェア不要で単体テストできる。
+const OVERSIZED_CALLBACK_REBUILD_THRESHOLD: u32 = 20;
+
+fn should_rebuild_for_oversized_callbacks(consecutive_oversized_callbacks: u32) -> bool {
+    consecutive_oversized_callbacks >= OVERSIZED_CALLBACK_REBUILD_THRESHOLD
+}
+
+/// モジュール doc「診断用プローブ(io probe)」のログを今回出すべきか。
+/// 「`restart_epoch` が変わった直後」「`in_number_frames` が変わったとき」「前回の
+/// ログから [`IO_PROBE_LOG_INTERVAL_NS`] 以上経過したとき」のいずれかに該当すれば
+/// `true`(複数該当しても1行だけ出す——呼び出し側がこの戻り値で1回だけ判断するため)。
+/// 純関数——ハードウェア不要で単体テストできる。
+fn should_log_io_probe(restart_epoch_changed: bool, frames_changed: bool, elapsed_ns: u64) -> bool {
+    restart_epoch_changed || frames_changed || elapsed_ns >= IO_PROBE_LOG_INTERVAL_NS
+}
+
+/// [`should_log_io_probe`] の時間トリガ。頻度を抑えつつ、通常ライブ1曲(数分)の間に
+/// 複数回は必ず出る程度の間隔として5秒を選んだ(【仮】)。
+const IO_PROBE_LOG_INTERVAL_NS: u64 = 5_000_000_000;
+
 // ============================================================================
 // オープン済みユニットへの問い合わせ(実デバイス/実セッション必須。単体テスト対象外)
 // ============================================================================
@@ -751,6 +850,31 @@ struct CallbackContext {
     /// ぶんホスト時刻の相関点が飛んでいるので世代を進める——補正項の変化と同じく、
     /// 同じ世代のまま跨いで外挿すると `MusicClockSnapshot` の契約に反する。
     last_restart_epoch: u64,
+    /// モジュール doc「診断用プローブ(io probe)」の **lead**。[`AppleBackend::
+    /// io_probe_lead_ns`] と同じ `Arc`。音声スレッドは毎コールバック上書きするだけ
+    /// (ロック・アロケーション無し)。
+    io_probe_lead_ns: Arc<AtomicI64>,
+    /// 診断用プローブの **mSampleTime の連続性**(フレーム数、符号付き、四捨五入)。
+    /// [`AppleBackend::io_probe_sample_time_gap_frames`] と同じ `Arc`。
+    io_probe_sample_time_gap_frames: Arc<AtomicI64>,
+    /// 診断用プローブの **flags**(`AudioTimeStamp.flags` の生のビットマスク)。
+    /// [`AppleBackend::io_probe_flags`] と同じ `Arc`。
+    io_probe_flags: Arc<AtomicU32>,
+    /// `io_probe_sample_time_gap_frames` を求めるための、直前コールバックの
+    /// `AudioTimeStamp.sample_time`。**音声スレッド専用**(`last_device_extra_latency_ns`
+    /// と同じ理由——単一の書き手である `render_proc` 自身が毎コールバック読み書きするだけ)。
+    last_probe_sample_time: f64,
+    /// `io_probe_sample_time_gap_frames` を求めるための、直前コールバックのフレーム数。
+    /// **音声スレッド専用**(`last_probe_sample_time` と同じ扱い)。
+    last_probe_frames: u32,
+    /// モジュール doc「オーバーサイズのコールバックからの直し」: バッファ長から期待される
+    /// フレーム数の2倍を超えるコールバック([`is_oversized_callback`])が連続している回数。
+    /// [`AppleBackend::consecutive_oversized_callbacks`]/[`UnitControl::
+    /// consecutive_oversized_callbacks`] と同じ `Arc`——[`UnitControl::
+    /// rebuild_if_oversized_callbacks`](ゲームスレッド・復帰確認ワーカーから安全な時点でだけ
+    /// 呼ばれる)がこれを読んで作り直すかどうかを判定する。音声スレッドは毎コールバック
+    /// `fetch_add`/`store` で更新するだけ(§5.3 に抵触しない)。
+    consecutive_oversized_callbacks: Arc<AtomicU32>,
     underrun_tracker: OutputUnderrunTracker,
     /// [`AppleBackend::callback_frames`] へ渡す `Arc`。
     callback_frames: Arc<AtomicU32>,
@@ -820,10 +944,36 @@ unsafe extern "C" fn render_proc(
             .callback_frames
             .store(in_number_frames, Ordering::Relaxed);
 
-        // SAFETY: CoreAudio が渡す有効なポインタ(関数 doc の契約)。
-        let callback_host_time_ns = unsafe { in_time_stamp.as_ref() }
+        // SAFETY: CoreAudio が渡す有効なポインタ(関数 doc の契約)。`host_time`/
+        // `sample_time`/`flags` のいずれも、ここで読んだ参照からだけ導出する
+        // (ポインタ自体の有効性はこの呼び出しの間だけ——関数 doc 参照)。
+        let timestamp_ref = unsafe { in_time_stamp.as_ref() };
+        let callback_host_time_ns = timestamp_ref
             .map(|ts| mach_ticks_to_ns(ts.host_time))
             .unwrap_or(0);
+
+        // モジュール doc「診断用プローブ(io probe)」。`host_time_ns()` は
+        // mach_absolute_time ベースで、ロック・アロケーション・システムコールを伴わない
+        // (§5.3 に抵触しない)。コールバックへ入ってできるだけ早いタイミングで読むことで、
+        // 以降の処理時間がノイズに乗らないようにしている。
+        let probe_now_ns = crate::host_time::host_time_ns();
+        context.io_probe_lead_ns.store(
+            callback_host_time_ns as i64 - probe_now_ns as i64,
+            Ordering::Relaxed,
+        );
+        let sample_time = timestamp_ref.map(|ts| ts.sample_time).unwrap_or(0.0);
+        let timestamp_flags = timestamp_ref.map(|ts| ts.flags).unwrap_or(0);
+        context
+            .io_probe_flags
+            .store(timestamp_flags, Ordering::Relaxed);
+        let expected_sample_time =
+            context.last_probe_sample_time + context.last_probe_frames as f64;
+        context.io_probe_sample_time_gap_frames.store(
+            (sample_time - expected_sample_time).round() as i64,
+            Ordering::Relaxed,
+        );
+        context.last_probe_sample_time = sample_time;
+        context.last_probe_frames = in_number_frames;
 
         let device_extra_latency_ns = context.device_extra_latency_ns.load(Ordering::Relaxed);
         let io_buffer_duration_ns = context.io_buffer_duration_ns.load(Ordering::Relaxed);
@@ -851,6 +1001,22 @@ unsafe extern "C" fn render_proc(
             context.last_device_extra_latency_ns = device_extra_latency_ns;
             context.last_io_buffer_duration_ns = io_buffer_duration_ns;
             context.last_restart_epoch = restart_epoch;
+        }
+
+        // モジュール doc「オーバーサイズのコールバックからの直し」: バッファ長から期待される
+        // フレーム数の2倍を超えるコールバックが連続した回数を数える(判定そのものは
+        // ホストでテストできる純関数 `is_oversized_callback` に切り出してある)。macOS は
+        // `io_buffer_duration_ns` が常に0なので `expected_io_buffer_frames` も常に0になり、
+        // この仕組みは target_os の分岐無しで実質的に no-op になる。
+        let expected_io_buffer_frames = ns_to_frames(io_buffer_duration_ns, context.sample_rate);
+        if is_oversized_callback(in_number_frames, expected_io_buffer_frames) {
+            context
+                .consecutive_oversized_callbacks
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            context
+                .consecutive_oversized_callbacks
+                .store(0, Ordering::Relaxed);
         }
 
         // バッファ長の項: macOS はこのコールバックの実測フレーム数から毎回求める
@@ -1044,6 +1210,10 @@ struct UnitControl {
     /// 古いユニットを捨ててから context を新しいユニットへ渡すときの同期点
     /// (`AppleBackend::close` と同じ理由)。
     render_completions: Arc<AtomicU64>,
+    /// [`CallbackContext::consecutive_oversized_callbacks`] と同じ `Arc`。
+    /// [`UnitControl::rebuild_if_oversized_callbacks`] がこれを読んで作り直すかどうかを
+    /// 判定する(モジュール doc「オーバーサイズのコールバックからの直し」参照)。
+    consecutive_oversized_callbacks: Arc<AtomicU32>,
 }
 
 // SAFETY: `OpenUnit` の生ポインタ(AudioUnit・context)へは必ず `slot` の `Mutex` を
@@ -1172,6 +1342,42 @@ impl RecoverableOutput for UnitControl {
         self.restart_epoch.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
+
+    fn rebuild_if_oversized_callbacks(&self) {
+        let streak = self.consecutive_oversized_callbacks.load(Ordering::Relaxed);
+        if !should_rebuild_for_oversized_callbacks(streak) {
+            return;
+        }
+
+        crate::mw_log!(
+            "[mw-backend] (native/apple ios) oversized callbacks detected ({streak} consecutive \
+             callbacks over twice the expected buffer length); rebuilding the output unit"
+        );
+
+        // 試みは1回だけ——失敗しても同じ streak のまま毎回呼び直されるのを避ける
+        // (`rebuild_if_oversized_callbacks` は曲の予約・復帰確認のたびに呼ばれるため、
+        // 失敗が続く場合に無意味な再試行を積み重ねないようにする)。
+        self.consecutive_oversized_callbacks
+            .store(0, Ordering::Relaxed);
+
+        // 作り直す前にセッションを整え直す(`attempt_recovery` の最初の一手と同じ)。
+        crate::ios_session::configure();
+
+        match self.rebuild() {
+            Ok(()) => {
+                if let Err(err) = self.play() {
+                    crate::mw_log!(
+                        "[mw-backend] (native/apple ios) play() after rebuilding for oversized \
+                         callbacks failed: {err}"
+                    );
+                }
+            }
+            Err(err) => crate::mw_log!(
+                "[mw-backend] (native/apple ios) rebuild after detecting oversized callbacks \
+                 failed: {err}"
+            ),
+        }
+    }
 }
 
 // ============================================================================
@@ -1228,6 +1434,27 @@ pub struct AppleBackend {
     /// (cpal 版と同じ `ios_interruption::Watcher`。macOS では no-op)。
     /// `open()`/`close()` と1対1。
     ios_interruption: Option<ios_interruption::Watcher>,
+    /// モジュール doc「診断用プローブ(io probe)」の **lead**。[`CallbackContext::
+    /// io_probe_lead_ns`] と同じ `Arc`。
+    io_probe_lead_ns: Arc<AtomicI64>,
+    /// 診断用プローブの **mSampleTime の連続性**。[`CallbackContext::
+    /// io_probe_sample_time_gap_frames`] と同じ `Arc`。
+    io_probe_sample_time_gap_frames: Arc<AtomicI64>,
+    /// 診断用プローブの **flags**。[`CallbackContext::io_probe_flags`] と同じ `Arc`。
+    io_probe_flags: Arc<AtomicU32>,
+    /// [`Backend::log_new_output_underruns`] が直近に io probe のログを出した時点の
+    /// [`restart_epoch`](Self::restart_epoch) の値。`u64::MAX` は「まだ1度もログしていない」
+    /// を表す初期値([`AppleBackend::logged_output_latency_epoch`] と同じ idiom)。
+    logged_io_probe_restart_epoch: AtomicU64,
+    /// [`Backend::log_new_output_underruns`] が直近に io probe のログを出した
+    /// ホスト単調時刻(ns)。0 は「まだ1度もログしていない」(`host_time_ns()` が実際に
+    /// 0ns を返すことはまず無いため、特殊値として安全に使える)。
+    logged_io_probe_host_time_ns: AtomicU64,
+    /// モジュール doc「オーバーサイズのコールバックからの直し」: バッファ長から期待される
+    /// フレーム数の2倍を超えるコールバックが連続している回数。[`CallbackContext::
+    /// consecutive_oversized_callbacks`]/[`UnitControl::consecutive_oversized_callbacks`] と
+    /// 同じ `Arc`。
+    consecutive_oversized_callbacks: Arc<AtomicU32>,
 }
 
 // SAFETY: `control` の中に生ポインタ(AudioUnit・context)を持つが、それらは
@@ -1263,6 +1490,12 @@ impl AppleBackend {
             ios_output_latency_watcher: None,
             restart_epoch: Arc::new(AtomicU64::new(0)),
             ios_interruption: None,
+            io_probe_lead_ns: Arc::new(AtomicI64::new(0)),
+            io_probe_sample_time_gap_frames: Arc::new(AtomicI64::new(0)),
+            io_probe_flags: Arc::new(AtomicU32::new(0)),
+            logged_io_probe_restart_epoch: AtomicU64::new(u64::MAX),
+            logged_io_probe_host_time_ns: AtomicU64::new(0),
+            consecutive_oversized_callbacks: Arc::new(AtomicU32::new(0)),
         }
     }
 }
@@ -1328,6 +1561,12 @@ impl Backend for AppleBackend {
             restart_epoch: Arc::clone(&self.restart_epoch),
             // 開いた時点の値を基準にする(これと違う値を見たら世代を進める)。
             last_restart_epoch: self.restart_epoch.load(Ordering::Relaxed),
+            io_probe_lead_ns: Arc::clone(&self.io_probe_lead_ns),
+            io_probe_sample_time_gap_frames: Arc::clone(&self.io_probe_sample_time_gap_frames),
+            io_probe_flags: Arc::clone(&self.io_probe_flags),
+            last_probe_sample_time: 0.0,
+            last_probe_frames: 0,
+            consecutive_oversized_callbacks: Arc::clone(&self.consecutive_oversized_callbacks),
             underrun_tracker: OutputUnderrunTracker::new(
                 Arc::clone(&self.output_underrun_count),
                 Arc::clone(&self.last_output_underrun_host_time_ns),
@@ -1456,6 +1695,7 @@ impl Backend for AppleBackend {
             device_extra_latency_ns: Arc::clone(&self.device_extra_latency_ns),
             io_buffer_duration_ns: Arc::clone(&self.io_buffer_duration_ns),
             render_completions: Arc::clone(&self.render_completions),
+            consecutive_oversized_callbacks: Arc::clone(&self.consecutive_oversized_callbacks),
         });
 
         // 割り込み・背面遷移・ルート変化・出力停止からの復帰(cpal 版と同じ監視。
@@ -1528,6 +1768,16 @@ impl Backend for AppleBackend {
                     .store(0, Ordering::Relaxed);
                 self.device_extra_latency_ns.store(0, Ordering::Relaxed);
                 self.io_buffer_duration_ns.store(0, Ordering::Relaxed);
+                self.io_probe_lead_ns.store(0, Ordering::Relaxed);
+                self.io_probe_sample_time_gap_frames
+                    .store(0, Ordering::Relaxed);
+                self.io_probe_flags.store(0, Ordering::Relaxed);
+                self.logged_io_probe_restart_epoch
+                    .store(u64::MAX, Ordering::Relaxed);
+                self.logged_io_probe_host_time_ns
+                    .store(0, Ordering::Relaxed);
+                self.consecutive_oversized_callbacks
+                    .store(0, Ordering::Relaxed);
                 Ok(())
             }
             _ => Err(BackendError::NotOpen),
@@ -1552,13 +1802,16 @@ impl Backend for AppleBackend {
         // iOS/tvOS だけが曲の再生予約の直前にここを通る
         // (`crates/mw-ffi/src/ffi.rs::mw_music_play_scheduled` から)。
         #[cfg(any(target_os = "ios", target_os = "tvos"))]
-        if self.control.is_some() {
+        if let Some(control) = self.control.as_ref() {
             refresh_ios_output_latency(
                 &self.device_extra_latency_ns,
                 &self.io_buffer_duration_ns,
                 self.sample_rate,
                 "music schedule",
             );
+            // モジュール doc「オーバーサイズのコールバックからの直し」の安全な時点の
+            // 一つ: 曲の再生予約の直前(世代をまたがない途中には作り直さない)。
+            control.rebuild_if_oversized_callbacks();
         }
     }
 
@@ -1620,10 +1873,42 @@ impl Backend for AppleBackend {
         let last_logged_frames = self
             .logged_callback_frames
             .swap(current_frames, Ordering::Relaxed);
-        if current_frames != last_logged_frames {
+        let frames_changed = current_frames != last_logged_frames;
+        if frames_changed {
             crate::mw_log!(
                 "[mw-backend] (native/apple) callback frame count (in_number_frames) changed: \
                  {last_logged_frames} -> {current_frames} frames"
+            );
+        }
+
+        // モジュール doc「診断用プローブ(io probe)」。既存のこの口(ゲームスレッド、
+        // 日和見的な定期呼び出し)に相乗りする——新しい FFI 口は増やさない。
+        let current_epoch = self.restart_epoch.load(Ordering::Relaxed);
+        let last_logged_epoch = self
+            .logged_io_probe_restart_epoch
+            .swap(current_epoch, Ordering::Relaxed);
+        let restart_epoch_changed = last_logged_epoch != current_epoch;
+
+        let now_ns = crate::host_time::host_time_ns();
+        let last_logged_host_time_ns = self.logged_io_probe_host_time_ns.load(Ordering::Relaxed);
+        let elapsed_ns = if last_logged_host_time_ns == 0 {
+            u64::MAX
+        } else {
+            now_ns.saturating_sub(last_logged_host_time_ns)
+        };
+
+        if should_log_io_probe(restart_epoch_changed, frames_changed, elapsed_ns) {
+            self.logged_io_probe_host_time_ns
+                .store(now_ns, Ordering::Relaxed);
+            let lead_ns = self.io_probe_lead_ns.load(Ordering::Relaxed);
+            let sample_time_gap_frames =
+                self.io_probe_sample_time_gap_frames.load(Ordering::Relaxed);
+            let flags = self.io_probe_flags.load(Ordering::Relaxed);
+            crate::mw_log!(
+                "[mw-backend] (native/apple) io probe: in_number_frames={current_frames}, \
+                 lead={lead_ms:.3} ms, sample_time_gap={sample_time_gap_frames} frames, \
+                 flags={flags:#x}, restart_epoch={current_epoch}",
+                lead_ms = lead_ns as f64 / 1_000_000.0,
             );
         }
     }
@@ -2024,6 +2309,112 @@ mod tests {
         assert_eq!(seconds_to_ns(f64::NEG_INFINITY), 0);
     }
 
+    /// iOS/tvOS の既定 `IOBufferDuration`(5ms)を 48kHz で読んだときの期待フレーム数
+    /// (240 フレーム。モジュール doc「オーバーサイズのコールバックからの直し」参照)。
+    #[test]
+    fn ns_to_frames_converts_the_steady_state_io_buffer_duration() {
+        assert_eq!(ns_to_frames(5_000_000, 48_000), 240);
+    }
+
+    #[test]
+    fn ns_to_frames_is_zero_when_sample_rate_is_unknown() {
+        assert_eq!(ns_to_frames(5_000_000, 0), 0);
+    }
+
+    #[test]
+    fn ns_to_frames_is_zero_for_zero_duration() {
+        assert_eq!(ns_to_frames(0, 48_000), 0);
+    }
+
+    #[test]
+    fn ns_to_frames_saturates_instead_of_overflowing() {
+        assert_eq!(ns_to_frames(u64::MAX, u32::MAX), u32::MAX);
+    }
+
+    /// 平常時(240 フレーム=期待フレーム数そのもの)は「オーバーサイズ」ではない。
+    #[test]
+    fn is_oversized_callback_is_false_for_the_expected_frame_count() {
+        assert!(!is_oversized_callback(240, 240));
+    }
+
+    /// ちょうど2倍は「超える」の境界に含めない(`>`、`>=` ではない)。
+    #[test]
+    fn is_oversized_callback_is_false_at_exactly_double() {
+        assert!(!is_oversized_callback(480, 240));
+    }
+
+    #[test]
+    fn is_oversized_callback_is_true_just_over_double() {
+        assert!(is_oversized_callback(481, 240));
+    }
+
+    /// 実機で観測されている値(240 希望 → 2048 実測)はオーバーサイズと判定されるはず。
+    #[test]
+    fn is_oversized_callback_is_true_for_the_observed_degraded_frame_count() {
+        assert!(is_oversized_callback(2048, 240));
+    }
+
+    /// 期待フレーム数が0(macOS。または iOS/tvOS でまだ `IOBufferDuration` を読んでいない)
+    /// では、フレーム数がどれだけ大きくても判定しない。
+    #[test]
+    fn is_oversized_callback_is_false_when_expected_frames_is_zero() {
+        assert!(!is_oversized_callback(2048, 0));
+    }
+
+    #[test]
+    fn should_rebuild_for_oversized_callbacks_is_false_below_the_threshold() {
+        assert!(!should_rebuild_for_oversized_callbacks(
+            OVERSIZED_CALLBACK_REBUILD_THRESHOLD - 1
+        ));
+    }
+
+    #[test]
+    fn should_rebuild_for_oversized_callbacks_is_true_at_the_threshold() {
+        assert!(should_rebuild_for_oversized_callbacks(
+            OVERSIZED_CALLBACK_REBUILD_THRESHOLD
+        ));
+    }
+
+    #[test]
+    fn should_rebuild_for_oversized_callbacks_is_true_above_the_threshold() {
+        assert!(should_rebuild_for_oversized_callbacks(
+            OVERSIZED_CALLBACK_REBUILD_THRESHOLD + 1
+        ));
+    }
+
+    #[test]
+    fn should_log_io_probe_is_false_when_nothing_changed_and_the_interval_has_not_elapsed() {
+        assert!(!should_log_io_probe(
+            false,
+            false,
+            IO_PROBE_LOG_INTERVAL_NS - 1
+        ));
+    }
+
+    #[test]
+    fn should_log_io_probe_is_true_when_the_restart_epoch_changed() {
+        assert!(should_log_io_probe(true, false, 0));
+    }
+
+    #[test]
+    fn should_log_io_probe_is_true_when_the_frame_count_changed() {
+        assert!(should_log_io_probe(false, true, 0));
+    }
+
+    #[test]
+    fn should_log_io_probe_is_true_at_the_interval() {
+        assert!(should_log_io_probe(false, false, IO_PROBE_LOG_INTERVAL_NS));
+    }
+
+    #[test]
+    fn should_log_io_probe_is_true_past_the_interval() {
+        assert!(should_log_io_probe(
+            false,
+            false,
+            IO_PROBE_LOG_INTERVAL_NS + 1
+        ));
+    }
+
     /// ハードウェア不要の構築テスト: `AppleBackend::new()` はまだ閉じている。
     #[test]
     fn new_backend_starts_closed() {
@@ -2150,6 +2541,12 @@ mod tests {
             music_clock,
             restart_epoch: Arc::new(AtomicU64::new(0)),
             last_restart_epoch: 0,
+            io_probe_lead_ns: Arc::new(AtomicI64::new(0)),
+            io_probe_sample_time_gap_frames: Arc::new(AtomicI64::new(0)),
+            io_probe_flags: Arc::new(AtomicU32::new(0)),
+            last_probe_sample_time: 0.0,
+            last_probe_frames: 0,
+            consecutive_oversized_callbacks: Arc::new(AtomicU32::new(0)),
             underrun_tracker: OutputUnderrunTracker::new(
                 Arc::new(AtomicU64::new(0)),
                 Arc::new(AtomicU64::new(0)),
@@ -2501,6 +2898,343 @@ mod tests {
         drop(unsafe { Box::from_raw(context_ptr) });
     }
 
+    /// `dummy_time_stamp` に `sample_time`/`flags` も指定できる版
+    /// (モジュール doc「診断用プローブ(io probe)」のテスト用)。
+    fn probe_time_stamp(host_time: u64, sample_time: f64, flags: u32) -> AudioTimeStamp {
+        AudioTimeStamp {
+            sample_time,
+            flags,
+            ..dummy_time_stamp(host_time)
+        }
+    }
+
+    /// モジュール doc「オーバーサイズのコールバックからの直し」: 期待フレーム数
+    /// (`io_buffer_duration_ns` から求める、ここでは 5ms=240 フレーム @ 48kHz)の2倍を超える
+    /// コールバックが連続している回数を数え、普段のサイズに戻ったら 0 にリセットする
+    /// (`consecutive_oversized_callbacks`、判定は `is_oversized_callback`)。
+    #[test]
+    fn render_proc_tracks_a_streak_of_oversized_callbacks_and_resets_on_a_normal_sized_callback() {
+        let context_ptr = test_callback_context(48_000);
+        unsafe {
+            (*context_ptr)
+                .io_buffer_duration_ns
+                .store(5_000_000, Ordering::Relaxed); // 240 frames @ 48kHz
+        }
+        let time_stamp = dummy_time_stamp(1_000);
+
+        // 2048 フレームは 240*2=480 を超える(実機で観測されている値そのもの)。
+        let mut oversized_buffer = aligned_test_buffer(); // 4096 要素 = 2048 フレーム * 2ch
+        for expected_streak in 1..=3u32 {
+            let mut buffer_list = AudioBufferList {
+                number_buffers: 1,
+                buffers: [AudioBuffer {
+                    number_channels: 2,
+                    data_byte_size: (oversized_buffer.len() * std::mem::size_of::<f32>()) as u32,
+                    data: oversized_buffer.as_mut_ptr().cast(),
+                }],
+            };
+            let status = unsafe {
+                render_proc(
+                    context_ptr.cast(),
+                    std::ptr::null_mut(),
+                    &time_stamp,
+                    0,
+                    2048,
+                    &mut buffer_list,
+                )
+            };
+            assert_eq!(status, NO_ERR);
+            assert_eq!(
+                unsafe {
+                    (*context_ptr)
+                        .consecutive_oversized_callbacks
+                        .load(Ordering::Relaxed)
+                },
+                expected_streak
+            );
+        }
+
+        // 普段のサイズ(240 フレーム)に戻ったら 0 にリセットされる。
+        let mut normal_buffer = [0.0f32; 240 * 2];
+        let mut buffer_list = AudioBufferList {
+            number_buffers: 1,
+            buffers: [AudioBuffer {
+                number_channels: 2,
+                data_byte_size: (normal_buffer.len() * std::mem::size_of::<f32>()) as u32,
+                data: normal_buffer.as_mut_ptr().cast(),
+            }],
+        };
+        let status = unsafe {
+            render_proc(
+                context_ptr.cast(),
+                std::ptr::null_mut(),
+                &time_stamp,
+                0,
+                240,
+                &mut buffer_list,
+            )
+        };
+        assert_eq!(status, NO_ERR);
+        assert_eq!(
+            unsafe {
+                (*context_ptr)
+                    .consecutive_oversized_callbacks
+                    .load(Ordering::Relaxed)
+            },
+            0,
+            "普段のサイズに戻ったのに streak がリセットされていない"
+        );
+
+        drop(unsafe { Box::from_raw(context_ptr) });
+    }
+
+    /// `io_buffer_duration_ns` が 0(macOS。または iOS/tvOS でまだ読んでいない)のときは、
+    /// `in_number_frames` がどれだけ大きくても streak が進まない(`is_oversized_callback`
+    /// の「期待フレーム数が0なら判定しない」が `render_proc` 経由でも成り立つことの固定化)。
+    #[test]
+    fn render_proc_does_not_track_oversized_callbacks_when_io_buffer_duration_is_zero() {
+        let context_ptr = test_callback_context(48_000);
+        let time_stamp = dummy_time_stamp(1_000);
+        let mut buffer = aligned_test_buffer();
+        let mut buffer_list = AudioBufferList {
+            number_buffers: 1,
+            buffers: [AudioBuffer {
+                number_channels: 2,
+                data_byte_size: (buffer.len() * std::mem::size_of::<f32>()) as u32,
+                data: buffer.as_mut_ptr().cast(),
+            }],
+        };
+
+        let status = unsafe {
+            render_proc(
+                context_ptr.cast(),
+                std::ptr::null_mut(),
+                &time_stamp,
+                0,
+                2048,
+                &mut buffer_list,
+            )
+        };
+        assert_eq!(status, NO_ERR);
+        assert_eq!(
+            unsafe {
+                (*context_ptr)
+                    .consecutive_oversized_callbacks
+                    .load(Ordering::Relaxed)
+            },
+            0
+        );
+
+        drop(unsafe { Box::from_raw(context_ptr) });
+    }
+
+    /// モジュール doc「診断用プローブ(io probe)」の **flags**:
+    /// `AudioTimeStamp.flags` をそのまま写すだけ。
+    #[test]
+    fn render_proc_copies_the_raw_timestamp_flags_into_the_probe() {
+        let context_ptr = test_callback_context(48_000);
+        let time_stamp = probe_time_stamp(1_000, 0.0, 0x1F);
+
+        let mut buffer = [0.0f32; 8]; // 4 frames * 2ch
+        let mut buffer_list = AudioBufferList {
+            number_buffers: 1,
+            buffers: [AudioBuffer {
+                number_channels: 2,
+                data_byte_size: (buffer.len() * std::mem::size_of::<f32>()) as u32,
+                data: buffer.as_mut_ptr().cast(),
+            }],
+        };
+        let status = unsafe {
+            render_proc(
+                context_ptr.cast(),
+                std::ptr::null_mut(),
+                &time_stamp,
+                0,
+                4,
+                &mut buffer_list,
+            )
+        };
+        assert_eq!(status, NO_ERR);
+        assert_eq!(
+            unsafe { (*context_ptr).io_probe_flags.load(Ordering::Relaxed) },
+            0x1F
+        );
+
+        drop(unsafe { Box::from_raw(context_ptr) });
+    }
+
+    /// 診断用プローブの **lead**(= 相関点 − コールバックに入った時点の `host_time_ns()`)。
+    /// テストの `AudioTimeStamp.host_time` はごく小さい値(1000)なので、ns 化しても
+    /// 実際の現在時刻(`host_time_ns()`、プロセスの単調時刻)よりはるかに小さく、
+    /// 符号が必ず負になる。
+    #[test]
+    fn render_proc_computes_a_negative_lead_for_a_tiny_test_host_time() {
+        let context_ptr = test_callback_context(48_000);
+        let time_stamp = dummy_time_stamp(1_000);
+
+        let mut buffer = [0.0f32; 8];
+        let mut buffer_list = AudioBufferList {
+            number_buffers: 1,
+            buffers: [AudioBuffer {
+                number_channels: 2,
+                data_byte_size: (buffer.len() * std::mem::size_of::<f32>()) as u32,
+                data: buffer.as_mut_ptr().cast(),
+            }],
+        };
+        let status = unsafe {
+            render_proc(
+                context_ptr.cast(),
+                std::ptr::null_mut(),
+                &time_stamp,
+                0,
+                4,
+                &mut buffer_list,
+            )
+        };
+        assert_eq!(status, NO_ERR);
+        assert!(
+            unsafe { (*context_ptr).io_probe_lead_ns.load(Ordering::Relaxed) } < 0,
+            "テストの mHostTime はごく小さい値なので、実際の現在時刻より手前(負)になるはず"
+        );
+
+        drop(unsafe { Box::from_raw(context_ptr) });
+    }
+
+    /// 診断用プローブの **mSampleTime の連続性**: 2回目の `sample_time` が
+    /// 「1回目の `sample_time` + 1回目のフレーム数」どおりに続いていれば差は0。
+    #[test]
+    fn render_proc_reports_zero_sample_time_gap_when_continuous() {
+        let context_ptr = test_callback_context(48_000);
+        let mut buffer = [0.0f32; 8]; // 4 frames * 2ch
+        let mut buffer_list = AudioBufferList {
+            number_buffers: 1,
+            buffers: [AudioBuffer {
+                number_channels: 2,
+                data_byte_size: (buffer.len() * std::mem::size_of::<f32>()) as u32,
+                data: buffer.as_mut_ptr().cast(),
+            }],
+        };
+
+        let first = probe_time_stamp(1_000, 1_000.0, 0);
+        let status = unsafe {
+            render_proc(
+                context_ptr.cast(),
+                std::ptr::null_mut(),
+                &first,
+                0,
+                4,
+                &mut buffer_list,
+            )
+        };
+        assert_eq!(status, NO_ERR);
+
+        let second = probe_time_stamp(2_000, 1_004.0, 0); // 1000 + 4 フレームどおり
+        let status = unsafe {
+            render_proc(
+                context_ptr.cast(),
+                std::ptr::null_mut(),
+                &second,
+                0,
+                4,
+                &mut buffer_list,
+            )
+        };
+        assert_eq!(status, NO_ERR);
+        assert_eq!(
+            unsafe {
+                (*context_ptr)
+                    .io_probe_sample_time_gap_frames
+                    .load(Ordering::Relaxed)
+            },
+            0,
+            "前回の sample_time + 前回のフレーム数どおりに続いているので差は0のはず"
+        );
+
+        drop(unsafe { Box::from_raw(context_ptr) });
+    }
+
+    /// 上と対になる固定化: コールバックの間が空けば(足りないフレーム数ぶん)差が正に出る。
+    #[test]
+    fn render_proc_reports_a_positive_sample_time_gap_when_a_callback_is_skipped() {
+        let context_ptr = test_callback_context(48_000);
+        let mut buffer = [0.0f32; 8];
+        let mut buffer_list = AudioBufferList {
+            number_buffers: 1,
+            buffers: [AudioBuffer {
+                number_channels: 2,
+                data_byte_size: (buffer.len() * std::mem::size_of::<f32>()) as u32,
+                data: buffer.as_mut_ptr().cast(),
+            }],
+        };
+
+        let first = probe_time_stamp(1_000, 1_000.0, 0);
+        let status = unsafe {
+            render_proc(
+                context_ptr.cast(),
+                std::ptr::null_mut(),
+                &first,
+                0,
+                4,
+                &mut buffer_list,
+            )
+        };
+        assert_eq!(status, NO_ERR);
+
+        // 本来 1000 + 4 = 1004 のはずが、1010 まで飛んでいる(6 フレームぶんの欠落)。
+        let second = probe_time_stamp(2_000, 1_010.0, 0);
+        let status = unsafe {
+            render_proc(
+                context_ptr.cast(),
+                std::ptr::null_mut(),
+                &second,
+                0,
+                4,
+                &mut buffer_list,
+            )
+        };
+        assert_eq!(status, NO_ERR);
+        assert_eq!(
+            unsafe {
+                (*context_ptr)
+                    .io_probe_sample_time_gap_frames
+                    .load(Ordering::Relaxed)
+            },
+            6
+        );
+
+        drop(unsafe { Box::from_raw(context_ptr) });
+    }
+
+    /// `log_new_output_underruns` の io probe ログ判定(`should_log_io_probe`)が
+    /// `restart_epoch` の変化を実際に拾うこと——初回呼び出しは「まだ1度もログしていない」
+    /// (`u64::MAX` の sentinel)が現在値と食い違うため必ず通る([`log_output_latency_once`]
+    /// と同じ idiom)。
+    #[test]
+    fn log_new_output_underruns_logs_the_io_probe_on_the_first_call() {
+        let backend = AppleBackend::new();
+        assert_eq!(
+            backend
+                .logged_io_probe_restart_epoch
+                .load(Ordering::Relaxed),
+            u64::MAX
+        );
+
+        backend.log_new_output_underruns();
+
+        assert_eq!(
+            backend
+                .logged_io_probe_restart_epoch
+                .load(Ordering::Relaxed),
+            0,
+            "初回呼び出しで現在の restart_epoch(0)を記録しているはず"
+        );
+        assert_ne!(
+            backend.logged_io_probe_host_time_ns.load(Ordering::Relaxed),
+            0,
+            "ログを出したのでログ時刻が記録されているはず"
+        );
+    }
+
     /// 閉じた後(`OpenUnit` を取り出した後)の制御口は、AudioUnit に触れずにエラーを返す。
     /// 復帰確認のワーカーが `close` の後まで走り続けても、閉じたユニットへ Start を撃たない。
     #[test]
@@ -2513,6 +3247,7 @@ mod tests {
             device_extra_latency_ns: Arc::new(AtomicU64::new(0)),
             io_buffer_duration_ns: Arc::new(AtomicU64::new(0)),
             render_completions: Arc::new(AtomicU64::new(0)),
+            consecutive_oversized_callbacks: Arc::new(AtomicU32::new(0)),
         };
 
         assert!(control.supports_rebuild());
@@ -2523,6 +3258,62 @@ mod tests {
             restart_epoch.load(Ordering::Relaxed),
             0,
             "閉じた後の操作で世代を進める合図を出している"
+        );
+    }
+
+    /// 閾値未満では何もしない(`rebuild()` を試みない——制御口が閉じていても
+    /// `restart_epoch` は不変のまま)。
+    #[test]
+    fn rebuild_if_oversized_callbacks_does_nothing_below_the_threshold() {
+        let restart_epoch = Arc::new(AtomicU64::new(0));
+        let streak = Arc::new(AtomicU32::new(OVERSIZED_CALLBACK_REBUILD_THRESHOLD - 1));
+        let control = UnitControl {
+            slot: Mutex::new(None),
+            sample_rate: 48_000.0,
+            restart_epoch: Arc::clone(&restart_epoch),
+            device_extra_latency_ns: Arc::new(AtomicU64::new(0)),
+            io_buffer_duration_ns: Arc::new(AtomicU64::new(0)),
+            render_completions: Arc::new(AtomicU64::new(0)),
+            consecutive_oversized_callbacks: Arc::clone(&streak),
+        };
+
+        control.rebuild_if_oversized_callbacks();
+
+        assert_eq!(
+            streak.load(Ordering::Relaxed),
+            OVERSIZED_CALLBACK_REBUILD_THRESHOLD - 1,
+            "閾値未満なのに streak を変えている(試みてもいない)"
+        );
+        assert_eq!(restart_epoch.load(Ordering::Relaxed), 0);
+    }
+
+    /// 閾値に達したら `rebuild()` を試みる(制御口が閉じているので失敗するが、
+    /// streak は試みた時点でリセットする——失敗が続いても毎回再試行を積み重ねない)。
+    #[test]
+    fn rebuild_if_oversized_callbacks_attempts_rebuild_at_the_threshold() {
+        let restart_epoch = Arc::new(AtomicU64::new(0));
+        let streak = Arc::new(AtomicU32::new(OVERSIZED_CALLBACK_REBUILD_THRESHOLD));
+        let control = UnitControl {
+            slot: Mutex::new(None),
+            sample_rate: 48_000.0,
+            restart_epoch: Arc::clone(&restart_epoch),
+            device_extra_latency_ns: Arc::new(AtomicU64::new(0)),
+            io_buffer_duration_ns: Arc::new(AtomicU64::new(0)),
+            render_completions: Arc::new(AtomicU64::new(0)),
+            consecutive_oversized_callbacks: Arc::clone(&streak),
+        };
+
+        control.rebuild_if_oversized_callbacks();
+
+        assert_eq!(
+            streak.load(Ordering::Relaxed),
+            0,
+            "試みた以上は streak をリセットするはず"
+        );
+        assert_eq!(
+            restart_epoch.load(Ordering::Relaxed),
+            0,
+            "制御口が閉じているので rebuild() 自体は失敗し、世代は進まないはず"
         );
     }
 
