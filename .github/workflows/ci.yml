@@ -260,4 +260,4 @@ jobs:
   gitleaks:
     # @v1 は意図的な可動タグ(互換を保つ修正は運用側がタグを前へ動かす)。
     # zizmor: ignore[unpinned-uses]
-    uses: mu5dvlp/ci-workflows/.github/workflows/gitleaks.yml@v1
+    uses: mu5dvlp-music-game-projects/ci-workflows/.github/workflows/gitleaks.yml@v1
