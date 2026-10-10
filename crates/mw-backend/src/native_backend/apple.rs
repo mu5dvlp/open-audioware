@@ -61,11 +61,12 @@
 //! [`crate::host_time::mach_ticks_to_ns`](同じ関数を cpal 版の時計整合性でも使っている)
 //! で ns 化する——これが**相関点**(このコールバックが呼ばれたホスト時刻そのもの。
 //! 毎コールバック読み直すだけで、どこにも保存しない)。そこへ**補正項**
-//! (`CallbackContext::device_extra_latency_ns`。出力レイテンシの推定値)を足して
-//! `Renderer::render` に渡す `buffer_start_host_time_ns`(予測される DAC 出力時刻)を得る。
-//! 式は [`compute_timestamps`] のドキュメント参照——この関数は macOS/iOS/tvOS で共通
-//! (相関点・補正項・バッファ長〔このコールバックの実測フレーム数〕を分けて受け取り、
-//! 内部で合算するだけの純関数)。
+//! (`CallbackContext::device_extra_latency_ns`。出力レイテンシの推定値)と
+//! **バッファ長の項**(`buffer_duration_ns`。下記「バッファ長の項の出し方」参照)を
+//! 足して `Renderer::render` に渡す `buffer_start_host_time_ns`(予測される DAC 出力時刻)を
+//! 得る。式は [`compute_timestamps`] のドキュメント参照——この関数自体は相関点・補正項・
+//! バッファ長の3値を受け取って合算するだけの純関数で、どちらも呼び出し側
+//! (`render_proc`)が OS ごとに値を用意する。
 //!
 //! 補正項の**出し方**だけが OS で違う:
 //!
@@ -84,6 +85,29 @@
 //!   ルート変化以外では読み直さない。セッションが落ち着く前に `open()` が読んだ値が
 //!   プロセス生存中ずっと残ってしまう(Control Center 操作・背面復帰後に小さな
 //!   常時のズレが残り続ける)問題への対処。
+//!
+//! バッファ長の項の**出し方**も OS で違う(いずれも [`compute_timestamps`] の3番目の
+//! 引数 `buffer_duration_ns` として渡す):
+//!
+//! - **macOS**: このコールバックの実測フレーム数(`in_number_frames`)を
+//!   `extra_latency_frames_to_ns` でそのつど ns 化する(変更無し。デバイス切断の
+//!   監視が無い前提の範囲なので、実測フレーム数が安定していることを前提にしてよい)。
+//! - **iOS/tvOS**: `AVAudioSession.IOBufferDuration()` を補正項
+//!   (`device_extra_latency_ns`)と**全く同じ読み直しタイミング**(`open()`・
+//!   `refresh_ios_output_latency` の4箇所)で読み、`CallbackContext::
+//!   io_buffer_duration_ns` に保持する——実測フレーム数(`in_number_frames`)は
+//!   使わない。RemoteIO は Control Center 表示中の出力停止からウォッチドッグ
+//!   (`ios_interruption` の `OutputStalled` → `pause()`→`play()`)で復帰した後、
+//!   `in_number_frames` が希望値(通常 240 フレーム=5ms)より大きい値(観測上
+//!   2048 前後)のまま戻らないことがある——実際の出力はそのぶん遅れていないため、
+//!   実測フレーム数をそのままバッファ長の項に使うと予測出力時刻が実測より恒久的に
+//!   遅れる(実機症状: 曲に合わせて叩くと判定が「速い」側〔GREAT FAST〕に倒れる)。
+//!   `IOBufferDuration` は OS に設定させた希望値であり、RemoteIO が実際に渡す
+//!   フレーム数の揺れに引きずられない——cpal 0.18.1 の iOS 実装(モジュール doc
+//!   「cpal 0.18.1 が iOS で返している値の意味」参照)が起動時に1度だけ
+//!   `IOBufferDuration` をキャッシュしていたのと同じ考え方だが、こちらはルート変化等で
+//!   読み直す分、より新鮮な値を使う。値が変わったら(macOS で補正項が変わるのと同じ
+//!   扱いで)`MusicClockPublisher::bump_generation` を呼ぶ(`render_proc` 参照)。
 //!
 //! **cpal 0.18.1(固定中)が iOS で返している値の意味、および 0.18.2 でそれが壊れた理由**
 //! (ソースを確認済み。`~/.cargo/registry/.../cpal-0.18.{1,2}/src/host/coreaudio/ios/mod.rs`):
@@ -112,7 +136,7 @@
 
 use std::ffi::c_void;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use mw_core::{CHANNELS, EventQueue, MusicClockPublisher, Renderer};
@@ -412,24 +436,21 @@ fn validated_sample_count(frames: u32, data: *mut c_void, data_byte_size: u32) -
 /// デバイスの実バッファ長 + 追加レイテンシから見積もっている。AUHAL の
 /// `AURenderCallback` は `mHostTime` をコールバック起動の基準時刻として渡してくるだけで
 /// 予測出力時刻そのものは返さないため、ここでは **(1) このバッファの再生に要る時間
-/// (`frames / sample_rate`)+ (2) デバイス側が申告する追加レイテンシ
-/// (`open()` 時に1度だけ `query_device_extra_latency_frames` で読んだ
-/// `device_extra_latency_ns`。cpal 0.18.1 の `get_device_extra_latency_frames` が読む
-/// のと同じ `kAudioDevicePropertyLatency` + `kAudioDevicePropertySafetyOffset` の合計)**
-/// を足したものを予測出力時刻として扱う——cpal が「デバイスの実バッファ長を取れない
-/// ときはこのコールバックのフレーム数へフォールバックする」のと同じ考え方
-/// (`cpal_backend.rs::build_output_stream` のコメント参照)。
+/// (`buffer_duration_ns`)+ (2) デバイス側が申告する追加レイテンシ
+/// (`device_extra_latency_ns`)** を足したものを予測出力時刻として扱う。
+///
+/// **この関数自身は両方の値がどう算出されたかを問わない**(ただの加算)——
+/// 呼び出し側(`render_proc`)が OS ごとに異なる出し方で2つの値を用意する
+/// (モジュール doc「タイムスタンプの扱い」参照: `device_extra_latency_ns` は macOS が
+/// `open()` 時の1回だけ・iOS/tvOS がルート変化等のたびに読み直す補正項、
+/// `buffer_duration_ns` は macOS がこのコールバックの実測フレーム数から・iOS/tvOS が
+/// `AVAudioSession.IOBufferDuration()` から求める値)。この分離により、2つの入力を
+/// 直接指定するだけで target を問わず単体テストできる。
 fn compute_timestamps(
     callback_host_time_ns: u64,
     device_extra_latency_ns: u64,
-    frames: u32,
-    sample_rate: u32,
+    buffer_duration_ns: u64,
 ) -> (u64, u64) {
-    let buffer_duration_ns = if sample_rate > 0 {
-        (frames as u64 * 1_000_000_000) / sample_rate as u64
-    } else {
-        0
-    };
     let output_latency_ns = device_extra_latency_ns.saturating_add(buffer_duration_ns);
     let buffer_start_host_time_ns = callback_host_time_ns.saturating_add(output_latency_ns);
     (buffer_start_host_time_ns, output_latency_ns)
@@ -438,9 +459,11 @@ fn compute_timestamps(
 /// frame 数を ns へ変換する(cpal 0.18.1 `host::frames_to_duration` と同じ式——
 /// 分母が立たない場合〔`sample_rate == 0`〕は 0 を返すのも含めて一致させてある)。
 /// 純関数——ハードウェア不要で単体テストできる(macOS でのみコンパイルされる。
-/// `query_device_extra_latency_frames` が返す frame 数を ns 化するために使う——
-/// iOS/tvOS の補正項は [`seconds_to_ns`] 経由で秒から直接 ns 化するため、
-/// こちらは呼ばない)。
+/// 用途は2つ: `query_device_extra_latency_frames` が返す frame 数の ns 化〔macOS の
+/// 補正項〕と、`render_proc` が毎コールバック求める macOS のバッファ長の項
+/// (`in_number_frames` をそのつど ns 化する。[`compute_timestamps`] の
+/// `buffer_duration_ns` 引数)——iOS/tvOS はどちらも `AVAudioSession` の秒の値を
+/// [`seconds_to_ns`] で直接 ns 化するため、こちらは呼ばない)。
 #[cfg(target_os = "macos")]
 fn extra_latency_frames_to_ns(frames: u32, sample_rate: u32) -> u64 {
     if sample_rate == 0 {
@@ -587,12 +610,9 @@ fn query_device_extra_latency_frames(unit: AudioUnit) -> u32 {
 /// が初期化時に1度読み、[`refresh_ios_output_latency`] がそれ以外の読み直し箇所
 /// (ルート変化・曲の再生予約・動かし直し・作り直し)から同じ関数を呼ぶ。
 ///
-/// **`IOBufferDuration` はここでは読まない**(`+ IOBufferDuration` を別途足すと二重計上に
-/// なる)——このバッファの長さは [`compute_timestamps`] がレンダーコールバックの
-/// **実測フレーム数**(`in_number_frames`)から求めており、RemoteIO が実際に渡してくる
-/// フレーム数は採用された `IOBufferDuration` をそのまま反映する(cpal 0.18.1 のように
-/// 起動時に1度だけ `AVAudioSession.IOBufferDuration()` をキャッシュするより、実測の方が
-/// ルート変化後のバッファ長変化にも自然に追従できる)。
+/// **バッファ長の項(`IOBufferDuration`)はここでは読まない**——そちらは
+/// [`query_ios_io_buffer_duration_ns`] が別に持つ(モジュール doc「バッファ長の項の
+/// 出し方」参照。実測フレーム数〔`in_number_frames`〕は使わない)。
 ///
 /// `AVAudioSession` の呼び出しは NSError を返さない単純なゲッタ(`ios_session.rs` が
 /// 同じ前提で呼んでいる)なので、失敗しうる分岐は無い——異常値のケア(負・NaN・無限大)は
@@ -605,36 +625,64 @@ fn query_ios_output_latency_ns() -> u64 {
     seconds_to_ns(seconds)
 }
 
-/// 補正項(`device_extra_latency_ns`)を [`query_ios_output_latency_ns`] で読み直し、
-/// 書き込んだうえで、変化をログへ出す——ルート変化(`ios_impl::Watcher`)・曲の再生予約
-/// (`AppleBackend::refresh_output_latency`)・動かし直し(`UnitControl::play`)・
-/// 作り直し(`UnitControl::rebuild`)の4箇所が共有する実体(モジュール doc「タイムスタンプの
-/// 扱い」参照)。
+/// `AVAudioSession.IOBufferDuration()`(秒)を ns 化して返す——iOS/tvOS の
+/// 「バッファ長の項」の出し方そのもの(モジュール doc「バッファ長の項の出し方」参照)。
+/// [`query_ios_output_latency_ns`] と**全く同じ呼び出し元・同じタイミング**
+/// (`AppleBackend::open`・[`refresh_ios_output_latency`] の4箇所)で読む——
+/// 片方だけ読み直して世代の整合が崩れることを避けるため、常にこの2関数を
+/// セットで呼ぶ([`refresh_ios_output_latency`] 参照)。
+///
+/// `AVAudioSession` の呼び出しは NSError を返さない単純なゲッタなので、失敗しうる
+/// 分岐は無い——異常値のケアは [`seconds_to_ns`] が担う。実セッションが要るため
+/// 単体テスト対象外。
+#[cfg(any(target_os = "ios", target_os = "tvos"))]
+fn query_ios_io_buffer_duration_ns() -> u64 {
+    // SAFETY: `AVAudioSession::sharedInstance()` はプロセス唯一の共有インスタンスを返す
+    // だけの呼び出しで、`IOBufferDuration()` は NSError を返さない単純なゲッタ。
+    let seconds = unsafe { objc2_avf_audio::AVAudioSession::sharedInstance().IOBufferDuration() };
+    seconds_to_ns(seconds)
+}
+
+/// 補正項(`device_extra_latency_ns`)を [`query_ios_output_latency_ns`] で、
+/// バッファ長の項(`io_buffer_duration_ns`)を [`query_ios_io_buffer_duration_ns`] で
+/// それぞれ読み直して書き込み、両方の変化をログへ出す——ルート変化
+/// (`ios_impl::Watcher`)・曲の再生予約(`AppleBackend::refresh_output_latency`)・
+/// 動かし直し(`UnitControl::play`)・作り直し(`UnitControl::rebuild`)の4箇所が
+/// 共有する実体(モジュール doc「タイムスタンプの扱い」参照)。常に両方を同じタイミングで
+/// 読み直す——片方だけ読み直すと、音声スレッドの世代判定(`render_proc` の
+/// `last_device_extra_latency_ns`/`last_io_buffer_duration_ns`)がどちらの値を
+/// 基準に世代を進めたか追いづらくなるため。
 ///
 /// `reason` はどの経路からの読み直しかをログに残すための短い文言(例:
-/// `"music schedule"`)。`IOBufferDuration` はタイムスタンプの計算には使わない
-/// ([`query_ios_output_latency_ns`] の doc「二重計上」参照)——ここでは実機ログからの
-/// 診断用に読むだけ。
+/// `"music schedule"`)。
 ///
 /// **呼び出し元はゲームスレッド・通知ハンドラ・復帰ワーカーといった非リアルタイムスレッド
 /// であること**(`mw_log!` はアロケーションとロックを伴う。音声スレッドから呼んでは
 /// ならない)。
 #[cfg(any(target_os = "ios", target_os = "tvos"))]
-fn refresh_ios_output_latency(device_extra_latency_ns: &AtomicU64, sample_rate: u32, reason: &str) {
-    let previous_ns = device_extra_latency_ns.load(Ordering::Relaxed);
-    let new_ns = query_ios_output_latency_ns();
-    device_extra_latency_ns.store(new_ns, Ordering::Relaxed);
-    // SAFETY: `AVAudioSession::sharedInstance()` はプロセス唯一の共有インスタンスを返す
-    // だけの呼び出しで、`IOBufferDuration()` は NSError を返さない単純なゲッタ
-    // (`query_ios_output_latency_ns` と同じ前提)。
-    let io_buffer_ms =
-        unsafe { objc2_avf_audio::AVAudioSession::sharedInstance().IOBufferDuration() } * 1000.0;
+fn refresh_ios_output_latency(
+    device_extra_latency_ns: &AtomicU64,
+    io_buffer_duration_ns: &AtomicU64,
+    sample_rate: u32,
+    reason: &str,
+) {
+    let previous_latency_ns = device_extra_latency_ns.load(Ordering::Relaxed);
+    let new_latency_ns = query_ios_output_latency_ns();
+    device_extra_latency_ns.store(new_latency_ns, Ordering::Relaxed);
+
+    let previous_buffer_ns = io_buffer_duration_ns.load(Ordering::Relaxed);
+    let new_buffer_ns = query_ios_io_buffer_duration_ns();
+    io_buffer_duration_ns.store(new_buffer_ns, Ordering::Relaxed);
+
     crate::mw_log!(
         "[mw-backend] (native/apple ios) output latency correction refreshed ({reason}): \
-         {:.3} ms -> {:.3} ms (io_buffer={:.3} ms, sample_rate={sample_rate} Hz)",
-        previous_ns as f64 / 1_000_000.0,
-        new_ns as f64 / 1_000_000.0,
-        io_buffer_ms,
+         output_latency {:.3} ms -> {:.3} ms, io_buffer_duration (used as the buffer-length \
+         term for the predicted output time, not in_number_frames) {:.3} ms -> {:.3} ms \
+         (sample_rate={sample_rate} Hz)",
+        previous_latency_ns as f64 / 1_000_000.0,
+        new_latency_ns as f64 / 1_000_000.0,
+        previous_buffer_ns as f64 / 1_000_000.0,
+        new_buffer_ns as f64 / 1_000_000.0,
     );
 }
 
@@ -675,6 +723,19 @@ struct CallbackContext {
     /// `device_extra_latency_ns` は `open()` 時に1度書いたあと固定なので、この値と
     /// 毎回一致し続け、世代は一度も進まない(4-1 の既知の差分は変えない)。
     last_device_extra_latency_ns: u64,
+    /// バッファ長の項(ns)。[`AppleBackend::io_buffer_duration_ns`] と同じ `Arc` を
+    /// 指す——macOS では誰も書かず常に 0 のまま(macOS は `render_proc` がこの値を
+    /// 読まず、このコールバックの実測フレーム数から毎回計算する。モジュール doc
+    /// 「バッファ長の項の出し方」参照)。iOS/tvOS は `open()` が
+    /// `query_ios_io_buffer_duration_ns` で初期化し、[`refresh_ios_output_latency`]
+    /// (ルート変化・曲の再生予約・動かし直し・作り直しの4箇所、
+    /// `device_extra_latency_ns` と全く同じタイミング)が書き直す。
+    io_buffer_duration_ns: Arc<AtomicU64>,
+    /// `render_proc` が直前までに観測していた `io_buffer_duration_ns` の値。
+    /// **音声スレッド専用**(`last_device_extra_latency_ns` と同じ理由・同じ扱い)。
+    /// 変化を検知したら同様に世代を進める——macOS はこの値が常に 0 のまま変わらないので
+    /// 実質的に no-op(`last_device_extra_latency_ns` の doc と同じ事情)。
+    last_io_buffer_duration_ns: u64,
     /// 音楽クロックの発行ハンドル(`Mixer::music_clock_handle` と同じ `Arc` を指す)。
     /// `render_proc` が補正項の変化を検知したときに [`MusicClockPublisher::
     /// bump_generation`] を呼ぶためだけに使う——`renderer.render()` 自身が内部で
@@ -765,33 +826,48 @@ unsafe extern "C" fn render_proc(
             .unwrap_or(0);
 
         let device_extra_latency_ns = context.device_extra_latency_ns.load(Ordering::Relaxed);
+        let io_buffer_duration_ns = context.io_buffer_duration_ns.load(Ordering::Relaxed);
         let restart_epoch = context.restart_epoch.load(Ordering::Relaxed);
         if device_extra_latency_ns != context.last_device_extra_latency_ns
+            || io_buffer_duration_ns != context.last_io_buffer_duration_ns
             || restart_epoch != context.last_restart_epoch
         {
-            // 補正項が変わった(iOS/tvOS: `IosOutputLatencyWatcher` が別スレッドで
-            // ルート変化を検知し、書き換えた)。新しい相関点(このすぐ下の
-            // `compute_timestamps`)が確定する前に世代を進める——`MusicClockPublisher::
-            // bump_generation` のドキュメント「新しい相関点が確定する前に世代を進める」と
-            // 同じ順序(`Mixer::render` 内部が discontinuity を処理する順序とも揃える)。
-            // 閾値は設けていない: この値は `IosOutputLatencyWatcher` が実際にルート変化を
-            // 検知して読み直した結果だけが書き込む(毎コールバック揺れる値ではない)ため、
-            // 変化がどれだけ小さくても、それを同じ世代のまま跨いで外挿すると
-            // `MusicClockSnapshot` の契約違反になる(`CallbackContext::
-            // last_device_extra_latency_ns` のドキュメント参照)。
+            // 補正項・バッファ長の項が変わった(iOS/tvOS: `IosOutputLatencyWatcher`・
+            // `refresh_ios_output_latency` が別スレッドで読み直し、書き換えた)。
+            // 新しい相関点(このすぐ下の `compute_timestamps`)が確定する前に世代を
+            // 進める——`MusicClockPublisher::bump_generation` のドキュメント「新しい
+            // 相関点が確定する前に世代を進める」と同じ順序(`Mixer::render` 内部が
+            // discontinuity を処理する順序とも揃える)。
+            // 閾値は設けていない: どちらの値も `IosOutputLatencyWatcher` /
+            // `refresh_ios_output_latency` が実際に読み直した結果だけが書き込む
+            // (毎コールバック揺れる値ではない)ため、変化がどれだけ小さくても、それを
+            // 同じ世代のまま跨いで外挿すると `MusicClockSnapshot` の契約違反になる
+            // (`CallbackContext::last_device_extra_latency_ns`/
+            // `last_io_buffer_duration_ns` のドキュメント参照)。
             // 出力を動かし直した・作り直した(`restart_epoch`)ときも同じ扱い——止まって
-            // いた間のぶん相関点が飛ぶ(`CallbackContext::last_restart_epoch`)。両方が同時に
+            // いた間のぶん相関点が飛ぶ(`CallbackContext::last_restart_epoch`)。3つが同時に
             // 変わっていても世代は1回だけ進める。
             context.music_clock.bump_generation();
             context.last_device_extra_latency_ns = device_extra_latency_ns;
+            context.last_io_buffer_duration_ns = io_buffer_duration_ns;
             context.last_restart_epoch = restart_epoch;
         }
+
+        // バッファ長の項: macOS はこのコールバックの実測フレーム数から毎回求める
+        // (変更無し)。iOS/tvOS は直前に読んだ `io_buffer_duration_ns`(`AVAudioSession.
+        // IOBufferDuration()` 由来)を使う——`in_number_frames` は使わない(モジュール doc
+        // 「バッファ長の項の出し方」参照。Control Center 表示中の出力停止からの復帰後、
+        // `in_number_frames` が希望値より大きい値のまま戻らないことがあり、実測値を
+        // 使うと予測出力時刻が実際の出力より恒久的に遅れるため)。
+        #[cfg(target_os = "macos")]
+        let buffer_duration_ns = extra_latency_frames_to_ns(in_number_frames, context.sample_rate);
+        #[cfg(any(target_os = "ios", target_os = "tvos"))]
+        let buffer_duration_ns = io_buffer_duration_ns;
 
         let (buffer_start_host_time_ns, output_latency_ns) = compute_timestamps(
             callback_host_time_ns,
             device_extra_latency_ns,
-            in_number_frames,
-            context.sample_rate,
+            buffer_duration_ns,
         );
         context
             .output_latency_ns
@@ -961,6 +1037,10 @@ struct UnitControl {
     /// (`refresh_ios_output_latency`)。
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     device_extra_latency_ns: Arc<AtomicU64>,
+    /// バッファ長の項。`device_extra_latency_ns` と同じタイミングで
+    /// `refresh_ios_output_latency` が読み直す(iOS/tvOS のみ)。
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    io_buffer_duration_ns: Arc<AtomicU64>,
     /// 古いユニットを捨ててから context を新しいユニットへ渡すときの同期点
     /// (`AppleBackend::close` と同じ理由)。
     render_completions: Arc<AtomicU64>,
@@ -1006,6 +1086,7 @@ impl RecoverableOutput for UnitControl {
         #[cfg(any(target_os = "ios", target_os = "tvos"))]
         refresh_ios_output_latency(
             &self.device_extra_latency_ns,
+            &self.io_buffer_duration_ns,
             self.sample_rate as u32,
             "resume play()",
         );
@@ -1061,6 +1142,7 @@ impl RecoverableOutput for UnitControl {
         #[cfg(any(target_os = "ios", target_os = "tvos"))]
         refresh_ios_output_latency(
             &self.device_extra_latency_ns,
+            &self.io_buffer_duration_ns,
             self.sample_rate as u32,
             "rebuild",
         );
@@ -1104,9 +1186,19 @@ pub struct AppleBackend {
     /// `None` なら閉じている。
     control: Option<Arc<UnitControl>>,
     callback_frames: Arc<AtomicU32>,
+    /// [`Backend::log_new_output_underruns`] が直近にログへ出した時点の
+    /// [`callback_frames`](Self::callback_frames) の値。変化を検知するためだけの
+    /// ゲームスレッド専用の状態(`logged_output_underrun_count` と同じ配線パターン)。
+    logged_callback_frames: AtomicU32,
     output_latency_ns: Arc<AtomicU64>,
     render_completions: Arc<AtomicU64>,
-    logged_output_latency: AtomicBool,
+    /// [`Backend::log_output_latency_once`] が直近にログへ出した時点の
+    /// [`restart_epoch`](Self::restart_epoch) の値。`u64::MAX` は「まだ1度も
+    /// ログしていない」を表す初期値(通常の `restart_epoch` がこの値に達することは
+    /// 実運用上無いため、特殊値として安全に使える)。動かし直し・作り直しで
+    /// `restart_epoch` が進むたびにこの値と食い違うようになるので、`measured output
+    /// latency` のログを世代ごとに1回だけ再び出せる(開いた直後の1回限りではなく)。
+    logged_output_latency_epoch: AtomicU64,
     sample_rate: u32,
     output_underrun_count: Arc<AtomicU64>,
     last_output_underrun_host_time_ns: Arc<AtomicU64>,
@@ -1119,6 +1211,12 @@ pub struct AppleBackend {
     /// 群と同じく `AppleBackend::new()` で1度だけ生成し、`open()`/`close()` を跨いで
     /// 再利用する。
     device_extra_latency_ns: Arc<AtomicU64>,
+    /// バッファ長の項(ns)。[`CallbackContext::io_buffer_duration_ns`] と同じ `Arc`。
+    /// macOS では誰も書かず常に 0(`render_proc` がこの値を読まないため、モジュール doc
+    /// 「バッファ長の項の出し方」参照)。iOS/tvOS は `open()` で初期化し、
+    /// `device_extra_latency_ns` と全く同じ読み直しタイミングで
+    /// `refresh_ios_output_latency` が書き直す。
+    io_buffer_duration_ns: Arc<AtomicU64>,
     /// iOS/tvOS: ルート変化のたびに `device_extra_latency_ns` を更新するウォッチャ。
     /// macOS では常に `Some` だが中身は no-op(構築・破棄のコストも無い)。
     /// `open()`/`close()` と1対1(`cpal_backend::CpalBackend::ios_interruption` と同じ配線)。
@@ -1151,15 +1249,17 @@ impl AppleBackend {
         Self {
             control: None,
             callback_frames: Arc::new(AtomicU32::new(0)),
+            logged_callback_frames: AtomicU32::new(0),
             output_latency_ns: Arc::new(AtomicU64::new(0)),
             render_completions: Arc::new(AtomicU64::new(0)),
-            logged_output_latency: AtomicBool::new(false),
+            logged_output_latency_epoch: AtomicU64::new(u64::MAX),
             sample_rate: 0,
             output_underrun_count: Arc::new(AtomicU64::new(0)),
             last_output_underrun_host_time_ns: Arc::new(AtomicU64::new(0)),
             consecutive_output_underrun_count: Arc::new(AtomicU32::new(0)),
             logged_output_underrun_count: AtomicU64::new(0),
             device_extra_latency_ns: Arc::new(AtomicU64::new(0)),
+            io_buffer_duration_ns: Arc::new(AtomicU64::new(0)),
             ios_output_latency_watcher: None,
             restart_epoch: Arc::new(AtomicU64::new(0)),
             ios_interruption: None,
@@ -1220,6 +1320,10 @@ impl Backend for AppleBackend {
             // `query_device_extra_latency_frames` のドキュメント参照)——いったん 0 で置き、
             // 確定した直後に `context_ptr` 経由で書き直す(下記)。
             last_device_extra_latency_ns: 0,
+            // バッファ長の項も同じ事情——いったん 0 で置き、`device_extra_latency_ns` と
+            // 同じタイミングで確定させて `context_ptr` 経由で書き直す(下記)。
+            io_buffer_duration_ns: Arc::clone(&self.io_buffer_duration_ns),
+            last_io_buffer_duration_ns: 0,
             music_clock,
             restart_epoch: Arc::clone(&self.restart_epoch),
             // 開いた時点の値を基準にする(これと違う値を見たら世代を進める)。
@@ -1289,6 +1393,20 @@ impl Backend for AppleBackend {
             (*context_ptr).last_device_extra_latency_ns = device_extra_latency_ns;
         }
 
+        // バッファ長の項も同じ手順(モジュール doc「バッファ長の項の出し方」参照)。
+        // macOS は常に 0(`render_proc` がこの値を読まないので、どちらでも実害は無いが
+        // 「macOS は今のまま」を明示するため 0 固定にしてある)。
+        #[cfg(target_os = "macos")]
+        let io_buffer_duration_ns: u64 = 0;
+        #[cfg(any(target_os = "ios", target_os = "tvos"))]
+        let io_buffer_duration_ns = query_ios_io_buffer_duration_ns();
+        self.io_buffer_duration_ns
+            .store(io_buffer_duration_ns, Ordering::Relaxed);
+        // SAFETY: 同上(`last_device_extra_latency_ns` の直前の SAFETY コメントと同じ前提)。
+        unsafe {
+            (*context_ptr).last_io_buffer_duration_ns = io_buffer_duration_ns;
+        }
+
         // レビュー【低】の修正: ルート変化監視(iOS/tvOS)は `AudioOutputUnitStart` より
         // **前**に組み立てる——レンダーコールバックが実際に動き出す前に監視を始めることで、
         // 「Start した直後、監視がまだ無い間にルート変化が来て取り逃す」窓を塞ぐ
@@ -1296,6 +1414,7 @@ impl Backend for AppleBackend {
         // `close()` は依然これを一番最初に止める(逆順で対称)。
         self.ios_output_latency_watcher = Some(IosOutputLatencyWatcher::new(
             Arc::clone(&self.device_extra_latency_ns),
+            Arc::clone(&self.io_buffer_duration_ns),
             sample_rate as u32,
         ));
 
@@ -1335,6 +1454,7 @@ impl Backend for AppleBackend {
             sample_rate,
             restart_epoch: Arc::clone(&self.restart_epoch),
             device_extra_latency_ns: Arc::clone(&self.device_extra_latency_ns),
+            io_buffer_duration_ns: Arc::clone(&self.io_buffer_duration_ns),
             render_completions: Arc::clone(&self.render_completions),
         });
 
@@ -1394,9 +1514,11 @@ impl Backend for AppleBackend {
 
                 self.sample_rate = 0;
                 self.callback_frames.store(0, Ordering::Relaxed);
+                self.logged_callback_frames.store(0, Ordering::Relaxed);
                 self.render_completions.store(0, Ordering::Relaxed);
                 self.output_latency_ns.store(0, Ordering::Relaxed);
-                self.logged_output_latency.store(false, Ordering::Relaxed);
+                self.logged_output_latency_epoch
+                    .store(u64::MAX, Ordering::Relaxed);
                 self.output_underrun_count.store(0, Ordering::Relaxed);
                 self.last_output_underrun_host_time_ns
                     .store(0, Ordering::Relaxed);
@@ -1405,6 +1527,7 @@ impl Backend for AppleBackend {
                 self.logged_output_underrun_count
                     .store(0, Ordering::Relaxed);
                 self.device_extra_latency_ns.store(0, Ordering::Relaxed);
+                self.io_buffer_duration_ns.store(0, Ordering::Relaxed);
                 Ok(())
             }
             _ => Err(BackendError::NotOpen),
@@ -1432,6 +1555,7 @@ impl Backend for AppleBackend {
         if self.control.is_some() {
             refresh_ios_output_latency(
                 &self.device_extra_latency_ns,
+                &self.io_buffer_duration_ns,
                 self.sample_rate,
                 "music schedule",
             );
@@ -1443,37 +1567,65 @@ impl Backend for AppleBackend {
     }
 
     fn log_output_latency_once(&self) {
-        if self.logged_output_latency.load(Ordering::Relaxed) {
-            return;
-        }
         let latency_ns = self.output_latency_ns();
         if latency_ns == 0 {
             return;
         }
-        self.logged_output_latency.store(true, Ordering::Relaxed);
+        // 世代(`restart_epoch`)ごとに1回だけログを出す——`u64::MAX`(初期値)は
+        // 「まだ1度も出していない」を表すので、開いた直後の最初の呼び出しは必ず通る。
+        // 動かし直し・作り直し(`UnitControl::play`/`rebuild`)が `restart_epoch` を
+        // 進めると、その後の呼び出しでまた1回だけ出せるようになる
+        // ([`AppleBackend::logged_output_latency_epoch`] のドキュメント参照)——
+        // Control Center 表示中の出力停止からの復帰のように、補正項・バッファ長の項が
+        // 入れ替わった後の実測値を確かめ直せるようにするため。
+        let current_epoch = self.restart_epoch.load(Ordering::Relaxed);
+        let last_logged_epoch = self.logged_output_latency_epoch.load(Ordering::Relaxed);
+        if last_logged_epoch == current_epoch {
+            return;
+        }
+        self.logged_output_latency_epoch
+            .store(current_epoch, Ordering::Relaxed);
         let latency_ms = latency_ns as f64 / 1_000_000.0;
         crate::mw_log!(
             "[mw-backend] (native/apple) output latency (measured, buffer duration + device \
-             latency + safety offset): {latency_ns} ns = {latency_ms:.3} ms"
+             latency + safety offset): {latency_ns} ns = {latency_ms:.3} ms (restart_epoch={current_epoch})"
         );
     }
 
     fn log_new_output_underruns(&self) {
         let current = self.output_underrun_count.load(Ordering::Relaxed);
         let last_logged = self.logged_output_underrun_count.load(Ordering::Relaxed);
-        if current <= last_logged {
-            return;
+        if current > last_logged {
+            self.logged_output_underrun_count
+                .store(current, Ordering::Relaxed);
+            let new_count = current - last_logged;
+            let consecutive = self
+                .consecutive_output_underrun_count
+                .load(Ordering::Relaxed);
+            crate::mw_log!(
+                "[mw-backend] (native/apple) output underrun suspected: +{new_count} since last \
+                 check (cumulative={current}, consecutive={consecutive})"
+            );
         }
-        self.logged_output_underrun_count
-            .store(current, Ordering::Relaxed);
-        let new_count = current - last_logged;
-        let consecutive = self
-            .consecutive_output_underrun_count
-            .load(Ordering::Relaxed);
-        crate::mw_log!(
-            "[mw-backend] (native/apple) output underrun suspected: +{new_count} since last \
-             check (cumulative={current}, consecutive={consecutive})"
-        );
+
+        // 音声スレッドが書いている実測フレーム数(`in_number_frames`)が前回ログした
+        // ときから変わっていたら、ここ(ゲームスレッド、日和見的な定期呼び出し)から
+        // 1行出す——Control Center 表示中の出力停止からの復帰後、iOS の RemoteIO が
+        // 希望値(通常 240 フレーム)より大きい値のまま戻らないことがあるかどうかを
+        // 実機ログで確かめるための診断用(モジュール doc「バッファ長の項の出し方」参照。
+        // iOS/tvOS はこの値をもう `buffer_start_host_time_ns` の計算には使わないが、
+        // 実測フレーム数そのものの変化は引き続き観測する価値がある)。毎フレームでは
+        // なく、変わったときだけ出す。
+        let current_frames = self.callback_frames.load(Ordering::Relaxed);
+        let last_logged_frames = self
+            .logged_callback_frames
+            .swap(current_frames, Ordering::Relaxed);
+        if current_frames != last_logged_frames {
+            crate::mw_log!(
+                "[mw-backend] (native/apple) callback frame count (in_number_frames) changed: \
+                 {last_logged_frames} -> {current_frames} frames"
+            );
+        }
     }
 
     fn output_underrun_count(&self) -> u64 {
@@ -1511,20 +1663,32 @@ pub(super) struct IosOutputLatencyWatcher {
 }
 
 impl IosOutputLatencyWatcher {
-    /// `device_extra_latency_ns` はルート変化のたびに書き直す先(`AppleBackend`/
-    /// `CallbackContext` と同じ `Arc` を指す)。`sample_rate` はログ出力用
+    /// `device_extra_latency_ns`/`io_buffer_duration_ns` はルート変化のたびに書き直す先
+    /// (`AppleBackend`/`CallbackContext` と同じ `Arc` を指す)。`sample_rate` はログ出力用
     /// (`refresh_ios_output_latency` へそのまま渡す)。
     #[cfg(any(target_os = "ios", target_os = "tvos"))]
-    fn new(device_extra_latency_ns: Arc<AtomicU64>, sample_rate: u32) -> Self {
+    fn new(
+        device_extra_latency_ns: Arc<AtomicU64>,
+        io_buffer_duration_ns: Arc<AtomicU64>,
+        sample_rate: u32,
+    ) -> Self {
         Self {
-            inner: ios_impl::Watcher::new(device_extra_latency_ns, sample_rate),
+            inner: ios_impl::Watcher::new(
+                device_extra_latency_ns,
+                io_buffer_duration_ns,
+                sample_rate,
+            ),
         }
     }
 
     /// macOS では何もしない(常に `Some(IosOutputLatencyWatcher::new(..))` を構築しても
     /// コストが無いようにするための no-op。`ios_interruption::Watcher` と同じ設計)。
     #[cfg(not(any(target_os = "ios", target_os = "tvos")))]
-    fn new(_device_extra_latency_ns: Arc<AtomicU64>, _sample_rate: u32) -> Self {
+    fn new(
+        _device_extra_latency_ns: Arc<AtomicU64>,
+        _io_buffer_duration_ns: Arc<AtomicU64>,
+        _sample_rate: u32,
+    ) -> Self {
         Self {}
     }
 }
@@ -1559,7 +1723,11 @@ mod ios_impl {
     unsafe impl Sync for Watcher {}
 
     impl Watcher {
-        pub(super) fn new(device_extra_latency_ns: Arc<AtomicU64>, sample_rate: u32) -> Self {
+        pub(super) fn new(
+            device_extra_latency_ns: Arc<AtomicU64>,
+            io_buffer_duration_ns: Arc<AtomicU64>,
+            sample_rate: u32,
+        ) -> Self {
             let nc = NSNotificationCenter::defaultCenter();
             let block = RcBlock::new(move |_: NonNull<NSNotification>| {
                 // パニックは Objective-C ランタイムの外へ絶対に漏らさない
@@ -1567,6 +1735,7 @@ mod ios_impl {
                 let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
                     refresh_ios_output_latency(
                         &device_extra_latency_ns,
+                        &io_buffer_duration_ns,
                         sample_rate,
                         "route change",
                     );
@@ -1687,23 +1856,42 @@ mod tests {
     }
 
     #[test]
-    fn compute_timestamps_adds_buffer_duration_and_unit_latency() {
-        // 512 frames @ 48kHz = 10_666_666ns(整数除算で切り捨て)。
-        let (buffer_start, latency) = compute_timestamps(1_000_000_000, 2_000_000, 512, 48_000);
+    fn compute_timestamps_adds_device_latency_and_buffer_duration() {
+        let (buffer_start, latency) = compute_timestamps(1_000_000_000, 2_000_000, 10_666_666);
         assert_eq!(latency, 2_000_000 + 10_666_666);
         assert_eq!(buffer_start, 1_000_000_000 + latency);
     }
 
+    /// 平常時(iOS/tvOS の既定 `IOBufferDuration` = 5ms。macOS でも 240 frames @
+    /// 48kHz のときの実測フレーム数由来のバッファ長の項と同じ値)の校正値を固定化する——
+    /// この関数のリファクタ(`frames`/`sample_rate` を受け取らず、呼び出し側が
+    /// 用意した `buffer_duration_ns` を直接受け取る形へ変更)の前後で、平常時の予測
+    /// 出力時刻が変わっていないことの根拠。
     #[test]
-    fn compute_timestamps_is_zero_latency_when_sample_rate_is_unknown() {
-        let (buffer_start, latency) = compute_timestamps(1_000_000_000, 0, 512, 0);
+    fn compute_timestamps_matches_the_steady_state_calibration_of_5ms_buffer_and_device_latency() {
+        const STEADY_STATE_BUFFER_DURATION_NS: u64 = 5_000_000; // 240 frames @ 48kHz
+        const DEVICE_LATENCY_NS: u64 = 17_900_000; // 基準端末 iPhone 14 の実測出力レイテンシ
+
+        let (buffer_start, latency) = compute_timestamps(
+            1_000_000_000,
+            DEVICE_LATENCY_NS,
+            STEADY_STATE_BUFFER_DURATION_NS,
+        );
+
+        assert_eq!(latency, DEVICE_LATENCY_NS + STEADY_STATE_BUFFER_DURATION_NS);
+        assert_eq!(buffer_start, 1_000_000_000 + latency);
+    }
+
+    #[test]
+    fn compute_timestamps_is_zero_latency_when_both_terms_are_zero() {
+        let (buffer_start, latency) = compute_timestamps(1_000_000_000, 0, 0);
         assert_eq!(latency, 0);
         assert_eq!(buffer_start, 1_000_000_000);
     }
 
     #[test]
     fn compute_timestamps_saturates_instead_of_overflowing() {
-        let (buffer_start, latency) = compute_timestamps(u64::MAX, u64::MAX, 512, 48_000);
+        let (buffer_start, latency) = compute_timestamps(u64::MAX, u64::MAX, 512);
         assert_eq!(buffer_start, u64::MAX);
         assert!(latency > 0);
     }
@@ -1719,12 +1907,12 @@ mod tests {
      {
         let correction_ns = Arc::new(AtomicU64::new(2_000_000)); // 2ms(例: 有線ルート)
         let callback_host_time_ns = 1_000_000_000u64; // 相関点——以下では一切変えない
+        let buffer_duration_ns = 5_000_000u64; // バッファ長の項——以下では一切変えない
 
         let (start_before, latency_before) = compute_timestamps(
             callback_host_time_ns,
             correction_ns.load(Ordering::Relaxed),
-            512,
-            48_000,
+            buffer_duration_ns,
         );
 
         // ルート変化(例: Bluetooth A2DP へ切替)を模倣: `IosOutputLatencyWatcher` が
@@ -1734,8 +1922,7 @@ mod tests {
         let (start_after, latency_after) = compute_timestamps(
             callback_host_time_ns, // 相関点は不変
             correction_ns.load(Ordering::Relaxed),
-            512,
-            48_000,
+            buffer_duration_ns, // バッファ長の項も不変
         );
 
         assert!(
@@ -1749,11 +1936,51 @@ mod tests {
         );
     }
 
+    /// 上と対になる固定化: iOS/tvOS の `IOBufferDuration` 由来のバッファ長の項が
+    /// (補正項とは無関係に)書き換わっても、差分がそのまま `buffer_start_host_time_ns`
+    /// へ反映される——`render_proc` がこの値を `in_number_frames` の代わりに使う
+    /// ようにした変更の核心(モジュール doc「バッファ長の項の出し方」参照)。
+    #[test]
+    fn compute_timestamps_reflects_an_io_buffer_duration_change_independently_of_the_correlation_point()
+     {
+        let callback_host_time_ns = 1_000_000_000u64;
+        let device_extra_latency_ns = 17_900_000u64; // 補正項——以下では一切変えない
+
+        let (start_before, latency_before) =
+            compute_timestamps(callback_host_time_ns, device_extra_latency_ns, 5_000_000);
+
+        // `in_number_frames` が希望値より大きい値のまま戻らなかった状況を模倣:
+        // `IOBufferDuration` ベースのバッファ長の項だけが更新される。
+        let (start_after, latency_after) =
+            compute_timestamps(callback_host_time_ns, device_extra_latency_ns, 42_666_666);
+
+        assert!(
+            latency_after > latency_before,
+            "バッファ長の項の増加がそのまま反映されるはず"
+        );
+        assert_eq!(
+            start_after - start_before,
+            latency_after - latency_before,
+            "相関点・補正項は変えず、バッファ長の項の差分だけが buffer_start_host_time_ns に \
+             反映されるはず"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn extra_latency_frames_to_ns_converts_using_the_sample_rate() {
         // 48 frames @ 48kHz = 1ms。
         assert_eq!(extra_latency_frames_to_ns(48, 48_000), 1_000_000);
+    }
+
+    /// macOS のバッファ長の項(`render_proc` がこの関数で毎コールバック求める)の
+    /// 平常時の値を固定化する——240 frames @ 48kHz は iOS/tvOS の既定
+    /// `IOBufferDuration`(5ms)と同じ値になる(`compute_timestamps_matches_the_steady_
+    /// state_calibration_of_5ms_buffer_and_device_latency` と対になる macOS 側の根拠)。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn extra_latency_frames_to_ns_matches_the_steady_state_240_frames_at_48khz() {
+        assert_eq!(extra_latency_frames_to_ns(240, 48_000), 5_000_000);
     }
 
     #[cfg(target_os = "macos")]
@@ -1815,6 +2042,75 @@ mod tests {
         assert!(matches!(backend.close(), Err(BackendError::NotOpen)));
     }
 
+    /// ハードウェア不要: `log_output_latency_once` は `restart_epoch` が進むたびに
+    /// もう一度ログを出せる状態に戻る(「一度ログを出した」ことを示す
+    /// `logged_output_latency_epoch` が、再び出していい現在の `restart_epoch` と
+    /// 一致しなくなるため)。実際に `mw_log!` が出力したことまでは検査できないが、
+    /// この状態遷移が「一度だけ」から「世代ごとに一度」へ変わったことを固定化する。
+    #[test]
+    fn log_output_latency_once_can_log_again_after_the_restart_epoch_advances() {
+        let backend = AppleBackend::new();
+        backend
+            .output_latency_ns
+            .store(23_000_000, Ordering::Relaxed);
+
+        // 初回はまだ出していない(`u64::MAX` のまま)ので必ず出し、現在の epoch(0)を
+        // 記録する。
+        assert_eq!(
+            backend.logged_output_latency_epoch.load(Ordering::Relaxed),
+            u64::MAX
+        );
+        backend.log_output_latency_once();
+        assert_eq!(
+            backend.logged_output_latency_epoch.load(Ordering::Relaxed),
+            0
+        );
+
+        // 同じ epoch のうちに繰り返し呼んでも、記録した epoch は変わらない(=再ログしない)。
+        backend.log_output_latency_once();
+        assert_eq!(
+            backend.logged_output_latency_epoch.load(Ordering::Relaxed),
+            0
+        );
+
+        // 動かし直し・作り直し(`UnitControl::play`/`rebuild`)を模して epoch を進める。
+        backend.restart_epoch.fetch_add(1, Ordering::Relaxed);
+        backend.log_output_latency_once();
+        assert_eq!(
+            backend.logged_output_latency_epoch.load(Ordering::Relaxed),
+            1,
+            "restart_epoch が進んだのにもう一度ログを出す状態へ遷移していない"
+        );
+    }
+
+    /// ハードウェア不要: `log_new_output_underruns` は、音声スレッドが書いている
+    /// `callback_frames`(実測フレーム数)が前回ログしたときから変わったときだけ
+    /// `logged_callback_frames` を更新する——Control Center 表示中の出力停止からの
+    /// 復帰後、`in_number_frames` が希望値より大きい値のまま戻らないことがあるかを
+    /// 実機ログで確かめるための診断(モジュール doc「バッファ長の項の出し方」参照)。
+    #[test]
+    fn log_new_output_underruns_tracks_callback_frames_changes() {
+        let backend = AppleBackend::new();
+        assert_eq!(backend.logged_callback_frames.load(Ordering::Relaxed), 0);
+
+        backend.callback_frames.store(240, Ordering::Relaxed);
+        backend.log_new_output_underruns();
+        assert_eq!(backend.logged_callback_frames.load(Ordering::Relaxed), 240);
+
+        // 変わっていなければ、記録値も変わらない。
+        backend.log_new_output_underruns();
+        assert_eq!(backend.logged_callback_frames.load(Ordering::Relaxed), 240);
+
+        // ウォッチドッグ復帰後に `in_number_frames` が戻らなかった状況を模倣。
+        backend.callback_frames.store(2048, Ordering::Relaxed);
+        backend.log_new_output_underruns();
+        assert_eq!(
+            backend.logged_callback_frames.load(Ordering::Relaxed),
+            2048,
+            "callback_frames の変化を検知できていない"
+        );
+    }
+
     /// 実デバイスを開いて数百 ms 鳴らす(無音)。CI・ヘッドレス環境では実行しない。
     /// `cargo test --features backend-native -- --ignored` で手動実行する。
     #[test]
@@ -1849,6 +2145,8 @@ mod tests {
             sample_rate,
             device_extra_latency_ns: Arc::new(AtomicU64::new(0)),
             last_device_extra_latency_ns: 0,
+            io_buffer_duration_ns: Arc::new(AtomicU64::new(0)),
+            last_io_buffer_duration_ns: 0,
             music_clock,
             restart_epoch: Arc::new(AtomicU64::new(0)),
             last_restart_epoch: 0,
@@ -2044,11 +2342,39 @@ mod tests {
         drop(unsafe { Box::from_raw(context_ptr) });
     }
 
-    /// 上のテストと対になる固定化: 補正項が**変わらない**限り、世代は進まないはず
-    /// (`AppleBackend::open` が最初のコールバックより前に `last_device_extra_latency_ns`
-    /// を実際の初期値で埋めておく修正の固定化——ここを 0 のまま放置すると、ルート変化が
-    /// 一度も起きていない macOS/通常運用でも最初のコールバックで無意味な世代の繰り上げが
-    /// 起きてしまう)。複数回のコールバックをまたいでも成り立つことを確認する。
+    /// 上と対になる固定化: バッファ長の項(`io_buffer_duration_ns`。iOS/tvOS の
+    /// `AVAudioSession.IOBufferDuration()` 由来)が書き換わったときも、補正項と同じく
+    /// 世代が進むこと(モジュール doc「バッファ長の項の出し方」参照)。
+    #[test]
+    fn render_proc_bumps_music_clock_generation_when_the_io_buffer_duration_changes() {
+        let context_ptr = test_callback_context(48_000);
+
+        let generation_before = render_once_and_read_generation(context_ptr);
+
+        // ルート変化を模す: `IosOutputLatencyWatcher`/`refresh_ios_output_latency` が
+        // `device_extra_latency_ns` と同じタイミングで書き換える想定の再現。
+        unsafe {
+            (*context_ptr)
+                .io_buffer_duration_ns
+                .store(2_000_000, Ordering::Relaxed) // 2ms(例: IOBufferDuration の変化)
+        };
+
+        let generation_after = render_once_and_read_generation(context_ptr);
+
+        assert_ne!(
+            generation_before, generation_after,
+            "バッファ長の項が変わったのに世代が進んでいない(MusicClockSnapshot の契約違反)"
+        );
+
+        drop(unsafe { Box::from_raw(context_ptr) });
+    }
+
+    /// 上の2テストと対になる固定化: 補正項・バッファ長の項が**どちらも変わらない**限り、
+    /// 世代は進まないはず(`AppleBackend::open` が最初のコールバックより前に
+    /// `last_device_extra_latency_ns`/`last_io_buffer_duration_ns` を実際の初期値で
+    /// 埋めておく修正の固定化——ここを 0 のまま放置すると、ルート変化が一度も起きていない
+    /// macOS/通常運用でも最初のコールバックで無意味な世代の繰り上げが起きてしまう)。
+    /// 複数回のコールバックをまたいでも成り立つことを確認する。
     #[test]
     fn render_proc_does_not_bump_music_clock_generation_when_the_latency_correction_is_unchanged() {
         let context_ptr = test_callback_context(48_000);
@@ -2059,6 +2385,10 @@ mod tests {
                 .device_extra_latency_ns
                 .store(0, Ordering::Relaxed);
             (*context_ptr).last_device_extra_latency_ns = 0;
+            (*context_ptr)
+                .io_buffer_duration_ns
+                .store(0, Ordering::Relaxed);
+            (*context_ptr).last_io_buffer_duration_ns = 0;
         }
 
         let mut buffer = [0.0f32; 8]; // 4 frames * 2ch
@@ -2149,7 +2479,8 @@ mod tests {
         drop(unsafe { Box::from_raw(context_ptr) });
     }
 
-    /// 動かし直しと補正項の変化が同じコールバックで見えても、世代は1つだけ進む。
+    /// 動かし直し・補正項・バッファ長の項の変化が同じコールバックで見えても、世代は
+    /// 1つだけ進む。
     #[test]
     fn render_proc_bumps_music_clock_generation_once_when_restart_and_correction_change_together() {
         let context_ptr = test_callback_context(48_000);
@@ -2160,6 +2491,9 @@ mod tests {
             (*context_ptr)
                 .device_extra_latency_ns
                 .store(80_000_000, Ordering::Relaxed);
+            (*context_ptr)
+                .io_buffer_duration_ns
+                .store(2_000_000, Ordering::Relaxed);
         }
 
         assert_eq!(render_once_and_read_generation(context_ptr), before + 1);
@@ -2177,6 +2511,7 @@ mod tests {
             sample_rate: 48_000.0,
             restart_epoch: Arc::clone(&restart_epoch),
             device_extra_latency_ns: Arc::new(AtomicU64::new(0)),
+            io_buffer_duration_ns: Arc::new(AtomicU64::new(0)),
             render_completions: Arc::new(AtomicU64::new(0)),
         };
 
