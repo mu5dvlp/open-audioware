@@ -89,6 +89,11 @@ jobs:
       - name: make cargo-machete
         run: make cargo-machete
 
+      # 第三者ライセンスの一覧(THIRD-PARTY-LICENSES.md / .txt)が依存の今の状態と一致するか。
+      # 依存を足したのに一覧を作り直し忘れると、利用側のライセンス表示が欠ける。
+      - name: make third-party-licenses-check
+        run: make third-party-licenses-check
+
       # 🔴 **`cargo test` の置き換え**(Codecov 導入)。
       # `cargo llvm-cov` は「テストを走らせたうえで計測する」ので、これ1本で
       # 従来の `cargo test --workspace` と同じ検証になる。
