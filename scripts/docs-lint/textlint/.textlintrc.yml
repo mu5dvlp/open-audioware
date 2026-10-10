@@ -1,0 +1,69 @@
+# textlint の規則設定(版は package.json で固定)。
+#
+# 方針: markdownlint と同じく、既定で入っている規則をいったん全部有効にして
+# ワークスペースの docs(COMMON.md / CLAUDE.md / AGENTS.md / README.md / docs/**/*.md)に
+# 当て、件数と実物を見て判断した(2026-10-10)。
+#
+# - preset-ja-spacing(全角半角のスペースの入れ方)は、6種類の規則すべてが
+#   数百〜数千件という規模で引っかかった(ja-space-between-half-and-full-width 6055件 /
+#   ja-space-around-code 5901件 など)。この文書群はそもそもその書き方で揃えていないので、
+#   件数が多すぎて直せないもの = 好みの問題として丸ごと無効にする。
+# - preset-ja-technical-writing は「文の長さ」「である/ですます の混在」「助詞の連続」
+#   「全角文字の連続」「!/? の使用」など、件数が3桁〜4桁に達する規則が大半で、同じ理由で無効。
+#   「かぎ括弧の対応が取れていない」(no-unmatched-pair・14件)は実物を見ると
+#   全て誤検知だった —— この文書群は丸括弧や「」で囲んだ説明を複数行にわたって書く
+#   書き方をしており、1文の途中で改行するたびに閉じ括弧が「無い」と誤判定される。
+# - 残りは件数が少なく、実際に文章の誤りを直す価値があるものだけを個別に有効にした
+#   (詳細は下のコメント)。
+
+rules:
+  preset-ja-spacing: false
+
+  # preset-ja-technical-writing は丸ごと無効にせず、"〜を行う" のような冗長表現の検出
+  # (ja-no-redundant-expression)だけを個別に有効にする。現状8件、すべて実物を確認して
+  # "〜する" へ言い換えても意味が変わらないことを確かめたうえでワークスペースの docs 側は直した。
+  preset-ja-technical-writing:
+    ja-no-redundant-expression: true
+    # 以下は件数が多すぎる・誤検知が確認できたために無効にしたもの(記録として明示する)。
+    sentence-length: false # 871件: 1文が長い日本語の書き方が全体の前提
+    no-doubled-joshi: false # 325件: 助詞の連続。多すぎて直せない
+    ja-no-mixed-period: false # 108件: 文体の混在。好みの問題
+    no-mix-dearu-desumasu: false # 95件: 文体の混在。好みの問題
+    max-kanji-continuous-len: false # 30件: 好みの問題
+    no-exclamation-question-mark: false # 26件: 好みの問題
+    no-unmatched-pair: false # 14件: 複数行にわたる括弧書きをすべて誤検知
+    ja-no-weak-phrase: false # 5件: 【仮】の値など、意図した言い切らない表現を誤検知する
+    max-ten: false # 4件: 好みの問題
+    arabic-kanji-numbers: false # 2件: 好みの問題(漢数字 ⇔ 算用数字)
+    max-comma: false # 2件: 好みの問題
+    no-doubled-conjunction: false # 2件: 法務テンプレの定型句 "全部または一部" 等を誤検知
+    ja-no-successive-word: false # 1件: "△" を2回使った表(記号の繰り返し)を誤検知
+    no-doubled-conjunctive-particle-ga: false # 1件: 「が」の主語の格助詞を誤って数える
+
+  # preset-japanese(ら抜き・二重否定・変な文字種 等。件数が少ない/0件のものだけ個別に有効化)。
+  # 現状いずれも0件だが、将来の事故を防ぐために有効にしておく
+  # (0件なので有効化によるワークスペース側の書き換えは発生していない)。
+  preset-japanese:
+    # ら抜き言葉(例: 「食べれる」→「食べられる」)
+    no-dropping-the-ra: true
+    # 二重否定(読みにくい/誤読しやすい)
+    no-double-negative-ja: true
+    # 本来の漢字ではない康熙部首が混入している(コピペ事故で起きる文字種の誤り)
+    no-kangxi-radicals: true
+    # Unicode の正規化形式が NFD(濁点が分離した文字)になっている(表示が環境依存で崩れる)
+    no-nfd: true
+    # ゼロ幅スペースの混入(コピペ事故。見た目では分からない)
+    no-zero-width-spaces: true
+    # 同じ接続詞が連続して使われている/逆接の「が」が1文に2回以上使われている:
+    # 実物(「または」の法務テンプレの定型句 "全部または一部" / 「が」が主語の
+    # 格助詞と逆接の接続助詞を両方含む1文)を見るとどちらも誤検知だったため無効にする。
+    no-doubled-conjunction: false
+    no-doubled-conjunctive-particle-ga: false
+    # 残りは preset-ja-technical-writing と同じ実装を共有しており、同じ理由で無効。
+    no-doubled-joshi: false
+    sentence-length: false
+    max-ten: false
+    no-mix-dearu-desumasu: false
+
+  # 半角カタカナの使用(全角のはずが半角で紛れ込む入力ミスを検出)。現状0件。
+  no-hankaku-kana: true

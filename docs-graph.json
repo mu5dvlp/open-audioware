@@ -1,0 +1,100 @@
+{
+  "exclude": [
+    "target",
+    "unity-sample/Library",
+    "unity-sample/Build",
+    "unity-sample/Logs",
+    "unity-sample/UserSettings",
+    "unity-sample/.utmp",
+    "fuzz/target",
+    "fuzz/artifacts",
+    "tools/csharp-abi-check/obj",
+    "tools/csharp-abi-check/bin"
+  ],
+  "cycle_ignore_sources": [
+    "COMMON.md",
+    "docs/history.md",
+    "docs/spec/README.md"
+  ],
+  "forbidden": [
+    {
+      "name": "no-common-to-readme",
+      "from": "*COMMON.md",
+      "to": "README.md",
+      "reason": "README はユーザー専用の入口。AI 向けの文書(COMMON.md)からは参照しない(2026-10-10 ユーザー決定)"
+    },
+    {
+      "name": "no-claude-to-readme",
+      "from": "*CLAUDE.md",
+      "to": "README.md",
+      "reason": "README はユーザー専用の入口。AI 向けの文書(CLAUDE.md)からは参照しない(2026-10-10 ユーザー決定)"
+    },
+    {
+      "name": "no-agents-to-readme",
+      "from": "*AGENTS.md",
+      "to": "README.md",
+      "reason": "README はユーザー専用の入口。AI 向けの文書(AGENTS.md)からは参照しない(2026-10-10 ユーザー決定)"
+    },
+    {
+      "name": "no-docs-to-readme",
+      "from": "docs/**",
+      "to": "README.md",
+      "reason": "README はユーザー専用の入口。AI 向けの文書(docs/ 以下)からは参照しない(2026-10-10 ユーザー決定)"
+    },
+    {
+      "name": "no-readme-to-claude",
+      "from": "README.md",
+      "to": "*CLAUDE.md",
+      "reason": "README → COMMON / docs 以外は張らない(2026-10-10 ユーザー決定)。CLAUDE.md の存在は地の文で触れるだけにする"
+    },
+    {
+      "name": "no-readme-to-agents",
+      "from": "README.md",
+      "to": "*AGENTS.md",
+      "reason": "README → COMMON / docs 以外は張らない(2026-10-10 ユーザー決定)。AGENTS.md の存在は地の文で触れるだけにする"
+    },
+    {
+      "name": "no-claude-to-agents",
+      "from": "*CLAUDE.md",
+      "to": "*AGENTS.md",
+      "reason": "CLAUDE.md(Claude Code 固有)と AGENTS.md(Codex 固有)は互いを読み合わない(2026-10-10 ユーザー決定「綺麗な依存関係に」)"
+    },
+    {
+      "name": "no-agents-to-claude",
+      "from": "*AGENTS.md",
+      "to": "*CLAUDE.md",
+      "reason": "CLAUDE.md(Claude Code 固有)と AGENTS.md(Codex 固有)は互いを読み合わない(2026-10-10 ユーザー決定「綺麗な依存関係に」)"
+    },
+    {
+      "name": "no-common-to-claude",
+      "from": "*COMMON.md",
+      "to": "*CLAUDE.md",
+      "reason": "集約(COMMON.md)はツールに依らない。ツール固有の話は各ツールの入口ファイルにあると文字で書き、リンクはしない(2026-10-10 ユーザー決定)"
+    },
+    {
+      "name": "no-common-to-agents",
+      "from": "*COMMON.md",
+      "to": "*AGENTS.md",
+      "reason": "集約(COMMON.md)はツールに依らない。ツール固有の話は各ツールの入口ファイルにあると文字で書き、リンクはしない(2026-10-10 ユーザー決定)"
+    },
+    {
+      "name": "no-docs-to-claude",
+      "from": "docs/**",
+      "to": "*CLAUDE.md",
+      "reason": "docs/ は集約(COMMON.md)の下にある。ツール固有の入口ファイルへは直接リンクしない(2026-10-10 ユーザー決定)"
+    },
+    {
+      "name": "no-docs-to-agents",
+      "from": "docs/**",
+      "to": "*AGENTS.md",
+      "reason": "docs/ は集約(COMMON.md)の下にある。ツール固有の入口ファイルへは直接リンクしない(2026-10-10 ユーザー決定)"
+    }
+  ],
+  "cycle_allow": [
+    {
+      "files": ["README.md", "CONTRIBUTING.md"],
+      "reason": "README は貢献の案内で CONTRIBUTING へ、CONTRIBUTING は前提として README へ —— 人向けの相互参照で読む順の前提は無い"
+    }
+  ]
+}
+

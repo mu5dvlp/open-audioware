@@ -1,0 +1,12 @@
+{
+  "name": "docs-lint-textlint",
+  "private": true,
+  "description": "textlint 本体とプリセットを版固定で持つための最小構成。make docs-lint から呼ばれる。ワークスペース本体には Node の依存を増やさない。",
+  "devDependencies": {
+    "textlint": "15.8.0",
+    "textlint-rule-preset-ja-technical-writing": "12.0.2",
+    "textlint-rule-preset-ja-spacing": "3.0.3",
+    "textlint-rule-preset-japanese": "10.0.4",
+    "textlint-rule-no-hankaku-kana": "2.0.1"
+  }
+}

@@ -1,0 +1,85 @@
+{
+  "_comment": "open-audioware 向けの docs-lint 規約。ワークスペースの scripts/docs-lint/ からツール(run.py / checks.py)をそのままコピーし、ここだけをこのリポジトリの既存の決まりに合わせて書き換えた。新しい決まりは作らない —— COMMON.md / docs/spec/ に既にある、機械で確かめられるものだけを拾う。",
+
+  "global_exclude_dirs": [
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    ".pytest_cache",
+    "target",
+    "unity-sample/Library",
+    "unity-sample/Build",
+    "unity-sample/Logs",
+    "unity-sample/UserSettings",
+    "unity-sample/.utmp",
+    "fuzz/target",
+    "fuzz/artifacts",
+    "tools/csharp-abi-check/obj",
+    "tools/csharp-abi-check/bin"
+  ],
+
+  "pointer_at_top": [
+    {
+      "_comment": "CLAUDE.md『まず COMMON.md を読むこと』(ルート)。",
+      "file": "CLAUDE.md",
+      "requires_file": "COMMON.md",
+      "must_contain": "COMMON.md",
+      "within_lines": 10
+    },
+    {
+      "_comment": "AGENTS.md『まず COMMON.md を読むこと』(ルート)。",
+      "file": "AGENTS.md",
+      "requires_file": "COMMON.md",
+      "must_contain": "COMMON.md",
+      "within_lines": 10
+    },
+    {
+      "_comment": "crates/mw-core も同じ3枚構成(COMMON.md / CLAUDE.md / AGENTS.md)。",
+      "file": "crates/mw-core/CLAUDE.md",
+      "requires_file": "crates/mw-core/COMMON.md",
+      "must_contain": "COMMON.md",
+      "within_lines": 10
+    },
+    {
+      "file": "crates/mw-core/AGENTS.md",
+      "requires_file": "crates/mw-core/COMMON.md",
+      "must_contain": "COMMON.md",
+      "within_lines": 10
+    },
+    {
+      "file": "crates/mw-backend/CLAUDE.md",
+      "requires_file": "crates/mw-backend/COMMON.md",
+      "must_contain": "COMMON.md",
+      "within_lines": 10
+    },
+    {
+      "file": "crates/mw-backend/AGENTS.md",
+      "requires_file": "crates/mw-backend/COMMON.md",
+      "must_contain": "COMMON.md",
+      "within_lines": 10
+    },
+    {
+      "file": "crates/mw-ffi/CLAUDE.md",
+      "requires_file": "crates/mw-ffi/COMMON.md",
+      "must_contain": "COMMON.md",
+      "within_lines": 10
+    },
+    {
+      "file": "crates/mw-ffi/AGENTS.md",
+      "requires_file": "crates/mw-ffi/COMMON.md",
+      "must_contain": "COMMON.md",
+      "within_lines": 10
+    }
+  ],
+
+  "forbidden_patterns": [
+    {
+      "id": "no-initmd-filename-reference",
+      "_comment": "COMMON.md『旧 init.md から docs/spec/ へ移管した。コードやコメントから参照する際は「初期構築仕様『§n 話題名』」のように書き、特定のファイル名には依存しないこと』。init.md は削除済みの前提なので、ファイル名での参照は確実にリンク切れになる。COMMON.md / docs/spec/ 自身の『旧 init.md』という移管の記録(過去形)は、移管した事実を書くために必要な例外として対象外にする。",
+      "regex": "(?<![\\w/-])init\\.md\\b",
+      "message": "init.md をファイル名で参照しない(移管済みで現存しない前提のため)。「初期構築仕様『§n 話題名』」の形で参照する",
+      "exclude_dirs": ["docs/spec", "COMMON.md"]
+    }
+  ]
+}
