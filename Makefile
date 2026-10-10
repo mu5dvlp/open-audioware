@@ -34,6 +34,14 @@ DOCS_GRAPH := python3 scripts/docs-graph/docs_graph.py
 # 同じ道具をそのままコピーして使っている(設定だけこのリポジトリに合わせた)。
 MARKDOWNLINT_CLI2_VERSION := 0.18.1
 
+# cargo-machete(使っていない依存の検査。make lint / CI)。版はここ1箇所で固定する
+# (gitleaks / semgrep と同じ方針)。
+# ⚠️ **`--with-metadata` は使わない。** crates/mw-ffi の build-dependencies(csbindgen)は
+# build.rs の中でだけ使っており、無印の `cargo machete` は build.rs も走査するため
+# 誤検知しないが、`--with-metadata` だと build.rs を見ずに「未使用」と誤検知する
+# (このリポジトリで実測して確認した)。
+CARGO_MACHETE_VERSION := 0.9.2
+
 # README.md はユーザー(人・外部コントリビューター)向けの文書として docs-lint の緑の対象には
 # 含めず、件数だけを別枠で見る(ワークスペース COMMON.md と同じ方針。2026-10-10)。
 # CONTRIBUTING.md / CODE_OF_CONDUCT.md / SECURITY.md も同じく人向けなので同じ扱いにする。
@@ -46,12 +54,14 @@ DOCS_LINT_READMES := README.md CONTRIBUTING.md CODE_OF_CONDUCT.md SECURITY.md
         miri miri-all miri-toolchain \
         fuzz-toolchain fuzz-build fuzz-corpus fuzz-run fuzz-seeds \
         tsan \
-        docs-check docs-lint docs-lint-md docs-lint-text docs-lint-rules docs-lint-readme-report
+        docs-check docs-lint docs-lint-md docs-lint-text docs-lint-rules docs-lint-readme-report \
+        cargo-machete
 
 help:
 	@echo "open-audioware — make ターゲット"
 	@echo "  make setup          - ツールチェーン・ターゲット・cargo-ndk 等の導入確認"
-	@echo "  make lint           - fmt --check + clippy -D warnings + cargo-deny + 第三者表記の鮮度検査 + C# ラッパのコンパイル + docs-check + docs-lint"
+	@echo "  make lint           - fmt --check + clippy -D warnings + cargo-deny + cargo-machete + 第三者表記の鮮度検査 + C# ラッパのコンパイル + docs-check + docs-lint"
+	@echo "  make cargo-machete  - 使っていない依存の検査(版は固定。導入済みでなければ導入する)"
 	@echo "  make csharp-check   - unity/Runtime/MwNative.cs を Unity 無しでコンパイル(P3-8)"
 	@echo "  make docs-check     - docs を docs-graph で検査(リンク切れ・外へのリンク・循環・禁止の向き)"
 	@echo "  make docs-lint      - docs の整形 + 日本語の書き方 + 独自規約(scripts/docs-lint/ 参照)"
@@ -121,10 +131,24 @@ lint:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo deny check
+	@$(MAKE) --no-print-directory cargo-machete
 	@$(MAKE) --no-print-directory third-party-licenses-check
 	@$(MAKE) --no-print-directory csharp-check
 	@$(MAKE) --no-print-directory docs-check
 	@$(MAKE) --no-print-directory docs-lint
+
+# cargo-machete: 使っていない依存の検査。`make lint` / CI から呼ばれる。版は固定
+# (CARGO_MACHETE_VERSION)で、導入済みでなければここで導入する(`make setup` を
+# 経由していなくても `make lint` 単体で動くように。fuzz-toolchain / miri-toolchain と同じ方針)。
+# ⚠️ **`--with-metadata` は付けない**(上の CARGO_MACHETE_VERSION のコメント参照)。
+# ⚠️ **誤検知(feature / cfg で使っているのに拾われる等)は Cargo.toml の
+# `[package.metadata.cargo-machete] ignored` へ理由つきで足すこと** —— ここを素通りさせない。
+cargo-machete:
+	@if [ "$$(cargo machete --version 2>/dev/null)" != "$(CARGO_MACHETE_VERSION)" ]; then \
+		echo "cargo-machete $(CARGO_MACHETE_VERSION) を導入します"; \
+		cargo install --locked cargo-machete@$(CARGO_MACHETE_VERSION); \
+	fi
+	cargo machete --skip-target-dir
 
 # ===========================================================================
 # docs-check / docs-lint(Markdown 文書の検査)
