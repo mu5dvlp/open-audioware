@@ -26,19 +26,36 @@ PLUGINS_ANDROID_DIR   := unity/Runtime/Plugins/Android/libs/$(ANDROID_ABI)
 
 XCFRAMEWORK           := $(PLUGINS_IOS_DIR)/MwFfi.xcframework
 
+# docs-check(scripts/docs-graph/docs_graph.py。Markdown 文書の依存関係の検査)。
+DOCS_GRAPH := python3 scripts/docs-graph/docs_graph.py
+
+# docs-lint(整形 + 日本語の書き方 + このリポジトリ独自の規約。scripts/docs-lint/)。版は固定。
+# ワークスペースの scripts/docs-lint/ / scripts/docs-graph/ / .markdownlint-cli2.jsonc と
+# 同じ道具をそのままコピーして使っている(設定だけこのリポジトリに合わせた)。
+MARKDOWNLINT_CLI2_VERSION := 0.18.1
+
+# README.md はユーザー(人・外部コントリビューター)向けの文書として docs-lint の緑の対象には
+# 含めず、件数だけを別枠で見る(ワークスペース COMMON.md と同じ方針。2026-10-10)。
+# CONTRIBUTING.md / CODE_OF_CONDUCT.md / SECURITY.md も同じく人向けなので同じ扱いにする。
+DOCS_LINT_READMES := README.md CONTRIBUTING.md CODE_OF_CONDUCT.md SECURITY.md
+
 .PHONY: help setup lint format gitleaks semgrep test bench bindgen csharp-check \
         build-macos build-ios build-android \
         package unity-sample-create unity-test \
         measurement-scene measurement-export-ios measurement-build-android clean \
         miri miri-all miri-toolchain \
         fuzz-toolchain fuzz-build fuzz-corpus fuzz-run fuzz-seeds \
-        tsan
+        tsan \
+        docs-check docs-lint docs-lint-md docs-lint-text docs-lint-rules docs-lint-readme-report
 
 help:
 	@echo "open-audioware — make ターゲット"
 	@echo "  make setup          - ツールチェーン・ターゲット・cargo-ndk 等の導入確認"
-	@echo "  make lint           - fmt --check + clippy -D warnings + cargo-deny + 第三者表記の鮮度検査 + C# ラッパのコンパイル"
+	@echo "  make lint           - fmt --check + clippy -D warnings + cargo-deny + 第三者表記の鮮度検査 + C# ラッパのコンパイル + docs-check + docs-lint"
 	@echo "  make csharp-check   - unity/Runtime/MwNative.cs を Unity 無しでコンパイル(P3-8)"
+	@echo "  make docs-check     - docs を docs-graph で検査(リンク切れ・外へのリンク・循環・禁止の向き)"
+	@echo "  make docs-lint      - docs の整形 + 日本語の書き方 + 独自規約(scripts/docs-lint/ 参照)"
+	@echo "  make docs-lint-readme-report - README.md 等(人向け文書)だけを件数確認(直さない。docs-lint には含めない)"
 	@echo "  make third-party-licenses       - THIRD-PARTY-LICENSES.md を再生成(依存を足したら必ず実行)"
 	@echo "  make third-party-licenses-check - 再生成して差分が無いか検査(CI 用)"
 	@echo "  make format         - cargo fmt (自動整形)"
@@ -106,6 +123,57 @@ lint:
 	cargo deny check
 	@$(MAKE) --no-print-directory third-party-licenses-check
 	@$(MAKE) --no-print-directory csharp-check
+	@$(MAKE) --no-print-directory docs-check
+	@$(MAKE) --no-print-directory docs-lint
+
+# ===========================================================================
+# docs-check / docs-lint(Markdown 文書の検査)
+# ===========================================================================
+#
+# ワークスペースの scripts/docs-graph/ と scripts/docs-lint/(+ .markdownlint-cli2.jsonc)を
+# そのままコピーしたもの。コードは変えておらず、このリポジトリに合わせた差は設定ファイル
+# (docs-graph.json / scripts/docs-lint/config.json / .markdownlint-cli2.jsonc /
+# scripts/docs-lint/textlint/.textlintrc.yml)だけに入れてある。
+
+# Markdown 文書どうしのリンクを依存の辺として検査する(dependency-cruiser / import-linter の
+# Markdown 版)。リンク切れ・リポジトリの外へのリンク・循環・禁止の向き(COMMON.md / CLAUDE.md /
+# AGENTS.md / README.md 間の依存関係)を見る。設定は docs-graph.json。
+docs-check:
+	$(DOCS_GRAPH) --root .
+
+# docs-lint(整形 / 日本語の書き方 / このリポジトリ独自の規約。README.md 等〈人向け文書〉は
+# 含まない)。道具と判断の根拠は .markdownlint-cli2.jsonc /
+# scripts/docs-lint/textlint/.textlintrc.yml / scripts/docs-lint/config.json のコメントに
+# 書いてある。
+docs-lint: docs-lint-md docs-lint-text docs-lint-rules
+	@echo "docs-lint: すべて green"
+
+# 1. 整形(markdownlint-cli2。版は上の変数で固定。設定はリポジトリ直下の .markdownlint-cli2.jsonc)。
+docs-lint-md:
+	bunx markdownlint-cli2@$(MARKDOWNLINT_CLI2_VERSION) "COMMON.md" "CLAUDE.md" "AGENTS.md" "docs/**/*.md" "crates/**/*.md" "tools/**/*.md" "scripts/**/*.md"
+
+# 2. 日本語の書き方(textlint。版は scripts/docs-lint/textlint/package.json で固定。
+#    node_modules はそのディレクトリだけに閉じ、リポジトリ本体には Node の依存を増やさない)。
+docs-lint-text:
+	cd scripts/docs-lint/textlint && bun install --frozen-lockfile
+	cd scripts/docs-lint/textlint && ./node_modules/.bin/textlint --config .textlintrc.yml \
+		"$(CURDIR)/COMMON.md" "$(CURDIR)/CLAUDE.md" "$(CURDIR)/AGENTS.md" \
+		"$(CURDIR)/docs/**/*.md" "$(CURDIR)/crates/**/*.md" "$(CURDIR)/tools/**/*.md" "$(CURDIR)/scripts/**/*.md"
+
+# 3. このリポジトリ独自の規約(scripts/docs-lint/run.py + checks.py。Python 標準ライブラリだけ)。
+docs-lint-rules:
+	python3 scripts/docs-lint/run.py .
+
+# README.md / CONTRIBUTING.md / CODE_OF_CONDUCT.md / SECURITY.md(人・外部コントリビューター
+# 向けの文書)だけを対象に、直さず件数を見るための窓(ワークスペース COMMON.md と同じ方針。
+# 2026-10-10。README 側を docs-lint の緑に含めるか・外すか・規則を緩めるかはユーザーが決める)。
+docs-lint-readme-report:
+	@echo "=== markdownlint($(DOCS_LINT_READMES)) ==="
+	-bunx markdownlint-cli2@$(MARKDOWNLINT_CLI2_VERSION) $(DOCS_LINT_READMES)
+	@echo "=== textlint($(DOCS_LINT_READMES)) ==="
+	@cd scripts/docs-lint/textlint && bun install --frozen-lockfile >/dev/null
+	@cd scripts/docs-lint/textlint && ./node_modules/.bin/textlint --config .textlintrc.yml \
+		$(foreach f,$(DOCS_LINT_READMES),"$(CURDIR)/$(f)") || true
 
 # ===========================================================================
 # C# ラッパのコンパイル検査(P3-8)
