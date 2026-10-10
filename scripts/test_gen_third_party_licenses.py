@@ -91,5 +91,74 @@ class LicenseGeneratorTest(unittest.TestCase):
         self.assertNotIn("dev", set().union(*categories.values()))
 
 
+class MarkdownToTextTest(unittest.TestCase):
+    """THIRD-PARTY-LICENSES.txt(プレーンテキスト版)への変換のテスト。"""
+
+    def test_strips_headings_tables_and_inline_markup(self) -> None:
+        markdown = [
+            "# タイトル",
+            "",
+            "本文 **強調** と `コード`。",
+            "",
+            "| クレート | バージョン | ライセンス |",
+            "|---|---|---|",
+            "| `foo` | 1.0.0 | MIT |",
+            "",
+        ]
+        self.assertEqual(
+            generator._markdown_to_text(markdown),
+            [
+                "タイトル",
+                "",
+                "本文 強調 と コード。",
+                "",
+                "foo 1.0.0 — MIT",
+                "",
+            ],
+        )
+
+    def test_strips_bold_that_spans_two_source_lines(self) -> None:
+        # THIRD-PARTY-LICENSES.md の「これは何か」節は、1つの **強調** が
+        # 2つの lines.append 呼び出し(= 2行)にまたがって開いて閉じる。
+        markdown = [
+            "表記義務がある。**この 1 枚をあなたのゲームのライセンス表示画面に載せれば、",
+            "依存ぶんの義務は満たせる**(このファイルをそのまま同梱してよい)。",
+        ]
+        self.assertEqual(
+            generator._markdown_to_text(markdown),
+            [
+                "表記義務がある。この 1 枚をあなたのゲームのライセンス表示画面に載せれば、",
+                "依存ぶんの義務は満たせる(このファイルをそのまま同梱してよい)。",
+            ],
+        )
+
+    def test_keeps_license_body_inside_code_fence_untouched(self) -> None:
+        markdown = [
+            "<details><summary><code>LICENSE</code></summary>",
+            "",
+            "```",
+            "**not bold** `not code`",
+            "```",
+            "",
+            "</details>",
+            "",
+        ]
+        self.assertEqual(
+            generator._markdown_to_text(markdown),
+            [
+                "LICENSE",
+                "",
+                "**not bold** `not code`",
+                "",
+            ],
+        )
+
+    def test_collapses_blank_run_and_trims_trailing_blank_lines(self) -> None:
+        self.assertEqual(
+            generator._collapse_blank_lines(["a", "", "", "", "b", "", "", ""]),
+            ["a", "", "", "b", ""],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

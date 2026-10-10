@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""依存クレートのライセンス表記(THIRD-PARTY-LICENSES.md)を生成する。
+"""依存クレートのライセンス表記(THIRD-PARTY-LICENSES.md / .txt)を生成する。
 
 # なぜ必要か
 
@@ -18,6 +18,12 @@ MPL-2.0 はそれに加えて「ソース入手方法の告知」を求める。
 
 を集めて 1 枚の Markdown にまとめる。ワークスペース自身のクレートは除外する
 (あちらは MIT-0 で、表記義務が無い)。
+
+**同じ内容をプレーンテキスト版(THIRD-PARTY-LICENSES.txt)でも出す**
+—— 利用側(client)は Markdown をそのまま UI Toolkit の Label に流し込むため、
+`#` / `|` / `**` などの記号が素通りで見えてしまう。一次情報は Markdown 側のまま、
+生成済みの Markdown 行を記号抜きの行へ変換して作る(内容は作り直さない。
+`_markdown_to_text` が担う)。
 
 ⚠️ **これは法的助言ではない。** 生成物は「一次情報(各クレートの LICENSE ファイル)を
 機械的に集めたもの」であり、公開前に人間が目を通すこと。
@@ -244,6 +250,133 @@ def _append_license_details(lines: list[str], packages: list[dict]) -> None:
             lines.append("")
 
 
+# ===========================================================================
+# プレーンテキスト版への変換
+# ===========================================================================
+#
+# 利用側(client)は生成物をそのまま UI Toolkit の Label に流し込むため、Markdown の
+# 記号(# / | / ** / `` ` ``)が素通りで見える。ここでは「Markdown を書くコード」を
+# 2重化せず、組み立て済みの Markdown 行(`lines`)を記号抜きのプレーンテキスト行へ
+# 変換することで、内容(クレートの一覧・ライセンス全文)が常に一致するようにする。
+
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+_DETAILS_SUMMARY_RE = re.compile(r"^<details><summary><code>(.*)</code></summary>$")
+_TABLE_SEPARATOR_RE = re.compile(r"^\|(?:-+\|)+$")
+# re.DOTALL: `**この 1 枚を...` が次の `lines.append` 行(= 改行をまたいだ先)で
+# `...満たせる**` と閉じるような、強調が複数行にわたる箇所が実際にある
+# (「表記が要る一覧」節の直前の説明文)。段落をまとめて剥がすため改行も `.` に含める。
+_BOLD_RE = re.compile(r"\*\*(.*?)\*\*", re.DOTALL)
+_INLINE_CODE_RE = re.compile(r"`([^`]*)`", re.DOTALL)
+
+
+def _strip_inline_markup(text: str) -> str:
+    """見出し・段落の中の `**強調**` / `` `コード` `` の記号を剥がす。"""
+    text = _BOLD_RE.sub(r"\1", text)
+    text = _INLINE_CODE_RE.sub(r"\1", text)
+    return text
+
+
+def _table_row_to_text(row: str) -> str:
+    """`| a | b | c |` を「a b — c」のような1行に変える。"""
+    cells = [_strip_inline_markup(cell.strip()) for cell in row.strip("|").split("|")]
+    if len(cells) <= 2:
+        return " ".join(cells)
+    return " ".join(cells[:2]) + " — " + " — ".join(cells[2:])
+
+
+def _collapse_blank_lines(lines: list[str]) -> list[str]:
+    """連続する空行を2行までに詰め、末尾の空行を1行までにする。"""
+    collapsed: list[str] = []
+    blank_run = 0
+    for line in lines:
+        if line == "":
+            blank_run += 1
+            if blank_run <= 2:
+                collapsed.append(line)
+        else:
+            blank_run = 0
+            collapsed.append(line)
+    while len(collapsed) >= 2 and collapsed[-1] == "" and collapsed[-2] == "":
+        collapsed.pop()
+    return collapsed
+
+
+def _markdown_to_text(markdown_lines: list[str]) -> list[str]:
+    """生成済みの Markdown 行を、記号を外したプレーンテキスト行へ変換する。
+
+    見出し(# / ## / ###)は記号を外した行 + 空行に、表は「部品名 版 — ライセンス」の
+    ような1行に、強調(`**`)とインラインコード(`` ` ``)は剥がす。ライセンス本文
+    (```` ``` ```` で囲まれた中)はそのまま通す(本文自体に `*` や `` ` `` が
+    含まれていても誤って剥がさないため)。
+
+    段落(見出し・表・コードフェンスのいずれでもない行)は、連続するぶんを
+    1つにまとめてから強調を剥がす —— 強調が行の区切りをまたぐ箇所があるため
+    (1行ごとに剥がすと、閉じる `**` が無い側がそのまま残ってしまう)。
+    """
+    out: list[str] = []
+    paragraph: list[str] = []
+
+    def flush_paragraph() -> None:
+        if not paragraph:
+            return
+        stripped = _strip_inline_markup("\n".join(paragraph))
+        out.extend(stripped.split("\n"))
+        paragraph.clear()
+
+    i = 0
+    n = len(markdown_lines)
+    in_code_fence = False
+    while i < n:
+        line = markdown_lines[i]
+
+        if line == "```":
+            flush_paragraph()
+            in_code_fence = not in_code_fence
+            i += 1
+            continue
+        if in_code_fence:
+            out.append(line)
+            i += 1
+            continue
+
+        heading = _HEADING_RE.match(line)
+        details = _DETAILS_SUMMARY_RE.match(line)
+
+        if line == "":
+            flush_paragraph()
+            out.append("")
+        elif heading:
+            flush_paragraph()
+            out.append(_strip_inline_markup(heading.group(2)))
+        elif details:
+            flush_paragraph()
+            out.append(details.group(1))
+        elif line == "</details>":
+            flush_paragraph()
+        elif (
+            line.startswith("|")
+            and line.endswith("|")
+            and i + 1 < n
+            and _TABLE_SEPARATOR_RE.match(markdown_lines[i + 1])
+        ):
+            flush_paragraph()
+            i += 2  # ヘッダ行 + 区切り行を読み飛ばす
+            while i < n and markdown_lines[i].startswith("|") and markdown_lines[i].endswith("|"):
+                out.append(_table_row_to_text(markdown_lines[i]))
+                i += 1
+            continue
+        elif line.startswith("> "):
+            paragraph.append(line[2:])
+        elif line.startswith("- "):
+            paragraph.append(line[2:])
+        else:
+            paragraph.append(line)
+        i += 1
+
+    flush_paragraph()
+    return _collapse_blank_lines(out)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -251,7 +384,16 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=Path(__file__).resolve().parent.parent / "THIRD-PARTY-LICENSES.md",
     )
+    parser.add_argument(
+        "--output-text",
+        type=Path,
+        default=None,
+        help="プレーンテキスト版の出力先(省略時は --output の拡張子を .txt に変えたパス)",
+    )
     args = parser.parse_args(argv)
+    output_text = (
+        args.output_text if args.output_text is not None else args.output.with_suffix(".txt")
+    )
 
     metadata = [_run_cargo_metadata(target) for target in _TARGET_TRIPLES]
     package_by_id, categories = _classify_packages(metadata)
@@ -367,8 +509,13 @@ def main(argv: list[str] | None = None) -> int:
     out_path = args.output
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    text_lines = _markdown_to_text(lines)
+    output_text.parent.mkdir(parents=True, exist_ok=True)
+    output_text.write_text("\n".join(text_lines) + "\n", encoding="utf-8")
+
     print(
-        f"generated: {out_path} ({len(needs_attribution)} need attribution, "
+        f"generated: {out_path} / {output_text} ({len(needs_attribution)} need attribution, "
         f"{len(no_notice)} no notice, {len(category_packages['proc-macro'])} proc-macro, "
         f"{len(category_packages['build'])} build-only)"
     )

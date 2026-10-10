@@ -56,7 +56,7 @@ help:
 	@echo "  make docs-check     - docs を docs-graph で検査(リンク切れ・外へのリンク・循環・禁止の向き)"
 	@echo "  make docs-lint      - docs の整形 + 日本語の書き方 + 独自規約(scripts/docs-lint/ 参照)"
 	@echo "  make docs-lint-readme-report - README.md 等(人向け文書)だけを件数確認(直さない。docs-lint には含めない)"
-	@echo "  make third-party-licenses       - THIRD-PARTY-LICENSES.md を再生成(依存を足したら必ず実行)"
+	@echo "  make third-party-licenses       - THIRD-PARTY-LICENSES.md / .txt を再生成(依存を足したら必ず実行)"
 	@echo "  make third-party-licenses-check - 再生成して差分が無いか検査(CI 用)"
 	@echo "  make format         - cargo fmt (自動整形)"
 	@echo "  make test           - cargo test --workspace"
@@ -283,18 +283,29 @@ semgrep: ## 静的解析(Semgrep CE。CI には載せない —— make lint と
 third-party-licenses:
 	@python3 scripts/gen-third-party-licenses.py
 
-# 生成物が古いまま公開されるのを防ぐ。CI(= make lint)から呼ばれる。
+# 生成物(.md / .txt の両方)が古いまま公開されるのを防ぐ。CI(= make lint)から呼ばれる。
 # 🔴 差分が出たら `make third-party-licenses` を実行してコミットすること。
 third-party-licenses-check:
-	@tmp_file=$$(mktemp); \
-	trap 'rm -f "$$tmp_file"' EXIT; \
-	python3 scripts/gen-third-party-licenses.py --output "$$tmp_file" >/dev/null; \
-	cmp -s "$$tmp_file" THIRD-PARTY-LICENSES.md || ( \
+	@tmp_md=$$(mktemp); \
+	tmp_txt=$$(mktemp); \
+	trap 'rm -f "$$tmp_md" "$$tmp_txt"' EXIT; \
+	python3 scripts/gen-third-party-licenses.py --output "$$tmp_md" --output-text "$$tmp_txt" >/dev/null; \
+	ok=0; \
+	cmp -s "$$tmp_md" THIRD-PARTY-LICENSES.md || { \
 		echo "[error] THIRD-PARTY-LICENSES.md が依存構成と食い違っています。"; \
-		echo "        make third-party-licenses を実行してください。"; \
-		diff -u THIRD-PARTY-LICENSES.md "$$tmp_file" || true; \
-		exit 1 )
-	@echo "[ok] THIRD-PARTY-LICENSES.md は最新です"
+		diff -u THIRD-PARTY-LICENSES.md "$$tmp_md" || true; \
+		ok=1; \
+	}; \
+	cmp -s "$$tmp_txt" THIRD-PARTY-LICENSES.txt || { \
+		echo "[error] THIRD-PARTY-LICENSES.txt が依存構成と食い違っています。"; \
+		diff -u THIRD-PARTY-LICENSES.txt "$$tmp_txt" || true; \
+		ok=1; \
+	}; \
+	if [ "$$ok" -ne 0 ]; then \
+		echo "        make third-party-licenses を実行してコミットしてください。"; \
+		exit 1; \
+	fi
+	@echo "[ok] THIRD-PARTY-LICENSES.md / THIRD-PARTY-LICENSES.txt は最新です"
 
 format:
 	cargo fmt --all
