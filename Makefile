@@ -150,7 +150,7 @@ docs-lint: docs-lint-md docs-lint-text docs-lint-rules
 
 # 1. 整形(markdownlint-cli2。版は上の変数で固定。設定はリポジトリ直下の .markdownlint-cli2.jsonc)。
 docs-lint-md:
-	bunx markdownlint-cli2@$(MARKDOWNLINT_CLI2_VERSION) "COMMON.md" "CLAUDE.md" "AGENTS.md" "docs/**/*.md" "crates/**/*.md" "tools/**/*.md" "scripts/**/*.md"
+	bunx markdownlint-cli2@$(MARKDOWNLINT_CLI2_VERSION) "COMMON.md" "CLAUDE.md" "AGENTS.md" "docs/**/*.md" "crates/**/*.md" "tools/**/*.md" "scripts/**/*.md" $(DOCS_LINT_READMES)
 
 # 2. 日本語の書き方(textlint。版は scripts/docs-lint/textlint/package.json で固定。
 #    node_modules はそのディレクトリだけに閉じ、リポジトリ本体には Node の依存を増やさない)。
@@ -158,7 +158,8 @@ docs-lint-text:
 	cd scripts/docs-lint/textlint && bun install --frozen-lockfile
 	cd scripts/docs-lint/textlint && ./node_modules/.bin/textlint --config .textlintrc.yml \
 		"$(CURDIR)/COMMON.md" "$(CURDIR)/CLAUDE.md" "$(CURDIR)/AGENTS.md" \
-		"$(CURDIR)/docs/**/*.md" "$(CURDIR)/crates/**/*.md" "$(CURDIR)/tools/**/*.md" "$(CURDIR)/scripts/**/*.md"
+		"$(CURDIR)/docs/**/*.md" "$(CURDIR)/crates/**/*.md" "$(CURDIR)/tools/**/*.md" "$(CURDIR)/scripts/**/*.md" \
+		$(foreach f,$(DOCS_LINT_READMES),"$(CURDIR)/$(f)")
 
 # 3. このリポジトリ独自の規約(scripts/docs-lint/run.py + checks.py。Python 標準ライブラリだけ)。
 docs-lint-rules:
