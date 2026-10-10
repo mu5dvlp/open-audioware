@@ -1140,6 +1140,12 @@ impl Backend for AppleBackend {
             return Err(BackendError::NoSupportedStreamConfig);
         }
 
+        // 音楽クロック(フレーム数→秒)とランプの換算が実際の出力レートを使うよう、
+        // コールバックが動き出す前に確定させる(仮置きの 48kHz のままだと、出力が
+        // 44.1kHz で開いたときに曲の時刻が実際の音より遅れて進む)。
+        let mut renderer = renderer;
+        renderer.set_sample_rate(sample_rate as u32);
+
         // `renderer` をムーブする**前に**音楽クロックの発行ハンドルを取る
         // (`Mixer::music_clock_handle` のドキュメント「ムーブする前に取ること」どおり。
         // `se_schedule_overflow_counter` を mw-ffi 側が同じ理由で先取りしているのと同じ
