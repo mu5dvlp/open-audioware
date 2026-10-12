@@ -21,7 +21,10 @@
 //! (WASAPI/ALSA 等の他ホストは対象外——本プロジェクトの配布ターゲットは macOS Editor /
 //! iOS / Android のみ、`README.md`。`cargo test --workspace` は CI で Linux 上でも
 //! 走る〔`.github/workflows/ci.yml`〕ため Linux 向けの実装も用意するが、これは
-//! ビルド・オフラインテスト専用であり実デバイスとの相関には使わない)。
+//! ビルド・オフラインテスト専用であり実デバイスとの相関には使わない。Windows も同様に
+//! `cargo check`(ビルド確認のみ)の対象として `QueryPerformanceCounter` /
+//! `QueryPerformanceFrequency` による実装を用意するが、WASAPI の `StreamInstant` との
+//! 相関は検証していない)。
 //!
 //! そのため [`host_time_ns`] は、**両ホストの式をそれぞれのプラットフォームで
 //! 文字通り再現する**。「たまたま近い値になる」のではなく「同じ時計を同じ式で読む」
@@ -123,7 +126,12 @@ pub fn host_time_ns() -> u64 {
 /// `long` とずれ、32bit ターゲットでは呼び出し自体が壊れた値を返す。`core::ffi::c_long`
 /// を使えば、ターゲットごとの実際の `long` 幅(64bit ターゲットは 64bit、32bit
 /// ターゲットは 32bit)にそのまま追従する。
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "windows"
+)))]
 #[repr(C)]
 struct Timespec {
     tv_sec: core::ffi::c_long,
@@ -131,10 +139,20 @@ struct Timespec {
 }
 
 /// `<time.h>` の `CLOCK_MONOTONIC`(Linux / Android どちらも値は 1)。
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "windows"
+)))]
 const CLOCK_MONOTONIC: i32 = 1;
 
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "windows"
+)))]
 unsafe extern "C" {
     /// `std` が既にリンク済みの libc(Linux は glibc、Android は bionic)が提供する
     /// シンボルを直接呼ぶ。**直接依存の `libc` クレートだけを外す**ための自前宣言
@@ -149,7 +167,12 @@ unsafe extern "C" {
 /// `StreamInstant` と同一時計になる(モジュール doc 参照)。Linux(CI 専用。
 /// 実配布対象ではない)でも同じ syscall が使えるため、ここに含めて
 /// `cargo test --workspace` を通す。
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "windows"
+)))]
 pub fn host_time_ns() -> u64 {
     let mut ts = Timespec {
         tv_sec: 0,
@@ -161,6 +184,92 @@ pub fn host_time_ns() -> u64 {
         clock_gettime(CLOCK_MONOTONIC, &mut ts);
     }
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// QPC(`QueryPerformanceCounter`)の raw カウンタ値を freq(Hz)を使って ns へ
+/// 変換する純関数部分(`denom == 0` 相当として `freq == 0` は呼び出し側の失敗時に
+/// raw カウンタをそのまま返す規約——[`ticks_to_ns_with_timebase`] と揃えてある)。
+///
+/// `counter * 1_000_000_000` を先に計算すると桁あふれしうるため、`counter / freq`
+/// を先に割って得た秒数を ns 化し、余り(`counter % freq`、常に `freq` 未満)だけを
+/// ns スケールへ掛ける——余りの項は原理的に `1_000_000_000` を超えない
+/// (`remainder < freq` なので `remainder * 1_000_000_000 / freq < 1_000_000_000`)。
+///
+/// FFI(実際の `QueryPerformanceCounter`/`QueryPerformanceFrequency` 呼び出し)から
+/// 分離してあるので、Windows ターゲット無しでも計算式だけを固定できる
+/// (`cfg(test)` にしているため macOS 上の `cargo test` でも検証できる。下の `tests` 参照)。
+#[cfg(any(target_os = "windows", test))]
+fn qpc_ticks_to_ns_with_frequency(counter: u64, freq: u64) -> u64 {
+    if freq == 0 {
+        return counter;
+    }
+    let secs = counter / freq;
+    let remainder = counter % freq;
+    let ns_from_secs = secs.saturating_mul(1_000_000_000);
+    let ns_from_remainder = (remainder as u128 * 1_000_000_000 / freq as u128) as u64;
+    ns_from_secs.saturating_add(ns_from_remainder)
+}
+
+// `<profileapi.h>` の `QueryPerformanceCounter` / `QueryPerformanceFrequency`
+// (C ABI 互換の自前宣言——新しいクレート(`windows-sys` 等)を足さないための方針、
+// ステップ5 と同じ)。kernel32.dll は Windows の `std` が既にリンク済みのため、
+// 新たな動的リンクは増えない。
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn QueryPerformanceCounter(lpPerformanceCount: *mut i64) -> i32;
+    fn QueryPerformanceFrequency(lpFrequency: *mut i64) -> i32;
+}
+
+/// QPC の周波数(Hz)のキャッシュ。0 は「まだ取得していない」を表す
+/// (`QueryPerformanceFrequency` は Windows XP 以降失敗しない契約だが、仮に失敗しても
+/// 0 のままなら [`qpc_ticks_to_ns_with_frequency`] の `freq == 0` 規約で raw カウンタに
+/// フォールバックする)。
+///
+/// プロセス内で一度取得すれば変わらない値(Windows Vista 以降はブート中変化しないことが
+/// 保証されている)なので1回だけ取ってキャッシュする。音声コールバックスレッド(RT)から
+/// 呼ばれる想定のため `Mutex`/`OnceLock` ではなく `AtomicU64` + `Ordering::Relaxed` の
+/// 読み書きのみにする(ロックを取らない——リアルタイム安全性規約、
+/// `crates/mw-backend/COMMON.md` §5.3 / `underrun.rs` モジュール doc と同じ方針)。
+/// 複数スレッドが同時に初回呼び出しをしても同じ値を書き込むだけなので競合しても安全。
+#[cfg(target_os = "windows")]
+static QPC_FREQUENCY_HZ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(target_os = "windows")]
+fn qpc_frequency_hz() -> u64 {
+    use std::sync::atomic::Ordering;
+    let cached = QPC_FREQUENCY_HZ.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let mut freq: i64 = 0;
+    // SAFETY: `freq` はスタック上の有効な `i64` へのポインタ。
+    // `QueryPerformanceFrequency` はこれへ書き込むだけで他の副作用は無い。
+    unsafe {
+        QueryPerformanceFrequency(&mut freq);
+    }
+    let freq = freq.max(0) as u64;
+    QPC_FREQUENCY_HZ.store(freq, Ordering::Relaxed);
+    freq
+}
+
+/// ホスト単調時刻をナノ秒で返す(Windows)。
+///
+/// `QueryPerformanceCounter` の raw カウンタ値を [`qpc_frequency_hz`] で取得した
+/// 周波数を使って ns へ変換する。WASAPI(cpal の Windows ホスト)は配布対象外
+/// (モジュール doc 参照)——この実装は `cargo check` が通ることの確認用であり、
+/// 実デバイスの `StreamInstant` との相関は検証していない。
+///
+/// リアルタイム安全: アロケーション・ロックを一切行わない(他の枝と同じ方針)。
+#[cfg(target_os = "windows")]
+pub fn host_time_ns() -> u64 {
+    let mut counter: i64 = 0;
+    // SAFETY: `counter` はスタック上の有効な `i64` へのポインタ。
+    // `QueryPerformanceCounter` はこれへ書き込むだけで他の副作用は無い。
+    unsafe {
+        QueryPerformanceCounter(&mut counter);
+    }
+    qpc_ticks_to_ns_with_frequency(counter.max(0) as u64, qpc_frequency_hz())
 }
 
 #[cfg(test)]
@@ -206,5 +315,48 @@ mod tests {
         // u64 の範囲を超える(u64::MAX の2倍)。`as u64` で素直に切り詰めると
         // ラップアラウンドして小さい値になってしまうため、saturating が要る。
         assert_eq!(ticks_to_ns_with_timebase(u64::MAX, 2, 1), u64::MAX);
+    }
+
+    #[test]
+    fn qpc_ticks_to_ns_with_frequency_converts_whole_seconds() {
+        // 典型的な QPC 周波数(10MHz)で 1 秒ぶんのカウンタ値。
+        assert_eq!(
+            qpc_ticks_to_ns_with_frequency(10_000_000, 10_000_000),
+            1_000_000_000
+        );
+        assert_eq!(qpc_ticks_to_ns_with_frequency(0, 10_000_000), 0);
+    }
+
+    #[test]
+    fn qpc_ticks_to_ns_with_frequency_handles_non_exact_division() {
+        // freq=3 は 1_000_000_000 を割り切れない(余りの扱いを確かめる)。
+        assert_eq!(qpc_ticks_to_ns_with_frequency(1, 3), 333_333_333);
+        assert_eq!(qpc_ticks_to_ns_with_frequency(4, 3), 1_333_333_333);
+    }
+
+    #[test]
+    fn qpc_ticks_to_ns_with_frequency_falls_back_to_raw_counter_when_freq_is_zero() {
+        assert_eq!(qpc_ticks_to_ns_with_frequency(12_345, 0), 12_345);
+    }
+
+    #[test]
+    fn qpc_ticks_to_ns_with_frequency_saturates_instead_of_overflowing() {
+        // freq=1 で counter=u64::MAX を変換すると素の計算は u64 の範囲を超える
+        // (u64::MAX 秒分を ns 化すると u64::MAX の約10億倍)。saturating で止める。
+        assert_eq!(qpc_ticks_to_ns_with_frequency(u64::MAX, 1), u64::MAX);
+    }
+
+    #[test]
+    fn qpc_ticks_to_ns_with_frequency_is_monotonically_non_decreasing_as_counter_grows() {
+        let freq = 10_000_000;
+        let mut previous = qpc_ticks_to_ns_with_frequency(0, freq);
+        for counter in (0..10_000_000_000u64).step_by(123_456_789) {
+            let current = qpc_ticks_to_ns_with_frequency(counter, freq);
+            assert!(
+                current >= previous,
+                "counter={counter}, current={current}, previous={previous}"
+            );
+            previous = current;
+        }
     }
 }
