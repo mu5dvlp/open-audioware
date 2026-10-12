@@ -277,7 +277,7 @@ gitleaks: ## 秘密情報がコミットされていないか git 履歴ごと�
 		gitleaks git . --redact --no-banner; \
 	elif command -v docker >/dev/null 2>&1; then \
 		echo "== gitleaks（$(GITLEAKS_IMAGE)） =="; \
-		docker run --rm -v "$(CURDIR):/repo" $(GITLEAKS_IMAGE) git /repo --redact --no-banner; \
+		MSYS_NO_PATHCONV=1 docker run --rm -v "$(CURDIR):/repo" $(GITLEAKS_IMAGE) git /repo --redact --no-banner; \
 	else \
 		echo "[error] gitleaks も docker も見つかりません。どちらかを用意してください。"; \
 		echo "        brew install gitleaks  # Windows は scoop install gitleaks。または Docker Desktop を起動する"; \
@@ -309,7 +309,7 @@ semgrep: ## 静的解析(Semgrep CE。CI には載せない —— make lint と
 		semgrep scan $(SEMGREP_CONFIG) --error --metrics=off .; \
 	elif command -v docker >/dev/null 2>&1; then \
 		echo "== semgrep($(SEMGREP_IMAGE)) =="; \
-		docker run --rm -v "$(CURDIR):/src" -w /src $(SEMGREP_IMAGE) semgrep scan $(SEMGREP_CONFIG) --error --metrics=off .; \
+		MSYS_NO_PATHCONV=1 docker run --rm -v "$(CURDIR):/src" -w /src $(SEMGREP_IMAGE) semgrep scan $(SEMGREP_CONFIG) --error --metrics=off .; \
 	else \
 		echo "[error] semgrep も docker も見つかりません。どちらかを用意してください。"; \
 		echo "        brew install semgrep  # Windows は pip install semgrep(または Docker Desktop を起動する)"; \
