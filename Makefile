@@ -8,9 +8,16 @@
 # --- 設定 -------------------------------------------------------------
 # Unity Editor 本体・同梱 NDK のパス。CI やローカル環境に合わせて上書き可能。
 UNITY_VERSION       ?= 6000.4.1f1
+# Windows(Git Bash / MSYS2。`uname -s` が MINGW* / MSYS* / CYGWIN*)では Unity Hub の既定の置き場所が違う。
+ifneq (,$(filter MINGW% MSYS% CYGWIN%,$(shell uname -s)))
+UNITY_HUB_EDITOR_DIR ?= C:/Program Files/Unity/Hub/Editor/$(UNITY_VERSION)
+UNITY_APP            ?= $(UNITY_HUB_EDITOR_DIR)/Editor/Unity.exe
+ANDROID_NDK_HOME     ?= $(UNITY_HUB_EDITOR_DIR)/Editor/Data/PlaybackEngines/AndroidPlayer/NDK
+else
 UNITY_HUB_EDITOR_DIR ?= /Applications/Unity/Hub/Editor/$(UNITY_VERSION)
 UNITY_APP            ?= $(UNITY_HUB_EDITOR_DIR)/Unity.app/Contents/MacOS/Unity
 ANDROID_NDK_HOME     ?= $(UNITY_HUB_EDITOR_DIR)/PlaybackEngines/AndroidPlayer/NDK
+endif
 export ANDROID_NDK_HOME
 
 # AAudio(Android のローレイテンシ出力 API)は API level 26 以降が必要。
@@ -273,7 +280,7 @@ gitleaks: ## 秘密情報がコミットされていないか git 履歴ごと�
 		docker run --rm -v "$(CURDIR):/repo" $(GITLEAKS_IMAGE) git /repo --redact --no-banner; \
 	else \
 		echo "[error] gitleaks も docker も見つかりません。どちらかを用意してください。"; \
-		echo "        brew install gitleaks  # または Docker Desktop を起動する"; \
+		echo "        brew install gitleaks  # Windows は scoop install gitleaks。または Docker Desktop を起動する"; \
 		exit 1; \
 	fi
 
@@ -305,7 +312,7 @@ semgrep: ## 静的解析(Semgrep CE。CI には載せない —— make lint と
 		docker run --rm -v "$(CURDIR):/src" -w /src $(SEMGREP_IMAGE) semgrep scan $(SEMGREP_CONFIG) --error --metrics=off .; \
 	else \
 		echo "[error] semgrep も docker も見つかりません。どちらかを用意してください。"; \
-		echo "        brew install semgrep  # または Docker Desktop を起動する"; \
+		echo "        brew install semgrep  # Windows は pip install semgrep(または Docker Desktop を起動する)"; \
 		exit 1; \
 	fi
 
