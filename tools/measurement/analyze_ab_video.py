@@ -43,7 +43,7 @@ FLASH_THRESHOLD_RATIO = 0.5  # baseline と peak の間のどこを「明るい�
 
 
 def run(cmd):
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
     if proc.returncode != 0:
         raise RuntimeError(f"command failed: {' '.join(cmd)}\n{proc.stderr[-2000:]}")
     return proc

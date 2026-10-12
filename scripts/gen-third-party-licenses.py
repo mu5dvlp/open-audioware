@@ -77,6 +77,7 @@ def _run_cargo_metadata(target: str) -> dict:
         ],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     )
     return json.loads(out.stdout)
@@ -508,11 +509,11 @@ def main(argv: list[str] | None = None) -> int:
 
     out_path = args.output
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
     text_lines = _markdown_to_text(lines)
     output_text.parent.mkdir(parents=True, exist_ok=True)
-    output_text.write_text("\n".join(text_lines) + "\n", encoding="utf-8")
+    output_text.write_text("\n".join(text_lines) + "\n", encoding="utf-8", newline="\n")
 
     print(
         f"generated: {out_path} / {output_text} ({len(needs_attribution)} need attribution, "
