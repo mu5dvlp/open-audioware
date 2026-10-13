@@ -45,10 +45,13 @@
 //!
 //! - 音声スレッドは MMCSS(`AvSetMmThreadCharacteristicsW("Pro Audio")`)に登録する
 //!   (cpal の WASAPI ホストが `audio_thread_priority` で行うのと同じ目的)。失敗しても続行する。
-//! - デバイスの抜き差し・既定出力の変更の監視(`IMMNotificationClient`)は無い。無効化された
-//!   デバイスへの `GetCurrentPadding` / `GetBuffer` が `AUDCLNT_E_DEVICE_INVALIDATED` を返したときに
-//!   `Event::StreamError { DeviceUnavailable }` を積んでスレッドを終える(`mw-ffi` の内部再オープンに乗る)。
-//!   既定の出力を切り替えただけではストリームは元のデバイスに残る(cpal 版と同じ)。
+//! - デバイスの変化は `IMMNotificationClient`(自前の COM)で監視する: 出力の既定
+//!   (`eRender` の `eConsole` / `eMultimedia`)が別のデバイスへ変わった、使用中のデバイスが
+//!   無効化された・取り除かれた、のどちらかで音声スレッドがループを抜け、
+//!   `Event::StreamError { DeviceUnavailable }` を積む(`mw-ffi` の内部再オープンが新しい既定へ
+//!   開き直す)。通知は任意のスレッドから来るので、コールバックは合図を立てて `SetEvent` するだけ。
+//!   通知が取れなくても、無効化されたデバイスへの `GetCurrentPadding` / `GetBuffer` が
+//!   `AUDCLNT_E_DEVICE_INVALIDATED` を返したときの同じエラーは残っている。
 //! - 低遅延の `IAudioClient3`(共有モードの最小周期)は使わない。
 //!
 //! 純粋ロジック(形式の組み立て・遅延計算・エラー分類・vtable の配置)は `target_os` を問わず
@@ -146,6 +149,20 @@ pub const IID_IMM_DEVICE_ENUMERATOR: Guid = Guid {
     data2: 0x9614,
     data3: 0x4F35,
     data4: [0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6],
+};
+/// `IID_IUnknown`。
+pub const IID_IUNKNOWN: Guid = Guid {
+    data1: 0x0000_0000,
+    data2: 0x0000,
+    data3: 0x0000,
+    data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
+};
+/// `IID_IMMNotificationClient`。
+pub const IID_IMM_NOTIFICATION_CLIENT: Guid = Guid {
+    data1: 0x7991_EEC9,
+    data2: 0x7E89,
+    data3: 0x4D85,
+    data4: [0x83, 0x90, 0x6C, 0x70, 0x3C, 0xEC, 0x60, 0xC0],
 };
 /// `IID_IAudioClient`。
 pub const IID_IAUDIO_CLIENT: Guid = Guid {
@@ -374,8 +391,10 @@ pub struct IMmDeviceEnumeratorVtbl {
     pub get_default_audio_endpoint:
         unsafe extern "system" fn(ThisPtr, i32, i32, *mut ThisPtr) -> Hresult,
     pub get_device: *const c_void,
-    pub register_endpoint_notification_callback: *const c_void,
-    pub unregister_endpoint_notification_callback: *const c_void,
+    pub register_endpoint_notification_callback:
+        unsafe extern "system" fn(ThisPtr, ThisPtr) -> Hresult,
+    pub unregister_endpoint_notification_callback:
+        unsafe extern "system" fn(ThisPtr, ThisPtr) -> Hresult,
 }
 
 /// `IMMDevice` の vtable。
@@ -390,7 +409,7 @@ pub struct IMmDeviceVtbl {
         *mut ThisPtr,
     ) -> Hresult,
     pub open_property_store: *const c_void,
-    pub get_id: *const c_void,
+    pub get_id: unsafe extern "system" fn(ThisPtr, *mut *mut u16) -> Hresult,
     pub get_state: *const c_void,
 }
 
@@ -451,10 +470,104 @@ pub const AUDCLNT_BUFFERFLAGS_SILENT: u32 = 0x2;
 pub const E_RENDER: i32 = 0;
 /// `ERole::eConsole`。
 pub const E_CONSOLE: i32 = 0;
+/// `ERole::eMultimedia`。
+pub const E_MULTIMEDIA: i32 = 1;
+/// `DEVICE_STATE_ACTIVE`(これ以外はデバイスが使えない: 無効・未接続・抜かれた)。
+pub const DEVICE_STATE_ACTIVE: u32 = 0x1;
+/// `E_NOINTERFACE`。
+pub const E_NOINTERFACE: Hresult = 0x8000_4002_u32 as i32;
 /// `CLSCTX_ALL`。
 pub const CLSCTX_ALL: u32 = 0x17;
 /// `COINIT_MULTITHREADED`。
 pub const COINIT_MULTITHREADED: u32 = 0;
+
+/// `PROPERTYKEY`。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PropertyKey {
+    pub fmtid: Guid,
+    pub pid: u32,
+}
+
+/// `IMMNotificationClient` の vtable。実装は自前のオブジェクト(`NotificationClient`)が持つ。
+#[repr(C)]
+pub struct IMmNotificationClientVtbl {
+    pub query_interface:
+        unsafe extern "system" fn(ThisPtr, *const Guid, *mut *mut c_void) -> Hresult,
+    pub add_ref: unsafe extern "system" fn(ThisPtr) -> u32,
+    pub release: unsafe extern "system" fn(ThisPtr) -> u32,
+    pub on_device_state_changed: unsafe extern "system" fn(ThisPtr, *const u16, u32) -> Hresult,
+    pub on_device_added: unsafe extern "system" fn(ThisPtr, *const u16) -> Hresult,
+    pub on_device_removed: unsafe extern "system" fn(ThisPtr, *const u16) -> Hresult,
+    pub on_default_device_changed:
+        unsafe extern "system" fn(ThisPtr, i32, i32, *const u16) -> Hresult,
+    pub on_property_value_changed:
+        unsafe extern "system" fn(ThisPtr, *const u16, PropertyKey) -> Hresult,
+}
+
+/// `IMMNotificationClient` が受ける通知のうち、出力の追従に関わるもの。
+/// デバイス ID は NUL を含まない UTF-16。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceEvent<'a> {
+    /// 既定のデバイスが変わった(`device_id` が `None` なら既定が無くなった)。
+    DefaultChanged {
+        flow: i32,
+        role: i32,
+        device_id: Option<&'a [u16]>,
+    },
+    /// デバイスの状態が変わった(`DEVICE_STATE_*`)。
+    StateChanged { device_id: &'a [u16], state: u32 },
+    /// デバイスが取り除かれた。
+    Removed { device_id: &'a [u16] },
+}
+
+/// 通知を受けたとき、開いているストリームを開き直すべきか。
+///
+/// - 出力(`eRender`)の既定が、`eConsole` か `eMultimedia` で、いま使っているのとは別の
+///   デバイスへ変わった。
+/// - いま使っているデバイスが、使えない状態(無効・未接続・抜かれた)になった・取り除かれた。
+///
+/// それ以外(他のデバイス・入力・`eCommunications`・追加・プロパティ変更)は開き直さない。
+pub fn should_reopen(event: DeviceEvent<'_>, current_id: &[u16]) -> bool {
+    match event {
+        DeviceEvent::DefaultChanged {
+            flow,
+            role,
+            device_id,
+        } => {
+            flow == E_RENDER
+                && (role == E_CONSOLE || role == E_MULTIMEDIA)
+                && device_id.is_some_and(|id| id != current_id)
+        }
+        DeviceEvent::StateChanged { device_id, state } => {
+            device_id == current_id && state != DEVICE_STATE_ACTIVE
+        }
+        DeviceEvent::Removed { device_id } => device_id == current_id,
+    }
+}
+
+/// NUL 終端の UTF-16 文字列を、NUL を除いたスライスとして借りる。
+/// 長さが `MAX_DEVICE_ID_UNITS` を超える(終端が見つからない)ものは `None`。
+///
+/// # Safety
+/// `ptr` は NULL か、少なくとも NUL まで(または `MAX_DEVICE_ID_UNITS` 要素)読める領域を指し、
+/// 戻り値の寿命のあいだ書き換えられないこと。
+pub unsafe fn wide_str_from_ptr<'a>(ptr: *const u16) -> Option<&'a [u16]> {
+    if ptr.is_null() {
+        return None;
+    }
+    for len in 0..MAX_DEVICE_ID_UNITS {
+        // SAFETY: 呼び出し側の保証により、NUL までの各要素は読める。
+        if unsafe { *ptr.add(len) } == 0 {
+            // SAFETY: 先頭から `len` 要素は上で読めることを確かめた。
+            return Some(unsafe { std::slice::from_raw_parts(ptr, len) });
+        }
+    }
+    None
+}
+
+/// デバイス ID の長さの上限(UTF-16 の要素数)。
+pub const MAX_DEVICE_ID_UNITS: usize = 1024;
 
 /// 共有モードの初期化フラグ(イベント駆動 + 形式変換)。
 pub const INIT_STREAM_FLAGS: u32 = AUDCLNT_STREAMFLAGS_EVENTCALLBACK
@@ -632,6 +745,329 @@ struct EventHandle(*mut c_void);
 unsafe impl Send for EventHandle {}
 
 // ============================================================================
+// デバイスの変化の監視(IMMNotificationClient)
+// ============================================================================
+//
+// 既定の出力の切り替え・使用中のデバイスの無効化/取り外しを `IMMNotificationClient` で受け、
+// 音声スレッドへ「開き直す」合図を出す。音声スレッドは合図を見るとループを抜けて
+// `Event::StreamError { DeviceUnavailable }` を積み、`mw-ffi` の内部再オープンが新しい既定へ
+// 開き直す(他のバックエンドが `DeviceUnavailable` で再オープンに乗るのと同じ経路)。
+//
+// 🔴 通知は OS が用意した**任意のスレッド**から来る。コールバックの中ではロックも COM 呼び出しも
+// せず、フラグを立てて音声スレッドのイベントを `SetEvent` するだけにする(音声スレッドは
+// 止めない・待たせない)。
+//
+// 🔴 寿命: オブジェクトは参照カウント付きでヒープに置く。作った時点の参照(1)は
+// `DeviceWatcher` が持ち、`RegisterEndpointNotificationCallback` が OS 側の参照を足す。
+// `DeviceWatcher::drop` は先に `Unregister...` する(戻った後は通知が来ない)→ 自分の参照を
+// 手放す、の順。最後の参照が消えたときにだけ解放する。`DeviceWatcher` は音声スレッドの中で、
+// ストリーム・`wake` ハンドルより先に落とす(コールバックが閉じたハンドルを触らない)。
+
+/// 音声スレッドへの合図。立ったら開き直す。
+#[cfg(target_os = "windows")]
+type DeviceChangedFlag = Arc<AtomicBool>;
+
+/// `IMMNotificationClient` の実体。先頭が vtable ポインタ(COM の ABI)。
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct NotificationClient {
+    vtbl: *const IMmNotificationClientVtbl,
+    refs: AtomicU32,
+    /// 開いているデバイスの ID(NUL なし)。作った後は変えない。
+    current_id: Vec<u16>,
+    changed: DeviceChangedFlag,
+    wake: EventHandle,
+}
+
+#[cfg(target_os = "windows")]
+static NOTIFICATION_VTBL: IMmNotificationClientVtbl = IMmNotificationClientVtbl {
+    query_interface: nc_query_interface,
+    add_ref: nc_add_ref,
+    release: nc_release,
+    on_device_state_changed: nc_on_device_state_changed,
+    on_device_added: nc_on_device_added,
+    on_device_removed: nc_on_device_removed,
+    on_default_device_changed: nc_on_default_device_changed,
+    on_property_value_changed: nc_on_property_value_changed,
+};
+
+#[cfg(target_os = "windows")]
+impl NotificationClient {
+    /// 参照カウント 1 のオブジェクトを作り、所有ポインタを返す。
+    fn new_raw(current_id: Vec<u16>, changed: DeviceChangedFlag, wake: EventHandle) -> *mut Self {
+        Box::into_raw(Box::new(Self {
+            vtbl: &NOTIFICATION_VTBL,
+            refs: AtomicU32::new(1),
+            current_id,
+            changed,
+            wake,
+        }))
+    }
+
+    /// 開き直しの合図を立てて音声スレッドを起こす。ロックも確保もしない。
+    fn raise(&self) {
+        self.changed.store(true, Ordering::Release);
+        // SAFETY: `wake` は音声スレッドを join するまで閉じられず、`DeviceWatcher` は
+        // その前に落ちる(登録解除済みなので、これ以降コールバックは来ない)。
+        unsafe {
+            SetEvent(self.wake.0);
+        }
+    }
+
+    fn handle(&self, event: DeviceEvent<'_>) {
+        if should_reopen(event, &self.current_id) {
+            self.raise();
+        }
+    }
+}
+
+/// COM の境界で panic を外へ出さない(出すと未定義動作)。
+#[cfg(target_os = "windows")]
+fn guard_callback(f: impl FnOnce()) -> Hresult {
+    let _ = panic::catch_unwind(AssertUnwindSafe(f));
+    0
+}
+
+/// `E_POINTER`。
+#[cfg(target_os = "windows")]
+const E_POINTER: Hresult = 0x8000_4003_u32 as i32;
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn nc_query_interface(
+    this: ThisPtr,
+    iid: *const Guid,
+    out: *mut *mut c_void,
+) -> Hresult {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: `out` は非 NULL(上で確認)で、呼び出し側が書き込み可能な領域。
+    unsafe { *out = std::ptr::null_mut() };
+    // SAFETY: `iid` は NULL か、呼び出し側が渡す有効な GUID。
+    let Some(iid) = (unsafe { iid.as_ref() }) else {
+        return E_NOINTERFACE;
+    };
+    if *iid == IID_IUNKNOWN || *iid == IID_IMM_NOTIFICATION_CLIENT {
+        // SAFETY: `this` は `NotificationClient`(参照を持つ者がいる間は生きている)。
+        unsafe {
+            nc_add_ref(this);
+            *out = this;
+        }
+        0
+    } else {
+        E_NOINTERFACE
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn nc_add_ref(this: ThisPtr) -> u32 {
+    // SAFETY: `this` は `NotificationClient` で、呼び出し側が参照を持っている。
+    let client = unsafe { &*this.cast::<NotificationClient>() };
+    client.refs.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn nc_release(this: ThisPtr) -> u32 {
+    // SAFETY: 同上。
+    let client = unsafe { &*this.cast::<NotificationClient>() };
+    let remaining = client.refs.fetch_sub(1, Ordering::Release) - 1;
+    if remaining == 0 {
+        std::sync::atomic::fence(Ordering::Acquire);
+        // SAFETY: 最後の参照が消えた。`new_raw` の `Box::into_raw` と対。以後 `this` は使われない。
+        drop(unsafe { Box::from_raw(this.cast::<NotificationClient>()) });
+    }
+    remaining
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn nc_on_device_state_changed(
+    this: ThisPtr,
+    device_id: *const u16,
+    state: u32,
+) -> Hresult {
+    guard_callback(|| {
+        // SAFETY: OS が渡す NUL 終端の文字列で、コールバックの間は有効。`this` は生きている。
+        let (client, id) = unsafe {
+            (
+                &*this.cast::<NotificationClient>(),
+                wide_str_from_ptr(device_id),
+            )
+        };
+        if let Some(device_id) = id {
+            client.handle(DeviceEvent::StateChanged { device_id, state });
+        }
+    })
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn nc_on_device_added(_this: ThisPtr, _device_id: *const u16) -> Hresult {
+    0
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn nc_on_device_removed(this: ThisPtr, device_id: *const u16) -> Hresult {
+    guard_callback(|| {
+        // SAFETY: `nc_on_device_state_changed` と同じ。
+        let (client, id) = unsafe {
+            (
+                &*this.cast::<NotificationClient>(),
+                wide_str_from_ptr(device_id),
+            )
+        };
+        if let Some(device_id) = id {
+            client.handle(DeviceEvent::Removed { device_id });
+        }
+    })
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn nc_on_default_device_changed(
+    this: ThisPtr,
+    flow: i32,
+    role: i32,
+    device_id: *const u16,
+) -> Hresult {
+    guard_callback(|| {
+        // SAFETY: `nc_on_device_state_changed` と同じ(NULL は「既定が無い」)。
+        let (client, id) = unsafe {
+            (
+                &*this.cast::<NotificationClient>(),
+                wide_str_from_ptr(device_id),
+            )
+        };
+        client.handle(DeviceEvent::DefaultChanged {
+            flow,
+            role,
+            device_id: id,
+        });
+    })
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn nc_on_property_value_changed(
+    _this: ThisPtr,
+    _device_id: *const u16,
+    _key: PropertyKey,
+) -> Hresult {
+    0
+}
+
+/// `IMMDevice::GetId` の結果(NUL なしの UTF-16)。
+#[cfg(target_os = "windows")]
+fn device_id_of(device: &Com<IMmDeviceVtbl>) -> Option<Vec<u16>> {
+    let mut raw: *mut u16 = std::ptr::null_mut();
+    // SAFETY: `device` は有効、出力先はスタック上のポインタ。
+    let hr = unsafe { (device.vtbl().get_id)(device.this(), &mut raw) };
+    if hr < 0 || raw.is_null() {
+        return None;
+    }
+    // SAFETY: 成功した `GetId` は NUL 終端の文字列を返す。コピーしてから `CoTaskMemFree` で解放する。
+    let id = unsafe { wide_str_from_ptr(raw) }.map(<[u16]>::to_vec);
+    // SAFETY: `GetId` が確保した領域を 1 回だけ解放する。
+    unsafe { CoTaskMemFree(raw.cast()) };
+    id
+}
+
+/// 現在の既定のレンダーエンドポイント(`eConsole`)の ID。
+#[cfg(target_os = "windows")]
+fn default_render_id(enumerator: &Com<IMmDeviceEnumeratorVtbl>) -> Option<Vec<u16>> {
+    let mut raw: *mut c_void = std::ptr::null_mut();
+    // SAFETY: `enumerator` は有効、出力先はスタック上のポインタ。
+    let hr = unsafe {
+        (enumerator.vtbl().get_default_audio_endpoint)(
+            enumerator.this(),
+            E_RENDER,
+            E_CONSOLE,
+            &mut raw,
+        )
+    };
+    if hr < 0 {
+        return None;
+    }
+    // SAFETY: 成功した呼び出しは参照を 1 つ所有する `IMMDevice` を返す。
+    let device = unsafe { Com::<IMmDeviceVtbl>::from_raw(raw) }?;
+    device_id_of(&device)
+}
+
+/// `IMMNotificationClient` の登録。`Drop` で解除する。音声スレッド(MTA)で作って落とす。
+#[cfg(target_os = "windows")]
+struct DeviceWatcher {
+    enumerator: Com<IMmDeviceEnumeratorVtbl>,
+    /// 参照を 1 つ所有している(`Drop` で手放す)。
+    client: *mut NotificationClient,
+}
+
+#[cfg(target_os = "windows")]
+impl DeviceWatcher {
+    /// `device_id` のデバイスを開いている間の変化を `changed` で知らせる。
+    /// 開いた後・登録前に既定が変わっていても取りこぼさないよう、登録後に既定を確かめ直す。
+    fn start(
+        device_id: Vec<u16>,
+        changed: DeviceChangedFlag,
+        wake: EventHandle,
+    ) -> Result<Self, Hresult> {
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        // SAFETY: GUID は有効な静的値、出力先はスタック上のポインタ。
+        let hr = unsafe {
+            CoCreateInstance(
+                &CLSID_MM_DEVICE_ENUMERATOR,
+                std::ptr::null_mut(),
+                CLSCTX_ALL,
+                &IID_IMM_DEVICE_ENUMERATOR,
+                &mut raw,
+            )
+        };
+        if hr < 0 {
+            return Err(hr);
+        }
+        // SAFETY: 成功した `CoCreateInstance` は参照を 1 つ所有するインターフェースを返す。
+        let enumerator = unsafe { Com::<IMmDeviceEnumeratorVtbl>::from_raw(raw) }.ok_or(-1)?;
+
+        let client = NotificationClient::new_raw(device_id, changed, wake);
+        // SAFETY: `enumerator` は有効。`client` は参照カウント 1 の有効なオブジェクトで、
+        // 登録は OS 側の参照を足す。
+        let hr = unsafe {
+            (enumerator.vtbl().register_endpoint_notification_callback)(
+                enumerator.this(),
+                client.cast(),
+            )
+        };
+        if hr < 0 {
+            // SAFETY: 登録に失敗したので、持っているのは自分の参照だけ。それを手放す。
+            unsafe { nc_release(client.cast()) };
+            return Err(hr);
+        }
+        let watcher = Self { enumerator, client };
+
+        if let Some(now) = default_render_id(&watcher.enumerator) {
+            // SAFETY: `client` は `watcher` が参照を持っているので生きている。
+            unsafe { &*watcher.client }.handle(DeviceEvent::DefaultChanged {
+                flow: E_RENDER,
+                role: E_CONSOLE,
+                device_id: Some(&now),
+            });
+        }
+        Ok(watcher)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for DeviceWatcher {
+    fn drop(&mut self) {
+        // SAFETY: `enumerator` は有効。解除が戻った後はコールバックが来ない(実行中のものは
+        // 終わるまで待つ)ので、そのあとで自分の参照を手放してよい。解除に失敗しても手放す。
+        unsafe {
+            let unregister = self
+                .enumerator
+                .vtbl()
+                .unregister_endpoint_notification_callback;
+            unregister(self.enumerator.this(), self.client.cast());
+            nc_release(self.client.cast());
+        }
+    }
+}
+
+// ============================================================================
 // ストリーム(音声スレッドが排他的に所有する)
 // ============================================================================
 
@@ -659,6 +1095,8 @@ struct Stream {
     clock: Option<ClockReader>,
     client: Com<IAudioClientVtbl>,
     info: StreamInfo,
+    /// 開いたデバイスの ID(NUL なし。取れなければ空で、その場合は変化を監視しない)。
+    device_id: Vec<u16>,
 }
 
 /// `IAudioClock` と、その周波数(開いたときに 1 回読む)。
@@ -741,6 +1179,7 @@ impl Stream {
         // SAFETY: 成功した呼び出しは参照を 1 つ所有する `IMMDevice` を返す。
         let device =
             unsafe { Com::<IMmDeviceVtbl>::from_raw(raw) }.ok_or(BackendError::NoOutputDevice)?;
+        let device_id = device_id_of(&device).unwrap_or_default();
 
         let mut raw: *mut c_void = std::ptr::null_mut();
         // SAFETY: `device` は有効。`IID_IAUDIO_CLIENT` を要求しているので結果は `IAudioClient`。
@@ -862,6 +1301,7 @@ impl Stream {
                 mix_sample_rate,
                 mix_channels,
             },
+            device_id,
         })
     }
 
@@ -894,6 +1334,8 @@ struct WorkerContext {
     callback_frames: Arc<AtomicU32>,
     callback_count: Arc<AtomicU64>,
     output_latency_ns: Arc<AtomicU64>,
+    /// 既定の出力・使用中のデバイスの変化の合図(`DeviceWatcher` が立てる)。
+    device_changed: DeviceChangedFlag,
 }
 
 /// 音声スレッドの本体。初期化の結果を `init_tx` で `open` へ返し、成功ならループに入る。
@@ -944,11 +1386,37 @@ fn worker_run(
         let _ = init_tx.send(Err(error));
         return None;
     }
+    // 変化の監視(失敗しても鳴らし続ける。その場合は無効化のエラーだけが頼り)。
+    // ストリームより後に宣言する = ストリームより先に落ちる。
+    let _watcher = if stream.device_id.is_empty() {
+        None
+    } else {
+        match DeviceWatcher::start(
+            stream.device_id.clone(),
+            Arc::clone(&context.device_changed),
+            context.wake,
+        ) {
+            Ok(watcher) => Some(watcher),
+            Err(hr) => {
+                crate::mw_log!(
+                    "[mw-backend] (native/windows) device change notifications are unavailable: {}",
+                    hresult_hex(hr)
+                );
+                None
+            }
+        }
+    };
     if init_tx.send(Ok(stream.info)).is_err() {
         // `open` が待ちきれずに諦めた。
         return None;
     }
-    worker_loop(context, &stream)
+    let reason = worker_loop(context, &stream);
+    if context.device_changed.load(Ordering::Acquire) {
+        crate::mw_log!(
+            "[mw-backend] (native/windows) the default output or the device in use changed; asking for a reopen"
+        );
+    }
+    reason
 }
 
 /// ループ本体。止められたら `None`、復旧不能のエラーで抜けたら `Some(理由)`。
@@ -966,6 +1434,9 @@ fn worker_loop(context: &mut WorkerContext, stream: &Stream) -> Option<StreamErr
         let waited = unsafe { WaitForSingleObject(context.wake.0, WAIT_TIMEOUT_MS) };
         if context.stop.load(Ordering::Acquire) {
             return None;
+        }
+        if context.device_changed.load(Ordering::Acquire) {
+            return Some(StreamErrorReason::DeviceUnavailable);
         }
         match waited {
             WAIT_OBJECT_0 => {}
@@ -1157,6 +1628,7 @@ impl Backend for WindowsBackend {
             callback_frames: Arc::clone(&self.callback_frames),
             callback_count: Arc::clone(&self.callback_count),
             output_latency_ns: Arc::clone(&self.output_latency_ns),
+            device_changed: Arc::new(AtomicBool::new(false)),
         };
         let (init_tx, init_rx) = sync_channel(1);
         let thread = std::thread::Builder::new()
@@ -1504,10 +1976,508 @@ mod tests {
         assert_eq!(classify_stream_error(-1), StreamErrorReason::Backend);
     }
 
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().collect()
+    }
+
+    const CURRENT: &str = "{0.0.0.00000000}.{aaaa}";
+    const OTHER: &str = "{0.0.0.00000000}.{bbbb}";
+
+    #[test]
+    fn the_default_render_device_changing_to_another_one_reopens_for_console_and_multimedia() {
+        let other = wide(OTHER);
+        for role in [E_CONSOLE, E_MULTIMEDIA] {
+            assert!(should_reopen(
+                DeviceEvent::DefaultChanged {
+                    flow: E_RENDER,
+                    role,
+                    device_id: Some(&other),
+                },
+                &wide(CURRENT),
+            ));
+        }
+    }
+
+    #[test]
+    fn default_changes_that_do_not_move_the_output_are_ignored() {
+        let current = wide(CURRENT);
+        let other = wide(OTHER);
+        // 通信用の役割・入力・同じデバイスへの変更・既定が無くなった通知。
+        for (flow, role, id) in [
+            (E_RENDER, 2, Some(&other)),
+            (1, E_CONSOLE, Some(&other)),
+            (E_RENDER, E_CONSOLE, Some(&current)),
+            (E_RENDER, E_CONSOLE, None),
+        ] {
+            assert!(
+                !should_reopen(
+                    DeviceEvent::DefaultChanged {
+                        flow,
+                        role,
+                        device_id: id.map(Vec::as_slice),
+                    },
+                    &current,
+                ),
+                "flow={flow} role={role} id={id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_device_in_use_becoming_unusable_or_removed_reopens() {
+        let current = wide(CURRENT);
+        // DEVICE_STATE_DISABLED / NOTPRESENT / UNPLUGGED
+        for state in [0x2, 0x4, 0x8] {
+            assert!(should_reopen(
+                DeviceEvent::StateChanged {
+                    device_id: &current,
+                    state,
+                },
+                &current,
+            ));
+        }
+        assert!(should_reopen(
+            DeviceEvent::Removed {
+                device_id: &current
+            },
+            &current,
+        ));
+    }
+
+    #[test]
+    fn state_changes_of_other_devices_or_to_active_are_ignored() {
+        let current = wide(CURRENT);
+        let other = wide(OTHER);
+        assert!(!should_reopen(
+            DeviceEvent::StateChanged {
+                device_id: &other,
+                state: 0x2,
+            },
+            &current,
+        ));
+        assert!(!should_reopen(
+            DeviceEvent::StateChanged {
+                device_id: &current,
+                state: DEVICE_STATE_ACTIVE,
+            },
+            &current,
+        ));
+        assert!(!should_reopen(
+            DeviceEvent::Removed { device_id: &other },
+            &current,
+        ));
+    }
+
+    #[test]
+    fn wide_str_from_ptr_stops_at_the_terminator() {
+        // SAFETY (この関数内の全呼び出し): 指す先は NUL 終端、または上限まで読める配列。
+        assert_eq!(unsafe { wide_str_from_ptr(std::ptr::null()) }, None);
+        let text = [0x61u16, 0x62, 0, 0x63];
+        assert_eq!(
+            unsafe { wide_str_from_ptr(text.as_ptr()) },
+            Some(&[0x61u16, 0x62][..])
+        );
+        let empty = [0u16];
+        assert_eq!(unsafe { wide_str_from_ptr(empty.as_ptr()) }, Some(&[][..]));
+        let unterminated = vec![1u16; MAX_DEVICE_ID_UNITS];
+        assert_eq!(unsafe { wide_str_from_ptr(unterminated.as_ptr()) }, None);
+    }
+
+    #[test]
+    fn notification_client_vtable_follows_the_com_interface_order() {
+        assert_eq!(
+            offset_of!(IMmNotificationClientVtbl, on_device_state_changed),
+            3 * PTR
+        );
+        assert_eq!(
+            offset_of!(IMmNotificationClientVtbl, on_device_added),
+            4 * PTR
+        );
+        assert_eq!(
+            offset_of!(IMmNotificationClientVtbl, on_device_removed),
+            5 * PTR
+        );
+        assert_eq!(
+            offset_of!(IMmNotificationClientVtbl, on_default_device_changed),
+            6 * PTR
+        );
+        assert_eq!(
+            offset_of!(IMmNotificationClientVtbl, on_property_value_changed),
+            7 * PTR
+        );
+        assert_eq!(size_of::<IMmNotificationClientVtbl>(), 8 * PTR);
+        assert_eq!(
+            offset_of!(
+                IMmDeviceEnumeratorVtbl,
+                register_endpoint_notification_callback
+            ),
+            6 * PTR
+        );
+        assert_eq!(
+            offset_of!(
+                IMmDeviceEnumeratorVtbl,
+                unregister_endpoint_notification_callback
+            ),
+            7 * PTR
+        );
+        assert_eq!(offset_of!(IMmDeviceVtbl, get_id), 5 * PTR);
+        assert_eq!(size_of::<PropertyKey>(), 20);
+    }
+
     #[cfg(target_os = "windows")]
     mod device {
         use super::super::*;
         use mw_core::{BusId, Command, SoundData};
+
+        use std::sync::atomic::AtomicBool;
+
+        fn wide(s: &str) -> Vec<u16> {
+            s.encode_utf16().collect()
+        }
+
+        /// 実体を作り、vtable 経由で呼ぶ(OS が呼ぶのと同じ経路)。
+        struct Fixture {
+            client: *mut NotificationClient,
+            flag: Arc<AtomicBool>,
+            wake: EventHandle,
+        }
+
+        impl Fixture {
+            fn new(current: &str) -> Self {
+                // SAFETY: 属性・名前は NULL、自動リセット・非シグナル。
+                let wake =
+                    EventHandle(unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) });
+                assert!(!wake.0.is_null());
+                let flag = Arc::new(AtomicBool::new(false));
+                let client = NotificationClient::new_raw(wide(current), Arc::clone(&flag), wake);
+                Self { client, flag, wake }
+            }
+            fn vtbl(&self) -> &IMmNotificationClientVtbl {
+                // SAFETY: `client` は参照を持っている間は有効。
+                unsafe { &*(*self.client).vtbl }
+            }
+            fn this(&self) -> ThisPtr {
+                self.client.cast()
+            }
+            fn signaled(&self) -> bool {
+                // SAFETY: `wake` は有効。0ms で状態だけ見る(自動リセットなので消費する)。
+                unsafe { WaitForSingleObject(self.wake.0, 0) == WAIT_OBJECT_0 }
+            }
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                // SAFETY: テストが最後に持つ参照を手放し、そのあとハンドルを閉じる。
+                unsafe {
+                    (self.vtbl().release)(self.this());
+                    CloseHandle(self.wake.0);
+                }
+            }
+        }
+
+        fn nul_terminated(s: &str) -> Vec<u16> {
+            let mut v = wide(s);
+            v.push(0);
+            v
+        }
+
+        #[test]
+        fn relevant_callbacks_raise_the_flag_and_wake_the_audio_thread() {
+            let nul_a = nul_terminated("dev-a");
+            let nul_b = nul_terminated("dev-b");
+
+            let f = Fixture::new("dev-a");
+            // SAFETY: 引数は NUL 終端の有効な文字列。
+            unsafe {
+                (f.vtbl().on_device_added)(f.this(), nul_b.as_ptr());
+                (f.vtbl().on_device_state_changed)(f.this(), nul_b.as_ptr(), 0x2);
+                (f.vtbl().on_device_state_changed)(f.this(), nul_a.as_ptr(), DEVICE_STATE_ACTIVE);
+                (f.vtbl().on_default_device_changed)(f.this(), E_RENDER, 2, nul_b.as_ptr());
+            }
+            assert!(!f.flag.load(Ordering::Acquire));
+            assert!(!f.signaled());
+
+            // SAFETY: 同上。
+            unsafe {
+                (f.vtbl().on_default_device_changed)(f.this(), E_RENDER, E_CONSOLE, nul_b.as_ptr());
+            }
+            assert!(f.flag.load(Ordering::Acquire));
+            assert!(f.signaled());
+
+            f.flag.store(false, Ordering::Release);
+            // SAFETY: 同上。
+            unsafe {
+                (f.vtbl().on_device_state_changed)(f.this(), nul_a.as_ptr(), 0x4);
+            }
+            assert!(f.flag.load(Ordering::Acquire));
+            f.flag.store(false, Ordering::Release);
+            // SAFETY: 同上。
+            unsafe {
+                (f.vtbl().on_device_removed)(f.this(), nul_a.as_ptr());
+            }
+            assert!(f.flag.load(Ordering::Acquire));
+        }
+
+        #[test]
+        fn callbacks_with_a_null_id_do_not_crash_or_raise() {
+            let f = Fixture::new("dev-a");
+            // SAFETY: NULL は OS が「既定が無い」ときに渡しうる値。
+            unsafe {
+                (f.vtbl().on_default_device_changed)(
+                    f.this(),
+                    E_RENDER,
+                    E_CONSOLE,
+                    std::ptr::null(),
+                );
+                (f.vtbl().on_device_removed)(f.this(), std::ptr::null());
+                (f.vtbl().on_device_state_changed)(f.this(), std::ptr::null(), 0x2);
+            }
+            assert!(!f.flag.load(Ordering::Acquire));
+        }
+
+        #[test]
+        fn query_interface_answers_only_iunknown_and_the_notification_client() {
+            let f = Fixture::new("dev-a");
+            let mut out: *mut c_void = std::ptr::null_mut();
+            // SAFETY: 出力先はスタック上のポインタ、IID は有効な静的値。
+            unsafe {
+                assert_eq!(
+                    (f.vtbl().query_interface)(f.this(), &IID_IMM_NOTIFICATION_CLIENT, &mut out),
+                    0
+                );
+                assert_eq!(out, f.this());
+                // QueryInterface が足した参照を手放す。
+                assert_eq!((f.vtbl().release)(f.this()), 1);
+                assert_eq!(
+                    (f.vtbl().query_interface)(f.this(), &IID_IUNKNOWN, &mut out),
+                    0
+                );
+                assert_eq!((f.vtbl().release)(f.this()), 1);
+                assert_eq!(
+                    (f.vtbl().query_interface)(f.this(), &IID_IAUDIO_CLIENT, &mut out),
+                    E_NOINTERFACE
+                );
+                assert!(out.is_null());
+            }
+        }
+
+        #[test]
+        fn the_object_is_freed_when_the_last_reference_is_released() {
+            let flag = Arc::new(AtomicBool::new(false));
+            let wake = EventHandle(std::ptr::null_mut());
+            let client = NotificationClient::new_raw(wide("dev-a"), Arc::clone(&flag), wake);
+            assert_eq!(Arc::strong_count(&flag), 2);
+            // SAFETY: `client` は参照 1 の有効なオブジェクト。
+            unsafe {
+                assert_eq!(nc_add_ref(client.cast()), 2);
+                assert_eq!(nc_release(client.cast()), 1);
+                assert_eq!(Arc::strong_count(&flag), 2);
+                assert_eq!(nc_release(client.cast()), 0);
+            }
+            assert_eq!(Arc::strong_count(&flag), 1);
+        }
+
+        // ------------------------------------------------------------------
+        // 実機: 既定の出力を API で切り替えて、鳴らしている間に追従することを確かめる
+        // ------------------------------------------------------------------
+
+        #[repr(C)]
+        struct IMmDeviceCollectionVtbl {
+            unknown: IUnknownVtbl,
+            get_count: unsafe extern "system" fn(ThisPtr, *mut u32) -> Hresult,
+            item: unsafe extern "system" fn(ThisPtr, u32, *mut ThisPtr) -> Hresult,
+        }
+
+        type EnumAudioEndpointsFn =
+            unsafe extern "system" fn(ThisPtr, i32, u32, *mut ThisPtr) -> Hresult;
+
+        /// 非公開の `IPolicyConfig`(`SetDefaultEndpoint` は 13 番目)。テストの中だけで使う。
+        #[repr(C)]
+        struct IPolicyConfigVtbl {
+            unknown: IUnknownVtbl,
+            skipped: [*const c_void; 10],
+            set_default_endpoint: unsafe extern "system" fn(ThisPtr, *const u16, i32) -> Hresult,
+        }
+
+        const CLSID_POLICY_CONFIG_CLIENT: Guid = Guid {
+            data1: 0x870A_F99C,
+            data2: 0x171D,
+            data3: 0x4F9E,
+            data4: [0xAF, 0x0D, 0xE6, 0x3D, 0xF4, 0x0C, 0x2B, 0xC9],
+        };
+        const IID_IPOLICY_CONFIG: Guid = Guid {
+            data1: 0xF867_9F50,
+            data2: 0x850A,
+            data3: 0x41CF,
+            data4: [0x9C, 0x72, 0x43, 0x0F, 0x29, 0x02, 0x90, 0xC8],
+        };
+
+        fn create_enumerator() -> Com<IMmDeviceEnumeratorVtbl> {
+            let mut raw: *mut c_void = std::ptr::null_mut();
+            // SAFETY: GUID は有効な静的値、出力先はスタック上のポインタ。
+            let hr = unsafe {
+                CoCreateInstance(
+                    &CLSID_MM_DEVICE_ENUMERATOR,
+                    std::ptr::null_mut(),
+                    CLSCTX_ALL,
+                    &IID_IMM_DEVICE_ENUMERATOR,
+                    &mut raw,
+                )
+            };
+            assert!(hr >= 0, "CoCreateInstance failed: {}", hresult_hex(hr));
+            // SAFETY: 成功した呼び出しは参照を 1 つ所有する。
+            unsafe { Com::from_raw(raw) }.expect("enumerator")
+        }
+
+        /// 有効なレンダーエンドポイントの ID を全部返す。
+        fn active_render_ids() -> Vec<Vec<u16>> {
+            let enumerator = create_enumerator();
+            let mut raw: ThisPtr = std::ptr::null_mut();
+            // SAFETY: スロット 3 は `EnumAudioEndpoints(EDataFlow, DWORD, IMMDeviceCollection**)`。
+            let hr = unsafe {
+                let f = std::mem::transmute::<*const c_void, EnumAudioEndpointsFn>(
+                    enumerator.vtbl().enum_audio_endpoints,
+                );
+                f(enumerator.this(), E_RENDER, DEVICE_STATE_ACTIVE, &mut raw)
+            };
+            assert!(hr >= 0, "EnumAudioEndpoints failed: {}", hresult_hex(hr));
+            // SAFETY: 成功した呼び出しは参照を 1 つ所有する。
+            let collection =
+                unsafe { Com::<IMmDeviceCollectionVtbl>::from_raw(raw) }.expect("collection");
+            let mut count = 0u32;
+            // SAFETY: 出力先はスタック上の `u32`。
+            unsafe { (collection.vtbl().get_count)(collection.this(), &mut count) };
+            let mut ids = Vec::new();
+            for index in 0..count {
+                let mut raw: ThisPtr = std::ptr::null_mut();
+                // SAFETY: `index < count`、出力先はスタック上のポインタ。
+                let hr = unsafe { (collection.vtbl().item)(collection.this(), index, &mut raw) };
+                if hr < 0 {
+                    continue;
+                }
+                // SAFETY: 成功した `Item` は参照を 1 つ所有する `IMMDevice` を返す。
+                if let Some(device) = unsafe { Com::<IMmDeviceVtbl>::from_raw(raw) } {
+                    ids.extend(device_id_of(&device));
+                }
+            }
+            ids
+        }
+
+        fn set_default_render(id: &[u16]) {
+            let mut raw: *mut c_void = std::ptr::null_mut();
+            // SAFETY: GUID は有効な静的値、出力先はスタック上のポインタ。
+            let hr = unsafe {
+                CoCreateInstance(
+                    &CLSID_POLICY_CONFIG_CLIENT,
+                    std::ptr::null_mut(),
+                    CLSCTX_ALL,
+                    &IID_IPOLICY_CONFIG,
+                    &mut raw,
+                )
+            };
+            assert!(hr >= 0, "IPolicyConfig is unavailable: {}", hresult_hex(hr));
+            // SAFETY: 成功した呼び出しは参照を 1 つ所有する。
+            let policy = unsafe { Com::<IPolicyConfigVtbl>::from_raw(raw) }.expect("policy config");
+            let mut nul = id.to_vec();
+            nul.push(0);
+            for role in [E_CONSOLE, E_MULTIMEDIA, 2] {
+                // SAFETY: `nul` は NUL 終端。
+                let hr = unsafe {
+                    (policy.vtbl().set_default_endpoint)(policy.this(), nul.as_ptr(), role)
+                };
+                assert!(hr >= 0, "SetDefaultEndpoint failed: {}", hresult_hex(hr));
+            }
+        }
+
+        /// 落ちたとき・panic したときも、既定の出力を元に戻す。
+        struct RestoreDefault(Vec<u16>);
+
+        impl Drop for RestoreDefault {
+            fn drop(&mut self) {
+                set_default_render(&self.0);
+            }
+        }
+
+        fn open_backend() -> (WindowsBackend, Arc<EventQueue>) {
+            let (renderer, _sender, _reclaim, _music_producer, _music_clock, events, _bgm) =
+                mw_core::Renderer::build(mw_core::Config::default(), 48_000);
+            let mut backend = WindowsBackend::new();
+            backend
+                .open(renderer, Arc::clone(&events))
+                .expect("open should succeed on a machine with a default output device");
+            (backend, events)
+        }
+
+        /// `StreamError { DeviceUnavailable }` が積まれるのを最大 `timeout` 待つ。
+        fn wait_for_device_unavailable(events: &EventQueue, timeout: Duration) -> bool {
+            let started = std::time::Instant::now();
+            while started.elapsed() < timeout {
+                let mut found = false;
+                events.drain(64, |event| {
+                    if matches!(
+                        event,
+                        Event::StreamError {
+                            reason: StreamErrorReason::DeviceUnavailable
+                        }
+                    ) {
+                        found = true;
+                    }
+                });
+                if found {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        }
+
+        /// 既定の出力を別のデバイスへ切り替えると、鳴らしている間に `DeviceUnavailable` が上がり、
+        /// 開き直した先でも鳴ること。最後に既定の出力を必ず元に戻す。
+        /// 出力が 1 つしかない PC では何もせず終わる。
+        /// `cargo test -p mw-backend follows_the_default_output -- --ignored --nocapture`
+        #[test]
+        #[ignore = "既定の出力を実際に切り替えるため、手元の Windows でのみ実行する(最後に元へ戻す)"]
+        fn follows_the_default_output_when_it_is_switched_while_playing() {
+            let _apartment = ComApartment::enter().expect("COM");
+            let original = default_render_id(&create_enumerator()).expect("a default output");
+            let Some(other) = active_render_ids().into_iter().find(|id| *id != original) else {
+                println!("only one active output device; nothing to switch to");
+                return;
+            };
+            let _restore = RestoreDefault(original.clone());
+
+            let (mut backend, events) = open_backend();
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(backend.callback_count() > 0, "the render loop never ran");
+            assert!(
+                !wait_for_device_unavailable(&events, Duration::from_millis(500)),
+                "an error was raised without any change"
+            );
+
+            // 元 → 別のデバイス。
+            let switched = std::time::Instant::now();
+            set_default_render(&other);
+            assert!(
+                wait_for_device_unavailable(&events, Duration::from_secs(5)),
+                "the switch to another default output was not noticed"
+            );
+            println!("switch noticed after {:?}", switched.elapsed());
+            backend.close().expect("close");
+            let (mut backend, events) = open_backend();
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(
+                backend.callback_count() > 0,
+                "the reopened stream did not play"
+            );
+
+            // 別のデバイス → 元(開き直した先も追従する)。
+            set_default_render(&original);
+            assert!(
+                wait_for_device_unavailable(&events, Duration::from_secs(5)),
+                "the switch back to the original output was not noticed"
+            );
+            backend.close().expect("close");
+        }
 
         /// 実デバイス(既定の出力)を開き、440Hz の正弦波を数秒鳴らして、
         /// コールバック回数・xrun 数・出力遅延を出力する。
