@@ -691,6 +691,15 @@ pub struct AndroidBackend {
 unsafe impl Send for AndroidBackend {}
 
 #[cfg(target_os = "android")]
+impl Drop for AndroidBackend {
+    /// `close` せずに落とされても AAudio のストリームを止めて閉じ、コールバックの文脈を残さない。
+    /// 閉じていれば何もしない(`close` は閉じ済みなら `NotOpen` を返すだけ)。
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+#[cfg(target_os = "android")]
 impl Default for AndroidBackend {
     fn default() -> Self {
         Self::new()
@@ -1024,6 +1033,46 @@ impl Backend for AndroidBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 開いたことが無いまま drop しても panic しない。
+    #[cfg(target_os = "android")]
+    #[test]
+    fn dropping_a_never_opened_backend_is_a_no_op() {
+        let mut backend = AndroidBackend::new();
+        assert!(!backend.is_open());
+        assert!(matches!(backend.close(), Err(BackendError::NotOpen)));
+        drop(backend);
+    }
+
+    /// `close` せずに drop しても、コールバックが止まること。
+    /// `cargo test -p mw-backend --features backend-native dropping_an_open_backend -- --ignored --nocapture`
+    /// を実機の Android で実行する。
+    #[cfg(target_os = "android")]
+    #[test]
+    #[ignore = "実デバイス(既定の出力)を開くため、実機の Android でのみ実行する"]
+    fn dropping_an_open_backend_stops_the_render_callback() {
+        for _ in 0..20 {
+            let (renderer, _sender, _reclaim, _music_producer, _music_clock, events, _bgm) =
+                mw_core::Renderer::build(mw_core::Config::default(), 48_000);
+            let mut backend = AndroidBackend::new();
+            backend
+                .open(renderer, events)
+                .expect("open should succeed on a device with a default output");
+            let completions = Arc::clone(&backend.render_completions);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(
+                completions.load(Ordering::Relaxed) > 0,
+                "the render callback never ran"
+            );
+            drop(backend);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert_eq!(
+                completions.load(Ordering::Relaxed),
+                0,
+                "the render callback kept running after drop"
+            );
+        }
+    }
 
     #[test]
     fn project_frame_to_ns_extrapolates_forward_from_the_anchor() {

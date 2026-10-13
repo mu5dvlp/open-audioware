@@ -60,7 +60,7 @@ AUDIOWARE-DEPS-PLAN.md ステップ4-3)へ差し替える前に、**cpal 版と�
 | A21 | 切断後の再オープン | `mw_poll_events`(ゲームスレッド、毎フレーム)が `StreamError { DeviceUnavailable }` を見て `note_stream_error` → `maybe_reopen`(`ffi.rs:1270-1272, 1297-1300`)→ 3段の再オープン(ADR 0002。`handle.rs:738, 1050, 1639`)。バックオフ 250〜4000ms・5回まで(`reopen.rs::REOPEN_BACKOFF_SCHEDULE_MS`)。音楽は位置を、BGM はトラックとループだけ戻す(`handle.rs:832-925`) | 同じ仕組みに乗る(`make_backend()` が `AndroidBackend` を返すだけ)| 同じ。✅ cpal 版は SH-M16 / Android 11 で有線の引き抜き → 約 0.5 秒で復帰、音とノーツが揃うことを確認済み(`docs/history/08-2026-09-04.md`)。**自前では未確認** |
 | A22 | 🔴 **再オープンでサンプルレートが変わったとき** | 常に 48kHz を要求するので**変わらない**(A3) | 48kHz を要求するので**変わらない**(A3、`44e29cf`)。加えて、曲の位置(`MusicClockSnapshot::song_frames`)とループ区間は**出力レートのフレーム数**で、再オープン後の `MusicSeek` へ前のレートの値をそのまま渡していたことを確認した(デコーダの `seek` は出力レート基準。`decode.rs`)。レートが変わった場合は新しいレートへ換算して戻すようにした(`handle.rs::rescale_output_frames`、`f046dc1`。cpal 版にも効く)。ロード済みの SE は作り直さない(変わった場合はその旨をログに出す) | **同じ**(`44e29cf` / `f046dc1`) |
 | A23 | 通知の来ない停止(コールバックが止まったまま、error callback も来ない)| **両方していない**。iOS には `OutputStallDetector` + ウォッチドッグがある(`ios_interruption.rs:530-`。iOS / tvOS 限定)が、Android には無い | 同左 | 両方していない |
-| A24 | 閉じ方 | `pause()`(`request_pause` + 待つ)→ ndk の `Drop` が `AAudioStream_close` → その後でコールバックの Box を解放(`cpal_backend.rs:295-`、ndk `audio.rs:1414-`) | `requestStop` → `close` → その後で `CallbackContext` / `ErrorContext` を解放(`android.rs:597-643`) | 同じ。⚠️ 「error callback が別スレッドで走っている最中に close が来たら」の扱いは両者とも AAudio 任せで同じ(C12 で連続の抜き差しを確かめる) |
+| A24 | 閉じ方 | `pause()`(`request_pause` + 待つ)→ ndk の `Drop` が `AAudioStream_close` → その後でコールバックの Box を解放(`cpal_backend.rs:295-`、ndk `audio.rs:1414-`) | `requestStop` → `close` → その後で `CallbackContext` / `ErrorContext` を解放(`android.rs:597-643`) | 同じ。`close` せずに落とした場合も、自前は `Drop` で `close` する(cpal 版は落とせば止まる)。⚠️ 「error callback が別スレッドで走っている最中に close が来たら」の扱いは両者とも AAudio 任せで同じ(C12 で連続の抜き差しを確かめる)。`Drop` の実機確認は未(`#[ignore]` のテスト `dropping_an_open_backend_stops_the_render_callback` を実機の Android で回す) |
 | A25 | 再オープンの実行場所 | ゲームスレッドの `mw_poll_events` が起点。**アプリが背面にいて Unity のフレームが止まっている間は再オープンしない**(前面に戻ってから) | 同じ | 同じ |
 
 ### 1.4 OS・アプリのライフサイクル
@@ -206,7 +206,8 @@ WASAPI ホストと比べた表。Unity Editor(Windows)で鳴らすための出�
 `close` せずに落としたときの後始末は `#[ignore]` のテスト
 (`cargo test -p mw-backend dropping_an_open_backend -- --ignored --nocapture`。20 回開いて落とし、
 音声スレッドが止まることとハンドル数が増えないこと〔177 → 182〕を見る)で確認している。
-Linux 版にも同じ `Drop` を足したが、Linux 実機では回していない。
+Linux 版・Apple 版・Android 版にも同じ `Drop` を足した(閉じ済みなら何もしない)。Linux・Android 実機と Mac では未確認
+(Apple・Android は `dropping_an_open_backend_stops_the_render_callback` が実機用の `#[ignore]` テスト)。
 
 音声スレッドがイベントを待ってタイムアウトし続けた場合(約 1 秒ごと)は `GetCurrentPadding` で装置の
 状態を問い合わせ、失敗なら `StreamError` を積む。`open` が 10 秒の初期化待ちを超えて諦めた場合は、
