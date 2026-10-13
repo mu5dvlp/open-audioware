@@ -173,7 +173,38 @@ iOS は `ed0236d` で、cpal 版の周り(`ios_interruption.rs`)と同じ監視�
 
 ---
 
-## 5. この文書の更新
+## 5. Windows(`windows.rs`)の同じ表
+
+`backend-native` の Windows 実装(`crates/mw-backend/src/native_backend/windows.rs`。WASAPI の共有モード・
+イベント駆動。COM の vtable と関数は自前の宣言で、新しいクレートは足していない)を、cpal 0.18.1 の
+WASAPI ホストと比べた表。Unity Editor(Windows)で鳴らすための出力。調べた範囲は Android 表と同じ観点。
+
+| # | 項目 | cpal 版(+ 周り) | 自前(`windows.rs`) | 判定 | 実機(Windows 11) |
+|---|---|---|---|---|---|
+| W1 | 出力先 | 既定のレンダーエンドポイント | `eRender` / `eConsole` の既定を `IMMDeviceEnumerator::GetDefaultAudioEndpoint` で取る | 同じ | ✅ 鳴った |
+| W2 | 共有 / 排他 | 共有モード・イベント駆動 | 共有モード・イベント駆動(`EVENTCALLBACK`) | 同じ | ✅ |
+| W3 | 🔴 **サンプルレート** | f32 ステレオで 48kHz を優先して要求(`find_f32_stereo_config`) | 48kHz を要求し、`AUTOCONVERTPCM` + `SRC_DEFAULT_QUALITY` でエンジンに変換させる。`Renderer` へは 48000 を渡す。開いたとき、エンドポイントのミックス形式のレートもログに出す | 同じ | ✅ ミックス形式 48000 Hz 2ch のため変換は挟まらなかった。44.1kHz のエンドポイントでは未確認 |
+| W4 | 形式 | f32 / 2ch | `WAVE_FORMAT_EXTENSIBLE`・IEEE float・32bit・2ch・`SPEAKER_FRONT_LEFT\|RIGHT` | 同じ | ✅ |
+| W5 | バッファ長 | 既定のデバイス周期 | `GetDevicePeriod` の既定周期を `Initialize` に渡す。開いた後に `GetBufferSize`・既定/最小周期・`GetStreamLatency` をログに出す(実効値のログ) | 同じ | ✅ 周期 10.000 ms(最小 3.000 ms)・バッファ 1056 frames・コールバック 480 frames |
+| W6 | 音声スレッドの優先度 | `audio_thread_priority`(MMCSS) | `AvSetMmThreadCharacteristicsW("Pro Audio")`(`avrt`)。失敗しても続行 | 同じ(目的) | 登録の成否はログに出していない |
+| W7 | 異常時のバッファ | データコールバックの前にゼロで埋める | `GetBuffer` の領域へ直接 `render`。ポインタが NULL・非アラインなら書かず `AUDCLNT_BUFFERFLAGS_SILENT` で返す。`render` が panic したらゼロで埋めて返し、`StreamError { Backend }` を積んで止まる | 同じ結果(正常時は `render` が全体を上書きする) | — |
+| W8 | xrun の数え方 | WASAPI は回数を出さない。本リポジトリのヒューリスティック(`OutputUnderrunTracker::observe`) | 同じヒューリスティック(基準はデバイス周期のフレーム数) | 同じ(OS の実数は無い) | ✅ 4 秒間 0 回 |
+| W9 | 🔴 **出力時刻・出力遅延** | `StreamInstant`(`GetBuffer` 時刻 + padding 等からの予測) | 出力遅延 = `GetCurrentPadding` のフレーム(ns 換算)+ `GetStreamLatency`。出力時刻 = `host_time_ns()`(`QueryPerformanceCounter`)+ 出力遅延。デバイス周期は padding に現れる(周期ぶん空いたときにイベントが来るため) | 同じ意味(DAC から出る予測時刻) | ✅ 12.000 ms(padding 576 frames + `GetStreamLatency` 0 ms) |
+| W10 | エラーの分類 | `DeviceNotAvailable` 等を `DeviceUnavailable` に丸める | `AUDCLNT_E_DEVICE_INVALIDATED` / `SERVICE_NOT_RUNNING` / `ENDPOINT_CREATE_FAILED` / `DEVICE_IN_USE` / `RESOURCES_INVALIDATED` → `DeviceUnavailable`(内部再オープンの対象)、`E_ACCESSDENIED` → `PermissionDenied`、他 → `Backend`。開く途中の `E_NOTFOUND` / `ENDPOINT_CREATE_FAILED` は `NoOutputDevice` | 同じ | 単体テストで固定。実際の抜き差しは未確認 |
+| W11 | デバイスの抜き差し・既定出力の変更 | 抜かれると `StreamError` を出す。既定の切り替えには追従しない | `IMMNotificationClient` は持たない。`GetCurrentPadding` / `GetBuffer` が上のエラーを返したら `StreamError` を積んでスレッドを終える(Linux 版と同じ範囲)。既定を切り替えただけでは元のデバイスに残る | 同じ範囲 | **未確認**(USB / Bluetooth を抜く) |
+| W12 | COM のアパートメント | 呼び出したスレッドに依存 | COM の呼び出しは専用スレッドの MTA で完結させ、結果だけチャネルで `open` へ返す(Unity のメインスレッドが STA でも影響を受けない) | 違う(良くなる方向) | ✅ |
+| W13 | 開く・閉じる | — | `open` は初期化の結果を最大 10 秒待つ。`close` は `SetEvent` で起こして join(待ち時間は周期より短い) | — | ✅ 開閉 1 回 |
+
+実機の数字(`cargo test -p mw-backend plays_a_tone -- --ignored --nocapture`、440Hz を 4 秒):
+コールバック 402 回(100.2 回/秒)、1 回 480 frames、xrun(疑い)0、出力遅延 12.000 ms(最小 = 最大)。
+
+未確認(実機): 44.1kHz など 48kHz 以外のエンドポイント、USB / Bluetooth の抜き差し(W11)、
+Windows Audio サービスの再起動、Unity Editor 上での音楽クロックと聴感のずれ。
+低遅延の `IAudioClient3`(共有モードの最小周期)は使っていない。
+
+---
+
+## 6. この文書の更新
 
 - 2節の項目を実装したら、該当する行の判定を書き換え、実装したコミットを備考に足す。
 - 3節の確認をしたら「実機」の結果(端末名・OS 版・日付)を書き足す。

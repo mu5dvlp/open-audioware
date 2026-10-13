@@ -227,6 +227,22 @@
   動作確認は `#[ignore]` のテスト(`ALSA_CONFIG_PATH` を `pcm.!default { type null }` だけの
   設定ファイルへ向けて `cargo test -p mw-backend -- --ignored`)。
 
+- `native_backend::windows::WindowsBackend`(AUDIOWARE-DEPS-PLAN.md ステップ4-3c)——
+  Windows の既定出力へ WASAPI の**共有モード・イベント駆動**で出力する `Backend` 実装。
+  COM の vtable(`IMMDeviceEnumerator` / `IMMDevice` / `IAudioClient` / `IAudioRenderClient`)と
+  `CoCreateInstance` などは自前の `extern "system"` 宣言(`ole32` / `kernel32` / `avrt`。新しいクレートは
+  追加していない)。🔴 **COM の呼び出しは専用スレッド(MTA)で完結させ**、`open` は結果をチャネルで待つ
+  (Unity のメインスレッドが STA でも影響を受けない)。形式は f32・2ch・48kHz を要求し、
+  `AUTOCONVERTPCM` でエンジンが変換する。専用スレッドは MMCSS("Pro Audio")に登録し、イベントを待って
+  `GetBuffer` のバッファへ直接 `Renderer::render` する。バッファ先頭の出力時刻は
+  `host_time_ns()`(QPC)+ 出力遅延(`GetCurrentPadding` のフレーム + `GetStreamLatency`)。
+  xrun の実数は無いので `OutputUnderrunTracker::observe` だけ。**既知の差分**: デバイスの抜き差し・
+  既定出力の変更の監視は無い(`AUDCLNT_E_DEVICE_INVALIDATED` 等で `Event::StreamError` を積んで
+  スレッドを終える)/ `IAudioClient3` は使わない。純粋ロジック(形式の組み立て・遅延計算・エラー分類・
+  vtable の配置)は `target_os` を問わずホストの `cargo test` で固定。実機確認は `#[ignore]` のテスト
+  (`cargo test -p mw-backend plays_a_tone -- --ignored --nocapture`。数秒鳴らしてコールバック回数・
+  xrun・出力遅延を出力する)。cpal 版との比較表は `docs/android-native-backend-parity.md` の 5 節。
+
 ## 設計意図
 
 - 初期構築仕様 M6(【仮】): 立ち上げは cpal で macOS Editor / iOS / Android を1系統に揃える。

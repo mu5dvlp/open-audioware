@@ -10,7 +10,10 @@
 //! Linux は [`linux`] に ALSA(libasound)の C API を直接叩く実装を置いた。専用スレッドが
 //! `snd_pcm_writei` を回す方式で、他の OS のようなコールバック駆動ではない。
 //!
-//! `android` / `linux` モジュール自体は `target_os` を問わずコンパイルする(`host_time` と同じ
+//! Windows は [`windows`] に WASAPI(共有モード・イベント駆動)を COM の自前宣言で直接叩く実装を置いた。
+//! 専用スレッドがイベントを待って `IAudioRenderClient` のバッファへ直接描画する。
+//!
+//! `android` / `linux` / `windows` モジュール自体は `target_os` を問わずコンパイルする(`host_time` と同じ
 //! 流儀)——純粋ロジック(タイムスタンプの外挿計算・バッファ検証・エラー分類)を
 //! ホスト(macOS)の `cargo test` から固定化するため。実際にハードウェアを叩く
 //! `Backend` 実装([`android::AndroidBackend`] / [`linux::LinuxBackend`])自体はそれぞれ
@@ -25,6 +28,7 @@ pub mod android;
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub mod apple;
 pub mod linux;
+pub mod windows;
 
 #[cfg(target_os = "android")]
 pub use android::AndroidBackend as NativeBackend;
@@ -32,3 +36,5 @@ pub use android::AndroidBackend as NativeBackend;
 pub use apple::AppleBackend as NativeBackend;
 #[cfg(target_os = "linux")]
 pub use linux::LinuxBackend as NativeBackend;
+#[cfg(target_os = "windows")]
+pub use windows::WindowsBackend as NativeBackend;

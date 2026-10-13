@@ -23,8 +23,8 @@
 //! 走る〔`.github/workflows/ci.yml`〕ため Linux 向けの実装も用意するが、これは
 //! ビルド・オフラインテスト専用であり実デバイスとの相関には使わない。Windows も同様に
 //! `cargo check`(ビルド確認のみ)の対象として `QueryPerformanceCounter` /
-//! `QueryPerformanceFrequency` による実装を用意するが、WASAPI の `StreamInstant` との
-//! 相関は検証していない)。
+//! `QueryPerformanceFrequency` による実装を用意する。自前の WASAPI バックエンド
+//! 〔`native_backend::windows`〕は、この時計を「いま」として出力時刻を求める)。
 //!
 //! そのため [`host_time_ns`] は、**両ホストの式をそれぞれのプラットフォームで
 //! 文字通り再現する**。「たまたま近い値になる」のではなく「同じ時計を同じ式で読む」
@@ -256,9 +256,8 @@ fn qpc_frequency_hz() -> u64 {
 /// ホスト単調時刻をナノ秒で返す(Windows)。
 ///
 /// `QueryPerformanceCounter` の raw カウンタ値を [`qpc_frequency_hz`] で取得した
-/// 周波数を使って ns へ変換する。WASAPI(cpal の Windows ホスト)は配布対象外
-/// (モジュール doc 参照)——この実装は `cargo check` が通ることの確認用であり、
-/// 実デバイスの `StreamInstant` との相関は検証していない。
+/// 周波数を使って ns へ変換する。自前の WASAPI バックエンド
+/// (`native_backend::windows`)が出力時刻の基準にする時計。
 ///
 /// リアルタイム安全: アロケーション・ロックを一切行わない(他の枝と同じ方針)。
 #[cfg(target_os = "windows")]

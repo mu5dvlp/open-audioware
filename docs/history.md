@@ -29,6 +29,7 @@
 
 ### [2026-09-29](history/16-2026-09-29.md)
 
+- (2026-10-13)自前の WASAPI 出力(Windows の `backend-native`)。共有モード・イベント駆動、COM は自前の宣言。実機で 4 秒鳴らして xrun 0・出力遅延 12ms
 - (2026-10-12)Windows(Git Bash)でも `make lint` / `make test` が通るよう、スクリプトの文字コード・改行、Makefile の Unity / NDK の既定、docker のパス変換、`.gitattributes` を直した
 - (2026-10-10)仮置きのサンプルレート(c9faf55 の見落とし)のまま描画を始めたら実機無しで検知できるよう `Renderer` に警告の合図を足し、1インスタンス1回だけログへ出した。`docs/android-native-backend-parity.md` の iOS 表に時計の4項目(mHostTime・バッファ長・outputLatency・サンプルレート)の読む/読み直す/世代を進めるかの表を足した
 - (2026-10-10)iOS の出力停止ウォッチドッグが復帰を試みる前に `AudioInterruptionBegan` を出すようにした(通知が一度も来ない停止では自動ポーズに乗れなかった)。二重発火は状態機械側の既存の保証(`allows_stall_watchdog`)にそのまま乗せた

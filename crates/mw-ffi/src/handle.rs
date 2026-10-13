@@ -33,7 +33,8 @@ use mw_backend::CpalBackend;
         target_os = "ios",
         target_os = "tvos",
         target_os = "android",
-        target_os = "linux"
+        target_os = "linux",
+        target_os = "windows"
     )
 ))]
 use mw_backend::NativeBackend;
@@ -1429,11 +1430,11 @@ pub fn with_instance<T>(handle: u64, f: impl FnOnce(&Instance) -> T) -> Option<T
 /// 実装したあとも、`backend-cpal` feature を有効にするだけで即座に cpal 実装へ
 /// 切り戻せる(段階ごとに壊していないことを確かめるための退路)。
 ///
-/// 🔴 **macOS・iOS/tvOS・Android・Linux が `backend-native` 実装済み**
+/// 🔴 **macOS・iOS/tvOS・Android・Linux・Windows が `backend-native` 実装済み**
 /// (`mw_backend::NativeBackend` = macOS/iOS/tvOS では `native_backend::apple::
 /// AppleBackend`〔AUHAL/RemoteIO〕、Android では `native_backend::android::
 /// AndroidBackend`〔AAudio〕、Linux では `native_backend::linux::LinuxBackend`
-/// 〔ALSA〕を自前の `extern "C"` 宣言で直接叩く)。これら5OS以外で `backend-native` を選んだ場合は引き続きコンパイル
+/// 〔ALSA〕、Windows では `native_backend::windows::WindowsBackend`〔WASAPI〕を自前の `extern` 宣言で直接叩く)。これら6OS以外で `backend-native` を選んだ場合は引き続きコンパイル
 /// エラーになる(既定ビルド〔`backend-cpal`〕には影響しない)。
 ///
 /// 🔴 テストビルドでのみ、テストダブルを差し込めるようにしてある —— CI にもこの環境にも
@@ -1454,7 +1455,7 @@ fn make_backend() -> Box<dyn Backend + Send> {
     crate::test_backend::take_from_factory().unwrap_or_else(|| Box::new(CpalBackend::new()))
 }
 
-// `backend-native` だけが有効(`backend-cpal` 無効)な macOS/iOS/tvOS/Android/Linux ビルド
+// `backend-native` だけが有効(`backend-cpal` 無効)な macOS/iOS/tvOS/Android/Linux/Windows ビルド
 // (ステップ4-1〔macOS〕・4-2〔iOS/tvOS〕・4-3〔Android〕・4-4 の前提〔Linux〕)。
 #[cfg(all(
     not(test),
@@ -1465,7 +1466,8 @@ fn make_backend() -> Box<dyn Backend + Send> {
         target_os = "ios",
         target_os = "tvos",
         target_os = "android",
-        target_os = "linux"
+        target_os = "linux",
+        target_os = "windows"
     )
 ))]
 fn make_backend() -> Box<dyn Backend + Send> {
@@ -1481,17 +1483,18 @@ fn make_backend() -> Box<dyn Backend + Send> {
         target_os = "ios",
         target_os = "tvos",
         target_os = "android",
-        target_os = "linux"
+        target_os = "linux",
+        target_os = "windows"
     )
 ))]
 fn make_backend() -> Box<dyn Backend + Send> {
     crate::test_backend::take_from_factory().unwrap_or_else(|| Box::new(NativeBackend::new()))
 }
 
-// `backend-native` だけが有効(`backend-cpal` 無効)な、macOS/iOS/tvOS/Android/Linux 以外の
+// `backend-native` だけが有効(`backend-cpal` 無効)な、macOS/iOS/tvOS/Android/Linux/Windows 以外の
 // ビルドの受け皿。
 //
-// `backend-native` が実装済みなのはこの5OSのみ。それ以外(Linux/Windows 等、本プロジェクトの
+// `backend-native` が実装済みなのはこの6OSのみ。それ以外(本プロジェクトの
 // 配布対象外)で選んだ場合は、選んだ時点で明確にコンパイルを止める(実行時に初めて失敗する
 // 「黙って cpal にフォールバック」はしない)。`compile_error!` を独立した item として発行し、
 // `unreachable!()`(型は `!`、どの戻り型にも合致する)で関数の型だけ合わせておくことで、
@@ -1504,11 +1507,12 @@ fn make_backend() -> Box<dyn Backend + Send> {
         target_os = "ios",
         target_os = "tvos",
         target_os = "android",
-        target_os = "linux"
+        target_os = "linux",
+        target_os = "windows"
     ))
 ))]
 compile_error!(
-    "backend-native は macOS/iOS/tvOS/Android/Linux のみ実装済み。それ以外では backend-cpal を \
+    "backend-native は macOS/iOS/tvOS/Android/Linux/Windows のみ実装済み。それ以外では backend-cpal を \
      有効にしてビルドすること"
 );
 
@@ -1520,11 +1524,14 @@ compile_error!(
         target_os = "ios",
         target_os = "tvos",
         target_os = "android",
-        target_os = "linux"
+        target_os = "linux",
+        target_os = "windows"
     ))
 ))]
 fn make_backend() -> Box<dyn Backend + Send> {
-    unreachable!("backend-native は macOS/iOS/tvOS/Android/Linux 以外ではまだ実装されていない")
+    unreachable!(
+        "backend-native は macOS/iOS/tvOS/Android/Linux/Windows 以外ではまだ実装されていない"
+    )
 }
 
 // backend-cpal / backend-native のどちらも無効なビルド(cargo build --no-default-features)

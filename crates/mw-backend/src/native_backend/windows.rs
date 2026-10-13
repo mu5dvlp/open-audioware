@@ -1,0 +1,1420 @@
+//! Windows 用の自前 WASAPI バックエンド(AUDIOWARE-DEPS-PLAN.md ステップ4-3c)。
+//!
+//! 4-1〜4-3([`crate::native_backend::apple`] / [`crate::native_backend::android`] /
+//! [`crate::native_backend::linux`])と同じく**新しい外部クレートは追加していない**
+//! (`windows` / `windows-sys` / `wasapi` は使わない)。COM のインターフェースは
+//! 自前の vtable 構造体で宣言し、`CoCreateInstance` などの関数は `extern "system"` で
+//! 宣言して `ole32` / `kernel32` / `avrt` へリンクする。いずれも Windows に標準で入っている DLL。
+//!
+//! # 方式: 共有モード・イベント駆動
+//!
+//! 専用スレッドが `WaitForSingleObject(イベント)` で WASAPI の「バッファに空きができた」
+//! 通知を待ち、`IAudioClient::GetCurrentPadding` で空きフレーム数を取り、
+//! `IAudioRenderClient::GetBuffer` が返したバッファへ**直接** `Renderer::render` して
+//! `ReleaseBuffer` する。
+//!
+//! 手順: `CoInitializeEx(MTA)` → 既定のレンダーエンドポイント(`eRender` / `eConsole`)→
+//! `IAudioClient::Initialize(SHARED, EVENTCALLBACK | AUTOCONVERTPCM | SRC_DEFAULT_QUALITY,
+//! 既定のデバイス周期)`。形式は **f32・2ch・48kHz を要求**する(cpal 版が 48kHz を要求する
+//! のと同じ。エンドポイントのミックス形式が別のレートでも `AUTOCONVERTPCM` で
+//! オーディオエンジンが変換する)。
+//!
+//! 🔴 COM の呼び出し(初期化・開始・音声ループ・終了)は**すべて 1 本のスレッド**で行う。
+//! `open` を呼んだゲームスレッド(Unity ならメインスレッド。STA のことがある)のアパートメントに
+//! 依存しないためで、結果だけをチャネルで `open` へ返す。
+//!
+//! # タイムスタンプ
+//!
+//! 今回書くバッファの先頭が DAC から出る時刻は、
+//! 「いま」+「バッファに残っている未再生のフレーム(`GetCurrentPadding`)」+
+//! 「エンジン〜エンドポイントの遅延(`GetStreamLatency`)」。「いま」は他の OS と同じ
+//! [`crate::host_time::host_time_ns`](`QueryPerformanceCounter`)なので `mw_host_time_ns()` と
+//! 直接比較できる。出力レイテンシ(`output_latency_ns`)はこの 2 項の合計
+//! ([`output_latency_ns`])。イベント駆動では「1 周期ぶん空いたらイベントが来る」ので、
+//! デバイス周期は `padding` に現れる。
+//!
+//! # アンダーラン
+//!
+//! WASAPI は xrun の回数を出さない。他の OS と同じ「コールバックの間隔が想定(= デバイス周期)
+//! より開いた」検知([`OutputUnderrunTracker::observe`])だけを回す。
+//!
+//! # 既知の差分
+//!
+//! - 音声スレッドは MMCSS(`AvSetMmThreadCharacteristicsW("Pro Audio")`)に登録する
+//!   (cpal の WASAPI ホストが `audio_thread_priority` で行うのと同じ目的)。失敗しても続行する。
+//! - デバイスの抜き差し・既定出力の変更の監視(`IMMNotificationClient`)は無い。無効化された
+//!   デバイスへの `GetCurrentPadding` / `GetBuffer` が `AUDCLNT_E_DEVICE_INVALIDATED` を返したときに
+//!   `Event::StreamError { DeviceUnavailable }` を積んでスレッドを終える(`mw-ffi` の内部再オープンに乗る)。
+//!   既定の出力を切り替えただけではストリームは元のデバイスに残る(cpal 版と同じ)。
+//! - 低遅延の `IAudioClient3`(共有モードの最小周期)は使わない。
+//!
+//! 純粋ロジック(形式の組み立て・遅延計算・エラー分類・vtable の配置)は `target_os` を問わず
+//! コンパイルし、ホストの `cargo test` で固定している([`crate::native_backend::linux`] と同じ流儀)。
+
+use std::ffi::c_void;
+
+use mw_core::{CHANNELS, StreamErrorReason};
+
+#[cfg(target_os = "windows")]
+use std::panic::{self, AssertUnwindSafe};
+#[cfg(target_os = "windows")]
+use std::sync::Arc;
+#[cfg(target_os = "windows")]
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+#[cfg(target_os = "windows")]
+use std::sync::mpsc::{SyncSender, sync_channel};
+#[cfg(target_os = "windows")]
+use std::thread::JoinHandle;
+#[cfg(target_os = "windows")]
+use std::time::Duration;
+
+#[cfg(target_os = "windows")]
+use mw_core::{Event, EventQueue, Renderer};
+
+#[cfg(target_os = "windows")]
+use crate::backend::{Backend, BackendError};
+#[cfg(target_os = "windows")]
+use crate::host_time::host_time_ns;
+#[cfg(target_os = "windows")]
+use crate::underrun::OutputUnderrunTracker;
+
+// ============================================================================
+// 純関数・定数(ハードウェア無しで `cargo test`(ホスト)から固定化できる)
+// ============================================================================
+//
+// `pub` はモジュール外へ公開する意図ではなく、Windows 以外では呼び出し元が `#[cfg]` で
+// 存在せず `dead_code` になるのを避けるため([`crate::native_backend::linux`] と同じ事情)。
+
+/// 目標サンプルレート。エンドポイントのミックス形式と違っても `AUTOCONVERTPCM` で変換される。
+pub const TARGET_SAMPLE_RATE_HZ: u32 = 48_000;
+
+/// 1 回の処理フレーム数の上限(`GetBuffer` が返した空きがこれを超えても、一度に扱うのはここまで)。
+pub const MAX_RENDER_FRAMES: u32 = 16_384;
+
+/// 初期化の完了を待つ上限。COM の初期化・デバイスの起動が詰まっても `open` が戻るようにする。
+pub const INIT_TIMEOUT_MS: u64 = 10_000;
+
+/// イベント待ちのタイムアウト(ms)。`close` は `SetEvent` で起こすので、これは保険。
+pub const WAIT_TIMEOUT_MS: u32 = 200;
+
+/// `HRESULT`(符号付き 32 ビット。負が失敗)。
+pub type Hresult = i32;
+
+/// `HRESULT_FROM_WIN32(ERROR_NOT_FOUND)` = `E_NOTFOUND`。既定のエンドポイントが無いときに返る。
+pub const E_NOTFOUND: Hresult = 0x8007_0490_u32 as i32;
+/// `E_ACCESSDENIED`。
+pub const E_ACCESSDENIED: Hresult = 0x8007_0005_u32 as i32;
+/// `AUDCLNT_E_DEVICE_INVALIDATED`(抜かれた・無効化された)。
+pub const AUDCLNT_E_DEVICE_INVALIDATED: Hresult = 0x8889_0004_u32 as i32;
+/// `AUDCLNT_E_UNSUPPORTED_FORMAT`。
+pub const AUDCLNT_E_UNSUPPORTED_FORMAT: Hresult = 0x8889_0008_u32 as i32;
+/// `AUDCLNT_E_DEVICE_IN_USE`。
+pub const AUDCLNT_E_DEVICE_IN_USE: Hresult = 0x8889_000A_u32 as i32;
+/// `AUDCLNT_E_ENDPOINT_CREATE_FAILED`。
+pub const AUDCLNT_E_ENDPOINT_CREATE_FAILED: Hresult = 0x8889_000F_u32 as i32;
+/// `AUDCLNT_E_SERVICE_NOT_RUNNING`(Windows Audio サービスが止まっている)。
+pub const AUDCLNT_E_SERVICE_NOT_RUNNING: Hresult = 0x8889_0010_u32 as i32;
+/// `AUDCLNT_E_RESOURCES_INVALIDATED`。
+pub const AUDCLNT_E_RESOURCES_INVALIDATED: Hresult = 0x8889_0026_u32 as i32;
+
+/// `GUID`(COM の識別子)。
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Guid {
+    pub data1: u32,
+    pub data2: u16,
+    pub data3: u16,
+    pub data4: [u8; 8],
+}
+
+/// `CLSID_MMDeviceEnumerator`。
+pub const CLSID_MM_DEVICE_ENUMERATOR: Guid = Guid {
+    data1: 0xBCDE_0395,
+    data2: 0xE52F,
+    data3: 0x467C,
+    data4: [0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E],
+};
+/// `IID_IMMDeviceEnumerator`。
+pub const IID_IMM_DEVICE_ENUMERATOR: Guid = Guid {
+    data1: 0xA956_64D2,
+    data2: 0x9614,
+    data3: 0x4F35,
+    data4: [0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6],
+};
+/// `IID_IAudioClient`。
+pub const IID_IAUDIO_CLIENT: Guid = Guid {
+    data1: 0x1CB9_AD4C,
+    data2: 0xDBFA,
+    data3: 0x4C32,
+    data4: [0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2],
+};
+/// `IID_IAudioRenderClient`。
+pub const IID_IAUDIO_RENDER_CLIENT: Guid = Guid {
+    data1: 0xF294_ACFC,
+    data2: 0x3146,
+    data3: 0x4483,
+    data4: [0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2],
+};
+/// `KSDATAFORMAT_SUBTYPE_IEEE_FLOAT`。
+pub const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: Guid = Guid {
+    data1: 0x0000_0003,
+    data2: 0x0000,
+    data3: 0x0010,
+    data4: [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71],
+};
+
+/// `WAVEFORMATEX`(Windows のヘッダと同じ 1 バイト詰め)。
+#[repr(C, packed(1))]
+#[derive(Clone, Copy)]
+pub struct WaveFormatEx {
+    pub format_tag: u16,
+    pub channels: u16,
+    pub samples_per_sec: u32,
+    pub avg_bytes_per_sec: u32,
+    pub block_align: u16,
+    pub bits_per_sample: u16,
+    pub cb_size: u16,
+}
+
+/// `WAVEFORMATEXTENSIBLE`。
+#[repr(C, packed(1))]
+#[derive(Clone, Copy)]
+pub struct WaveFormatExtensible {
+    pub format: WaveFormatEx,
+    pub valid_bits_per_sample: u16,
+    pub channel_mask: u32,
+    pub sub_format: Guid,
+}
+
+/// `WAVE_FORMAT_EXTENSIBLE`。
+pub const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+/// `SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT`。
+pub const SPEAKER_MASK_STEREO: u32 = 0x3;
+
+/// 要求する出力形式(f32・インターリーブ・`CHANNELS` ch・`sample_rate` Hz)。
+pub fn float_stereo_format(sample_rate: u32) -> WaveFormatExtensible {
+    let channels = CHANNELS as u16;
+    let bits = 32u16;
+    let block_align = channels * (bits / 8);
+    WaveFormatExtensible {
+        format: WaveFormatEx {
+            format_tag: WAVE_FORMAT_EXTENSIBLE,
+            channels,
+            samples_per_sec: sample_rate,
+            avg_bytes_per_sec: sample_rate.saturating_mul(block_align as u32),
+            block_align,
+            bits_per_sample: bits,
+            // `WAVEFORMATEXTENSIBLE` が `WAVEFORMATEX` の後ろに足す分(2 + 4 + 16)。
+            cb_size: 22,
+        },
+        valid_bits_per_sample: bits,
+        channel_mask: SPEAKER_MASK_STEREO,
+        sub_format: KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
+    }
+}
+
+/// 100ns 単位(WASAPI の `REFERENCE_TIME`)を ns へ。負は 0、`u64` を超える分は飽和する。
+pub fn hns_to_ns(hns: i64) -> u64 {
+    if hns <= 0 {
+        return 0;
+    }
+    (hns as u64).saturating_mul(100)
+}
+
+/// フレーム数を ns へ。`sample_rate == 0` は 0。
+pub fn frames_to_ns(frames: u64, sample_rate: u32) -> u64 {
+    if sample_rate == 0 {
+        return 0;
+    }
+    let ns = frames as u128 * 1_000_000_000 / sample_rate as u128;
+    ns.min(u64::MAX as u128) as u64
+}
+
+/// 100ns 単位の時間をフレーム数へ(切り捨て。`sample_rate` を掛けるので `u128` で計算する)。
+pub fn hns_to_frames(hns: i64, sample_rate: u32) -> u32 {
+    if hns <= 0 {
+        return 0;
+    }
+    let frames = hns as u128 * sample_rate as u128 / 10_000_000;
+    frames.min(u32::MAX as u128) as u32
+}
+
+/// 出力レイテンシ(ns)= バッファに残っている未再生分 + `GetStreamLatency`。
+pub fn output_latency_ns(padding_frames: u32, sample_rate: u32, stream_latency_hns: i64) -> u64 {
+    frames_to_ns(padding_frames as u64, sample_rate).saturating_add(hns_to_ns(stream_latency_hns))
+}
+
+/// 今回書くバッファの先頭が出力される(と予測される)ホスト単調時刻(ns)。
+pub fn playback_start_ns(callback_ns: u64, latency_ns: u64) -> u64 {
+    callback_ns.saturating_add(latency_ns)
+}
+
+/// 今回書ける(空いている)フレーム数。`padding` が `buffer` を超える異常値は 0、
+/// 上限は [`MAX_RENDER_FRAMES`]。
+pub fn writable_frames(buffer_frames: u32, padding_frames: u32) -> u32 {
+    buffer_frames
+        .saturating_sub(padding_frames)
+        .min(MAX_RENDER_FRAMES)
+}
+
+/// `HRESULT` を `0x88890004` の形に整形する(ログ・エラー文言用)。
+pub fn hresult_hex(hr: Hresult) -> String {
+    format!("0x{:08X}", hr as u32)
+}
+
+/// 開く途中(エンドポイント取得〜`Initialize`)の失敗を `BackendError` へ分類する。
+/// `stage` は失敗した呼び出しの名前。デバイスが無い(`E_NOTFOUND` /
+/// `AUDCLNT_E_ENDPOINT_CREATE_FAILED`)は `NoOutputDevice`、それ以外は `BuildStreamFailed`。
+pub fn classify_open_error(stage: &str, hr: Hresult) -> crate::backend::BackendError {
+    match hr {
+        E_NOTFOUND | AUDCLNT_E_ENDPOINT_CREATE_FAILED => {
+            crate::backend::BackendError::NoOutputDevice
+        }
+        _ => crate::backend::BackendError::BuildStreamFailed(format!(
+            "WASAPI {stage} failed: {} ({})",
+            describe_hresult(hr),
+            hresult_hex(hr)
+        )),
+    }
+}
+
+/// 動いている最中の失敗を `Event::StreamError` の理由へ分類する。
+/// 切断・サービス停止・使用中・リソース無効化は `DeviceUnavailable`(`mw-ffi` の内部再オープンの対象)、
+/// アクセス拒否は `PermissionDenied`、他は `Backend`。
+pub fn classify_stream_error(hr: Hresult) -> StreamErrorReason {
+    match hr {
+        AUDCLNT_E_DEVICE_INVALIDATED
+        | AUDCLNT_E_SERVICE_NOT_RUNNING
+        | AUDCLNT_E_ENDPOINT_CREATE_FAILED
+        | AUDCLNT_E_DEVICE_IN_USE
+        | AUDCLNT_E_RESOURCES_INVALIDATED => StreamErrorReason::DeviceUnavailable,
+        E_ACCESSDENIED => StreamErrorReason::PermissionDenied,
+        _ => StreamErrorReason::Backend,
+    }
+}
+
+/// 既知の `HRESULT` の短い名前(ログ用。未知は `unknown`)。
+pub fn describe_hresult(hr: Hresult) -> &'static str {
+    match hr {
+        E_NOTFOUND => "E_NOTFOUND",
+        E_ACCESSDENIED => "E_ACCESSDENIED",
+        AUDCLNT_E_DEVICE_INVALIDATED => "AUDCLNT_E_DEVICE_INVALIDATED",
+        AUDCLNT_E_UNSUPPORTED_FORMAT => "AUDCLNT_E_UNSUPPORTED_FORMAT",
+        AUDCLNT_E_DEVICE_IN_USE => "AUDCLNT_E_DEVICE_IN_USE",
+        AUDCLNT_E_ENDPOINT_CREATE_FAILED => "AUDCLNT_E_ENDPOINT_CREATE_FAILED",
+        AUDCLNT_E_SERVICE_NOT_RUNNING => "AUDCLNT_E_SERVICE_NOT_RUNNING",
+        AUDCLNT_E_RESOURCES_INVALIDATED => "AUDCLNT_E_RESOURCES_INVALIDATED",
+        _ => "unknown",
+    }
+}
+
+// ============================================================================
+// COM の宣言(自前。新しいクレートは追加しない)
+// ============================================================================
+//
+// vtable は C++ の仮想関数テーブルと同じ並び(`IUnknown` の 3 つ + 各インターフェース固有)。
+// 使わないスロットも位置を保つために `*const c_void` で残す。並びは下のテストで
+// `offset_of!` により固定している。
+
+type ThisPtr = *mut c_void;
+
+/// `IUnknown` の vtable。
+#[repr(C)]
+pub struct IUnknownVtbl {
+    pub query_interface: *const c_void,
+    pub add_ref: unsafe extern "system" fn(ThisPtr) -> u32,
+    pub release: unsafe extern "system" fn(ThisPtr) -> u32,
+}
+
+/// `IMMDeviceEnumerator` の vtable。
+#[repr(C)]
+pub struct IMmDeviceEnumeratorVtbl {
+    pub unknown: IUnknownVtbl,
+    pub enum_audio_endpoints: *const c_void,
+    pub get_default_audio_endpoint:
+        unsafe extern "system" fn(ThisPtr, i32, i32, *mut ThisPtr) -> Hresult,
+    pub get_device: *const c_void,
+    pub register_endpoint_notification_callback: *const c_void,
+    pub unregister_endpoint_notification_callback: *const c_void,
+}
+
+/// `IMMDevice` の vtable。
+#[repr(C)]
+pub struct IMmDeviceVtbl {
+    pub unknown: IUnknownVtbl,
+    pub activate: unsafe extern "system" fn(
+        ThisPtr,
+        *const Guid,
+        u32,
+        *const c_void,
+        *mut ThisPtr,
+    ) -> Hresult,
+    pub open_property_store: *const c_void,
+    pub get_id: *const c_void,
+    pub get_state: *const c_void,
+}
+
+/// `IAudioClient` の vtable。
+#[repr(C)]
+pub struct IAudioClientVtbl {
+    pub unknown: IUnknownVtbl,
+    pub initialize: unsafe extern "system" fn(
+        ThisPtr,
+        i32,
+        u32,
+        i64,
+        i64,
+        *const WaveFormatExtensible,
+        *const Guid,
+    ) -> Hresult,
+    pub get_buffer_size: unsafe extern "system" fn(ThisPtr, *mut u32) -> Hresult,
+    pub get_stream_latency: unsafe extern "system" fn(ThisPtr, *mut i64) -> Hresult,
+    pub get_current_padding: unsafe extern "system" fn(ThisPtr, *mut u32) -> Hresult,
+    pub is_format_supported: *const c_void,
+    pub get_mix_format: unsafe extern "system" fn(ThisPtr, *mut *mut WaveFormatEx) -> Hresult,
+    pub get_device_period: unsafe extern "system" fn(ThisPtr, *mut i64, *mut i64) -> Hresult,
+    pub start: unsafe extern "system" fn(ThisPtr) -> Hresult,
+    pub stop: unsafe extern "system" fn(ThisPtr) -> Hresult,
+    pub reset: unsafe extern "system" fn(ThisPtr) -> Hresult,
+    pub set_event_handle: unsafe extern "system" fn(ThisPtr, *mut c_void) -> Hresult,
+    pub get_service: unsafe extern "system" fn(ThisPtr, *const Guid, *mut ThisPtr) -> Hresult,
+}
+
+/// `IAudioRenderClient` の vtable。
+#[repr(C)]
+pub struct IAudioRenderClientVtbl {
+    pub unknown: IUnknownVtbl,
+    pub get_buffer: unsafe extern "system" fn(ThisPtr, u32, *mut *mut u8) -> Hresult,
+    pub release_buffer: unsafe extern "system" fn(ThisPtr, u32, u32) -> Hresult,
+}
+
+/// `AUDCLNT_SHAREMODE_SHARED`。
+pub const AUDCLNT_SHAREMODE_SHARED: i32 = 0;
+/// `AUDCLNT_STREAMFLAGS_EVENTCALLBACK`。
+pub const AUDCLNT_STREAMFLAGS_EVENTCALLBACK: u32 = 0x0004_0000;
+/// `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`。
+pub const AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM: u32 = 0x8000_0000;
+/// `AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY`。
+pub const AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY: u32 = 0x0800_0000;
+/// `AUDCLNT_BUFFERFLAGS_SILENT`。
+pub const AUDCLNT_BUFFERFLAGS_SILENT: u32 = 0x2;
+/// `EDataFlow::eRender`。
+pub const E_RENDER: i32 = 0;
+/// `ERole::eConsole`。
+pub const E_CONSOLE: i32 = 0;
+/// `CLSCTX_ALL`。
+pub const CLSCTX_ALL: u32 = 0x17;
+/// `COINIT_MULTITHREADED`。
+pub const COINIT_MULTITHREADED: u32 = 0;
+
+/// 共有モードの初期化フラグ(イベント駆動 + 形式変換)。
+pub const INIT_STREAM_FLAGS: u32 = AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+    | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+    | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+
+#[cfg(target_os = "windows")]
+const WAIT_OBJECT_0: u32 = 0;
+#[cfg(target_os = "windows")]
+const WAIT_TIMEOUT: u32 = 0x0000_0102;
+
+#[cfg(target_os = "windows")]
+#[link(name = "ole32")]
+unsafe extern "system" {
+    fn CoInitializeEx(reserved: *const c_void, co_init: u32) -> Hresult;
+    fn CoUninitialize();
+    fn CoCreateInstance(
+        rclsid: *const Guid,
+        outer: *mut c_void,
+        cls_context: u32,
+        riid: *const Guid,
+        out: *mut *mut c_void,
+    ) -> Hresult;
+    fn CoTaskMemFree(ptr: *mut c_void);
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateEventW(
+        attributes: *const c_void,
+        manual_reset: i32,
+        initial_state: i32,
+        name: *const u16,
+    ) -> *mut c_void;
+    fn SetEvent(handle: *mut c_void) -> i32;
+    fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+    fn CloseHandle(handle: *mut c_void) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "avrt")]
+unsafe extern "system" {
+    fn AvSetMmThreadCharacteristicsW(task_name: *const u16, task_index: *mut u32) -> *mut c_void;
+    fn AvRevertMmThreadCharacteristics(handle: *mut c_void) -> i32;
+}
+
+/// `"Pro Audio"` の UTF-16(NUL 終端)。
+#[cfg(target_os = "windows")]
+const MMCSS_TASK_NAME: [u16; 10] = [
+    b'P' as u16,
+    b'r' as u16,
+    b'o' as u16,
+    b' ' as u16,
+    b'A' as u16,
+    b'u' as u16,
+    b'd' as u16,
+    b'i' as u16,
+    b'o' as u16,
+    0,
+];
+
+/// COM オブジェクトの先頭(vtable へのポインタ)。
+#[repr(C)]
+pub struct ComObject<V> {
+    vtbl: *const V,
+}
+
+/// COM インターフェースの所有ポインタ。`Drop` で `Release` する。
+///
+/// 不変条件: `ptr` は非 NULL で、`Release` するまで有効な `V` 形の COM オブジェクトを指す。
+/// スレッド間で移さない(`Send` を実装しない)——COM の呼び出しは作ったスレッドだけで行う。
+#[cfg(target_os = "windows")]
+struct Com<V> {
+    ptr: *mut ComObject<V>,
+}
+
+#[cfg(target_os = "windows")]
+impl<V> Com<V> {
+    /// # Safety
+    /// `ptr` は NULL か、参照を 1 つ所有する `V` 形の COM インターフェースであること。
+    unsafe fn from_raw(ptr: *mut c_void) -> Option<Self> {
+        if ptr.is_null() {
+            None
+        } else {
+            Some(Self { ptr: ptr.cast() })
+        }
+    }
+
+    fn this(&self) -> *mut c_void {
+        self.ptr.cast()
+    }
+
+    fn vtbl(&self) -> &V {
+        // SAFETY: 不変条件により `ptr` は有効で、その先頭は有効な vtable へのポインタ。
+        // `Com` が生きている間は `Release` されない。
+        unsafe { &*(*self.ptr).vtbl }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl<V> Drop for Com<V> {
+    fn drop(&mut self) {
+        // SAFETY: すべての COM インターフェースの vtable は `IUnknown` の 3 スロットで始まるので、
+        // `IUnknownVtbl` として読んでよい。参照を 1 つ所有しているので `Release` は 1 回。
+        unsafe {
+            let unknown = (*self.ptr).vtbl.cast::<IUnknownVtbl>();
+            ((*unknown).release)(self.this());
+        }
+    }
+}
+
+/// `CoInitializeEx` / `CoUninitialize` の対。
+#[cfg(target_os = "windows")]
+struct ComApartment;
+
+#[cfg(target_os = "windows")]
+impl ComApartment {
+    fn enter() -> Result<Self, Hresult> {
+        // SAFETY: 予約引数は NULL。成功(`S_OK` / `S_FALSE`)したら `Drop` で対になる
+        // `CoUninitialize` を呼ぶ。
+        let hr = unsafe { CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED) };
+        if hr < 0 { Err(hr) } else { Ok(Self) }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        // SAFETY: `enter` が成功した同じスレッドで、1 回だけ呼ぶ。
+        unsafe { CoUninitialize() }
+    }
+}
+
+/// MMCSS への登録。`Drop` で解除する。失敗(`None`)しても動作は続ける。
+#[cfg(target_os = "windows")]
+struct MmcssRegistration(*mut c_void);
+
+#[cfg(target_os = "windows")]
+impl MmcssRegistration {
+    fn enter() -> Option<Self> {
+        let mut task_index = 0u32;
+        // SAFETY: タスク名は NUL 終端の UTF-16、`task_index` はスタック上の有効な書き込み先。
+        let handle =
+            unsafe { AvSetMmThreadCharacteristicsW(MMCSS_TASK_NAME.as_ptr(), &mut task_index) };
+        if handle.is_null() {
+            None
+        } else {
+            Some(Self(handle))
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for MmcssRegistration {
+    fn drop(&mut self) {
+        // SAFETY: `enter` が返したハンドルを登録したスレッドで 1 回だけ解除する。
+        unsafe {
+            AvRevertMmThreadCharacteristics(self.0);
+        }
+    }
+}
+
+/// 音声スレッドを起こす/待たせるためのイベントハンドル(自動リセット)。
+///
+/// `Backend` が作って所有し、`close` が join した後に閉じる。音声スレッドは待つだけで閉じない。
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy)]
+struct EventHandle(*mut c_void);
+
+// SAFETY: Win32 のイベントハンドルはプロセス内のどのスレッドからでも
+// `SetEvent` / `WaitForSingleObject` できる。閉じるのは音声スレッドを join した後の 1 回だけ。
+#[cfg(target_os = "windows")]
+unsafe impl Send for EventHandle {}
+
+// ============================================================================
+// ストリーム(音声スレッドが排他的に所有する)
+// ============================================================================
+
+/// 開いた結果(`open` のログとフィールドへ返す)。
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug)]
+struct StreamInfo {
+    sample_rate: u32,
+    buffer_frames: u32,
+    /// 既定のデバイス周期をフレームへ直したもの(アンダーランの間隔検知の基準)。
+    period_frames: u32,
+    default_period_hns: i64,
+    min_period_hns: i64,
+    stream_latency_hns: i64,
+    /// エンドポイントのミックス形式のレート(0 は取得失敗)。
+    mix_sample_rate: u32,
+    mix_channels: u16,
+}
+
+#[cfg(target_os = "windows")]
+struct Stream {
+    // フィールドの宣言順 = 解放順(レンダークライアントを先に、`IAudioClient` を後に)。
+    render: Com<IAudioRenderClientVtbl>,
+    client: Com<IAudioClientVtbl>,
+    info: StreamInfo,
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for Stream {
+    fn drop(&mut self) {
+        // SAFETY: `client` は有効。止まっていても `Stop` は成功する(失敗しても解放は続ける)。
+        unsafe {
+            (self.client.vtbl().stop)(self.client.this());
+        }
+    }
+}
+
+/// `$call` が負の `HRESULT` なら `classify_open_error($stage, hr)` を返す。
+#[cfg(target_os = "windows")]
+macro_rules! check_open {
+    ($stage:expr, $call:expr) => {{
+        let hr: Hresult = $call;
+        if hr < 0 {
+            return Err(classify_open_error($stage, hr));
+        }
+    }};
+}
+
+#[cfg(target_os = "windows")]
+impl Stream {
+    /// 既定のレンダーエンドポイントを共有モード・イベント駆動で初期化する(開始はしない)。
+    fn open(event: EventHandle) -> Result<Self, BackendError> {
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        // SAFETY: GUID は有効な静的値、出力先はスタック上のポインタ。
+        let hr = unsafe {
+            CoCreateInstance(
+                &CLSID_MM_DEVICE_ENUMERATOR,
+                std::ptr::null_mut(),
+                CLSCTX_ALL,
+                &IID_IMM_DEVICE_ENUMERATOR,
+                &mut raw,
+            )
+        };
+        check_open!("CoCreateInstance(MMDeviceEnumerator)", hr);
+        // SAFETY: 成功した `CoCreateInstance` は参照を 1 つ所有する要求どおりのインターフェースを返す。
+        let enumerator = unsafe { Com::<IMmDeviceEnumeratorVtbl>::from_raw(raw) }
+            .ok_or(BackendError::NoOutputDevice)?;
+
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `enumerator` は有効、出力先はスタック上のポインタ。
+        let hr = unsafe {
+            (enumerator.vtbl().get_default_audio_endpoint)(
+                enumerator.this(),
+                E_RENDER,
+                E_CONSOLE,
+                &mut raw,
+            )
+        };
+        check_open!("GetDefaultAudioEndpoint", hr);
+        // SAFETY: 成功した呼び出しは参照を 1 つ所有する `IMMDevice` を返す。
+        let device =
+            unsafe { Com::<IMmDeviceVtbl>::from_raw(raw) }.ok_or(BackendError::NoOutputDevice)?;
+
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `device` は有効。`IID_IAUDIO_CLIENT` を要求しているので結果は `IAudioClient`。
+        let hr = unsafe {
+            (device.vtbl().activate)(
+                device.this(),
+                &IID_IAUDIO_CLIENT,
+                CLSCTX_ALL,
+                std::ptr::null(),
+                &mut raw,
+            )
+        };
+        check_open!("IMMDevice::Activate(IAudioClient)", hr);
+        // SAFETY: 成功した `Activate` は参照を 1 つ所有する `IAudioClient` を返す。
+        let client = unsafe { Com::<IAudioClientVtbl>::from_raw(raw) }.ok_or_else(|| {
+            BackendError::BuildStreamFailed("IMMDevice::Activate returned NULL".into())
+        })?;
+
+        let mut default_period_hns = 0i64;
+        let mut min_period_hns = 0i64;
+        // SAFETY: 出力先はスタック上の有効な `i64`。
+        let hr = unsafe {
+            (client.vtbl().get_device_period)(
+                client.this(),
+                &mut default_period_hns,
+                &mut min_period_hns,
+            )
+        };
+        check_open!("GetDevicePeriod", hr);
+
+        // エンドポイントのミックス形式(ログ用。取れなくても続行する)。
+        let (mix_sample_rate, mix_channels) = {
+            let mut mix: *mut WaveFormatEx = std::ptr::null_mut();
+            // SAFETY: 出力先はスタック上のポインタ。成功時の戻りは `CoTaskMemFree` で解放する。
+            let hr = unsafe { (client.vtbl().get_mix_format)(client.this(), &mut mix) };
+            if hr >= 0 && !mix.is_null() {
+                // SAFETY: `mix` は `GetMixFormat` が返した有効な `WAVEFORMATEX`(1 バイト詰めなので
+                // 値は `read_unaligned` で読む)。読み終えたら解放する。
+                unsafe {
+                    let format = std::ptr::read_unaligned(mix);
+                    CoTaskMemFree(mix.cast());
+                    (format.samples_per_sec, format.channels)
+                }
+            } else {
+                (0, 0)
+            }
+        };
+
+        let format = float_stereo_format(TARGET_SAMPLE_RATE_HZ);
+        // SAFETY: `format` はこの呼び出しのあいだ有効。セッション GUID は NULL。
+        let hr = unsafe {
+            (client.vtbl().initialize)(
+                client.this(),
+                AUDCLNT_SHAREMODE_SHARED,
+                INIT_STREAM_FLAGS,
+                default_period_hns,
+                0,
+                &format,
+                std::ptr::null(),
+            )
+        };
+        check_open!("IAudioClient::Initialize", hr);
+
+        // SAFETY: `event` は `Backend` が作った有効なイベントハンドル(close まで閉じられない)。
+        let hr = unsafe { (client.vtbl().set_event_handle)(client.this(), event.0) };
+        check_open!("SetEventHandle", hr);
+
+        let mut buffer_frames = 0u32;
+        // SAFETY: 出力先はスタック上の有効な `u32`。
+        let hr = unsafe { (client.vtbl().get_buffer_size)(client.this(), &mut buffer_frames) };
+        check_open!("GetBufferSize", hr);
+
+        let mut stream_latency_hns = 0i64;
+        // SAFETY: 出力先はスタック上の有効な `i64`。
+        let hr =
+            unsafe { (client.vtbl().get_stream_latency)(client.this(), &mut stream_latency_hns) };
+        check_open!("GetStreamLatency", hr);
+
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `IID_IAUDIO_RENDER_CLIENT` を要求しているので結果は `IAudioRenderClient`。
+        let hr = unsafe {
+            (client.vtbl().get_service)(client.this(), &IID_IAUDIO_RENDER_CLIENT, &mut raw)
+        };
+        check_open!("GetService(IAudioRenderClient)", hr);
+        // SAFETY: 成功した `GetService` は参照を 1 つ所有する `IAudioRenderClient` を返す。
+        let render = unsafe { Com::<IAudioRenderClientVtbl>::from_raw(raw) }.ok_or_else(|| {
+            BackendError::BuildStreamFailed("GetService(IAudioRenderClient) returned NULL".into())
+        })?;
+
+        let period_frames =
+            hns_to_frames(default_period_hns, TARGET_SAMPLE_RATE_HZ).clamp(1, MAX_RENDER_FRAMES);
+        Ok(Self {
+            render,
+            client,
+            info: StreamInfo {
+                sample_rate: TARGET_SAMPLE_RATE_HZ,
+                buffer_frames,
+                period_frames,
+                default_period_hns,
+                min_period_hns,
+                stream_latency_hns,
+                mix_sample_rate,
+                mix_channels,
+            },
+        })
+    }
+
+    fn start(&self) -> Result<(), BackendError> {
+        // SAFETY: `client` は初期化済みで有効。
+        let hr = unsafe { (self.client.vtbl().start)(self.client.this()) };
+        if hr < 0 {
+            return Err(BackendError::PlayStreamFailed(format!(
+                "WASAPI IAudioClient::Start failed: {} ({})",
+                describe_hresult(hr),
+                hresult_hex(hr)
+            )));
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// 音声スレッド
+// ============================================================================
+
+/// 音声スレッドが排他的に所有する状態。
+#[cfg(target_os = "windows")]
+struct WorkerContext {
+    renderer: Renderer,
+    events: Arc<EventQueue>,
+    wake: EventHandle,
+    stop: Arc<AtomicBool>,
+    underrun_tracker: OutputUnderrunTracker,
+    callback_frames: Arc<AtomicU32>,
+    callback_count: Arc<AtomicU64>,
+    output_latency_ns: Arc<AtomicU64>,
+}
+
+/// 音声スレッドの本体。初期化の結果を `init_tx` で `open` へ返し、成功ならループに入る。
+///
+/// 音声スレッドの規約(`mw-core/COMMON.md`): ループの中でロック・ヒープ確保をしない
+/// (`mw_log!` も呼ばない)。例外は終了時の致命的エラー通知だけ(`push_side_channel` は
+/// `Mutex` を使うが、そのあとスレッドは終わる)。
+#[cfg(target_os = "windows")]
+fn worker_main(mut context: WorkerContext, init_tx: SyncSender<Result<StreamInfo, BackendError>>) {
+    let caught = panic::catch_unwind(AssertUnwindSafe(|| worker_run(&mut context, &init_tx)));
+    let fatal = match caught {
+        Ok(reason) => reason,
+        // 契約が破られた場合の最後の防波堤(他バックエンドの `catch_unwind` と同じ方針)。
+        Err(_) => Some(StreamErrorReason::Backend),
+    };
+    if let Some(reason) = fatal {
+        context
+            .events
+            .push_side_channel(Event::StreamError { reason });
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn worker_run(
+    context: &mut WorkerContext,
+    init_tx: &SyncSender<Result<StreamInfo, BackendError>>,
+) -> Option<StreamErrorReason> {
+    // 宣言順の逆に解放される: MMCSS → ストリーム → COM。
+    let _apartment = match ComApartment::enter() {
+        Ok(apartment) => apartment,
+        Err(hr) => {
+            let _ = init_tx.send(Err(BackendError::BuildStreamFailed(format!(
+                "CoInitializeEx failed: {}",
+                hresult_hex(hr)
+            ))));
+            return None;
+        }
+    };
+    let stream = match Stream::open(context.wake) {
+        Ok(stream) => stream,
+        Err(error) => {
+            let _ = init_tx.send(Err(error));
+            return None;
+        }
+    };
+    let _mmcss = MmcssRegistration::enter();
+    if let Err(error) = stream.start() {
+        let _ = init_tx.send(Err(error));
+        return None;
+    }
+    if init_tx.send(Ok(stream.info)).is_err() {
+        // `open` が待ちきれずに諦めた。
+        return None;
+    }
+    worker_loop(context, &stream)
+}
+
+/// ループ本体。止められたら `None`、復旧不能のエラーで抜けたら `Some(理由)`。
+#[cfg(target_os = "windows")]
+fn worker_loop(context: &mut WorkerContext, stream: &Stream) -> Option<StreamErrorReason> {
+    let info = stream.info;
+    let client = &stream.client;
+    let render = &stream.render;
+
+    loop {
+        // SAFETY: `wake` は `Backend` が所有する有効なハンドル(join まで閉じられない)。
+        let waited = unsafe { WaitForSingleObject(context.wake.0, WAIT_TIMEOUT_MS) };
+        if context.stop.load(Ordering::Acquire) {
+            return None;
+        }
+        match waited {
+            WAIT_OBJECT_0 => {}
+            WAIT_TIMEOUT => continue,
+            _ => return Some(StreamErrorReason::Backend),
+        }
+
+        let callback_ns = host_time_ns();
+        let mut padding = 0u32;
+        // SAFETY: `client` は有効、出力先はスタック上の `u32`。
+        let hr = unsafe { (client.vtbl().get_current_padding)(client.this(), &mut padding) };
+        if hr < 0 {
+            return Some(classify_stream_error(hr));
+        }
+        let frames = writable_frames(info.buffer_frames, padding);
+        if frames == 0 {
+            continue;
+        }
+
+        let mut data: *mut u8 = std::ptr::null_mut();
+        // SAFETY: `render` は有効。`frames` は `buffer_frames - padding` 以下なので `GetBuffer` の契約内。
+        let hr = unsafe { (render.vtbl().get_buffer)(render.this(), frames, &mut data) };
+        if hr < 0 {
+            return Some(classify_stream_error(hr));
+        }
+
+        let latency_ns = output_latency_ns(padding, info.sample_rate, info.stream_latency_hns);
+        context
+            .output_latency_ns
+            .store(latency_ns, Ordering::Relaxed);
+        context.callback_frames.store(frames, Ordering::Relaxed);
+        context.callback_count.fetch_add(1, Ordering::Relaxed);
+        context
+            .underrun_tracker
+            .observe(callback_ns, info.period_frames, info.sample_rate);
+
+        let mut flags = 0u32;
+        let mut panicked = false;
+        let sample_count = frames as usize * CHANNELS;
+        if data.is_null() || !(data as usize).is_multiple_of(std::mem::align_of::<f32>()) {
+            // 契約外のポインタ。書かずに無音として返す。
+            flags = AUDCLNT_BUFFERFLAGS_SILENT;
+        } else {
+            // SAFETY: `GetBuffer` は `frames` フレームぶん(f32 × `CHANNELS` ch)の書き込み可能な
+            // 領域を返す。`ReleaseBuffer` するまでこのスレッドだけが触る。アラインは上で確認済み。
+            let buffer =
+                unsafe { std::slice::from_raw_parts_mut(data.cast::<f32>(), sample_count) };
+            let start_ns = playback_start_ns(callback_ns, latency_ns);
+            // 音声スレッド上で呼ぶ mw-core 側の経路は `Renderer::render` のみ。
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                context.renderer.render(buffer, start_ns);
+            }));
+            if result.is_err() {
+                panicked = true;
+                buffer.fill(0.0);
+            }
+        }
+        // SAFETY: 直前の `GetBuffer` と同じ `frames`。
+        let hr = unsafe { (render.vtbl().release_buffer)(render.this(), frames, flags) };
+        if panicked {
+            return Some(StreamErrorReason::Backend);
+        }
+        if hr < 0 {
+            return Some(classify_stream_error(hr));
+        }
+    }
+}
+
+// ============================================================================
+// Backend 実装(Windows のみ)
+// ============================================================================
+
+/// Windows の既定出力(WASAPI 共有モード)へ直接出力する `Backend` 実装。
+#[cfg(target_os = "windows")]
+pub struct WindowsBackend {
+    thread: Option<JoinHandle<()>>,
+    wake: Option<EventHandle>,
+    stop: Arc<AtomicBool>,
+    callback_frames: Arc<AtomicU32>,
+    callback_count: Arc<AtomicU64>,
+    output_latency_ns: Arc<AtomicU64>,
+    logged_output_latency: AtomicBool,
+    sample_rate: u32,
+    output_underrun_count: Arc<AtomicU64>,
+    last_output_underrun_host_time_ns: Arc<AtomicU64>,
+    consecutive_output_underrun_count: Arc<AtomicU32>,
+    logged_output_underrun_count: AtomicU64,
+}
+
+#[cfg(target_os = "windows")]
+impl Default for WindowsBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsBackend {
+    pub fn new() -> Self {
+        Self {
+            thread: None,
+            wake: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            callback_frames: Arc::new(AtomicU32::new(0)),
+            callback_count: Arc::new(AtomicU64::new(0)),
+            output_latency_ns: Arc::new(AtomicU64::new(0)),
+            logged_output_latency: AtomicBool::new(false),
+            sample_rate: 0,
+            output_underrun_count: Arc::new(AtomicU64::new(0)),
+            last_output_underrun_host_time_ns: Arc::new(AtomicU64::new(0)),
+            consecutive_output_underrun_count: Arc::new(AtomicU32::new(0)),
+            logged_output_underrun_count: AtomicU64::new(0),
+        }
+    }
+
+    /// 開いてからの音声ループの回数(実機確認用。0 は一度も回っていない)。
+    pub fn callback_count(&self) -> u64 {
+        self.callback_count.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Backend for WindowsBackend {
+    fn open(&mut self, renderer: Renderer, events: Arc<EventQueue>) -> Result<(), BackendError> {
+        if self.thread.is_some() {
+            return Err(BackendError::AlreadyOpen);
+        }
+        let mut renderer = renderer;
+        // ランプのミリ秒→サンプル数換算(初期構築仕様 §4.1)が正しいレートを使えるよう、
+        // スレッドを起こす前に確定させる(`AUTOCONVERTPCM` で 48kHz が通る前提)。
+        renderer.set_sample_rate(TARGET_SAMPLE_RATE_HZ);
+
+        // SAFETY: 属性・名前は NULL、自動リセット・非シグナルで作る。
+        let wake = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        if wake.is_null() {
+            return Err(BackendError::BuildStreamFailed(
+                "CreateEventW failed".to_string(),
+            ));
+        }
+        let wake = EventHandle(wake);
+
+        self.stop.store(false, Ordering::Release);
+        let context = WorkerContext {
+            renderer,
+            events,
+            wake,
+            stop: Arc::clone(&self.stop),
+            underrun_tracker: OutputUnderrunTracker::new(
+                Arc::clone(&self.output_underrun_count),
+                Arc::clone(&self.last_output_underrun_host_time_ns),
+                Arc::clone(&self.consecutive_output_underrun_count),
+            ),
+            callback_frames: Arc::clone(&self.callback_frames),
+            callback_count: Arc::clone(&self.callback_count),
+            output_latency_ns: Arc::clone(&self.output_latency_ns),
+        };
+        let (init_tx, init_rx) = sync_channel(1);
+        let thread = std::thread::Builder::new()
+            .name("mw-wasapi-render".into())
+            .spawn(move || worker_main(context, init_tx));
+        let thread = match thread {
+            Ok(thread) => thread,
+            Err(error) => {
+                // SAFETY: スレッドが起動しなかったので、ハンドルはこの関数だけが持っている。
+                unsafe {
+                    CloseHandle(wake.0);
+                }
+                return Err(BackendError::PlayStreamFailed(format!(
+                    "failed to spawn the WASAPI render thread: {error}"
+                )));
+            }
+        };
+
+        match init_rx.recv_timeout(Duration::from_millis(INIT_TIMEOUT_MS)) {
+            Ok(Ok(info)) => {
+                crate::mw_log!(
+                    "[mw-backend] (native/windows) output stream started: shared mode, \
+                     event-driven, sample_rate={} Hz (requested {} Hz, endpoint mix format {} Hz \
+                     {} ch), channels={CHANNELS}, buffer={} frames, device period \
+                     default={:.3} ms / min={:.3} ms ({} frames), stream latency={:.3} ms",
+                    info.sample_rate,
+                    TARGET_SAMPLE_RATE_HZ,
+                    info.mix_sample_rate,
+                    info.mix_channels,
+                    info.buffer_frames,
+                    info.default_period_hns as f64 / 10_000.0,
+                    info.min_period_hns as f64 / 10_000.0,
+                    info.period_frames,
+                    info.stream_latency_hns as f64 / 10_000.0,
+                );
+                self.thread = Some(thread);
+                self.wake = Some(wake);
+                self.sample_rate = info.sample_rate;
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                let _ = thread.join();
+                // SAFETY: スレッドは join 済みで、ハンドルを使う者はもういない。
+                unsafe {
+                    CloseHandle(wake.0);
+                }
+                Err(error)
+            }
+            Err(_) => {
+                // 初期化が終わらない(または音声スレッドが応答なしに死んだ)。止めを依頼して諦める。
+                // スレッドがまだ生きている可能性があるため、ハンドルは閉じずに残す(リーク)。
+                self.stop.store(true, Ordering::Release);
+                // SAFETY: ハンドルは有効(閉じていない)。
+                unsafe {
+                    SetEvent(wake.0);
+                }
+                Err(BackendError::BuildStreamFailed(
+                    "WASAPI stream initialization did not complete".to_string(),
+                ))
+            }
+        }
+    }
+
+    fn close(&mut self) -> Result<(), BackendError> {
+        let (Some(thread), Some(wake)) = (self.thread.take(), self.wake.take()) else {
+            return Err(BackendError::NotOpen);
+        };
+        self.stop.store(true, Ordering::Release);
+        // SAFETY: ハンドルは有効(まだ閉じていない)。待っている音声スレッドを起こす。
+        unsafe {
+            SetEvent(wake.0);
+        }
+        // パニックで終わっていても `Err` が返るだけなので無視してよい。
+        let _ = thread.join();
+        // SAFETY: 音声スレッドは join 済みで、ハンドルを使う者はもういない。
+        unsafe {
+            CloseHandle(wake.0);
+        }
+
+        self.sample_rate = 0;
+        self.callback_frames.store(0, Ordering::Relaxed);
+        self.callback_count.store(0, Ordering::Relaxed);
+        self.output_latency_ns.store(0, Ordering::Relaxed);
+        self.logged_output_latency.store(false, Ordering::Relaxed);
+        self.output_underrun_count.store(0, Ordering::Relaxed);
+        self.last_output_underrun_host_time_ns
+            .store(0, Ordering::Relaxed);
+        self.consecutive_output_underrun_count
+            .store(0, Ordering::Relaxed);
+        self.logged_output_underrun_count
+            .store(0, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn is_open(&self) -> bool {
+        self.thread.is_some()
+    }
+
+    fn last_callback_frames(&self) -> u32 {
+        self.callback_frames.load(Ordering::Relaxed)
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn output_latency_ns(&self) -> u64 {
+        self.output_latency_ns.load(Ordering::Relaxed)
+    }
+
+    fn log_output_latency_once(&self) {
+        if self.logged_output_latency.load(Ordering::Relaxed) {
+            return;
+        }
+        let latency_ns = self.output_latency_ns();
+        if latency_ns == 0 {
+            return;
+        }
+        self.logged_output_latency.store(true, Ordering::Relaxed);
+        let latency_ms = latency_ns as f64 / 1_000_000.0;
+        crate::mw_log!(
+            "[mw-backend] (native/windows) output latency (padding + GetStreamLatency): \
+             {latency_ns} ns = {latency_ms:.3} ms"
+        );
+    }
+
+    fn log_new_output_underruns(&self) {
+        let current = self.output_underrun_count.load(Ordering::Relaxed);
+        let last_logged = self.logged_output_underrun_count.load(Ordering::Relaxed);
+        if current <= last_logged {
+            return;
+        }
+        self.logged_output_underrun_count
+            .store(current, Ordering::Relaxed);
+        let new_count = current - last_logged;
+        let consecutive = self
+            .consecutive_output_underrun_count
+            .load(Ordering::Relaxed);
+        crate::mw_log!(
+            "[mw-backend] (native/windows) output underrun suspected: +{new_count} since \
+             last check (cumulative={current}, consecutive={consecutive})"
+        );
+    }
+
+    fn output_underrun_count(&self) -> u64 {
+        self.output_underrun_count.load(Ordering::Relaxed)
+    }
+
+    fn last_output_underrun_host_time_ns(&self) -> u64 {
+        self.last_output_underrun_host_time_ns
+            .load(Ordering::Relaxed)
+    }
+
+    fn consecutive_output_underrun_count(&self) -> u32 {
+        self.consecutive_output_underrun_count
+            .load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::BackendError;
+    use std::mem::{offset_of, size_of};
+
+    const PTR: usize = size_of::<usize>();
+
+    #[test]
+    fn float_stereo_format_describes_interleaved_f32_at_the_requested_rate() {
+        let f = float_stereo_format(48_000);
+        let format = f.format;
+        assert_eq!({ format.format_tag }, WAVE_FORMAT_EXTENSIBLE);
+        assert_eq!({ format.channels }, 2);
+        assert_eq!({ format.samples_per_sec }, 48_000);
+        assert_eq!({ format.bits_per_sample }, 32);
+        assert_eq!({ format.block_align }, 8);
+        assert_eq!({ format.avg_bytes_per_sec }, 384_000);
+        assert_eq!({ format.cb_size }, 22);
+        assert_eq!({ f.valid_bits_per_sample }, 32);
+        assert_eq!({ f.channel_mask }, 0x3);
+        assert_eq!({ f.sub_format }, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+    }
+
+    #[test]
+    fn wave_format_structs_have_the_packed_win32_layout() {
+        assert_eq!(size_of::<WaveFormatEx>(), 18);
+        assert_eq!(size_of::<WaveFormatExtensible>(), 40);
+        assert_eq!(size_of::<Guid>(), 16);
+    }
+
+    #[test]
+    fn vtable_slots_match_the_com_interface_definitions() {
+        // IUnknown が 3 スロット。以降は各インターフェースの宣言順(Windows SDK のヘッダ)。
+        assert_eq!(size_of::<IUnknownVtbl>(), 3 * PTR);
+        assert_eq!(
+            offset_of!(IMmDeviceEnumeratorVtbl, get_default_audio_endpoint),
+            4 * PTR
+        );
+        assert_eq!(size_of::<IMmDeviceEnumeratorVtbl>(), 8 * PTR);
+        assert_eq!(offset_of!(IMmDeviceVtbl, activate), 3 * PTR);
+        assert_eq!(size_of::<IMmDeviceVtbl>(), 7 * PTR);
+        assert_eq!(offset_of!(IAudioClientVtbl, initialize), 3 * PTR);
+        assert_eq!(offset_of!(IAudioClientVtbl, get_buffer_size), 4 * PTR);
+        assert_eq!(offset_of!(IAudioClientVtbl, get_stream_latency), 5 * PTR);
+        assert_eq!(offset_of!(IAudioClientVtbl, get_current_padding), 6 * PTR);
+        assert_eq!(offset_of!(IAudioClientVtbl, get_mix_format), 8 * PTR);
+        assert_eq!(offset_of!(IAudioClientVtbl, get_device_period), 9 * PTR);
+        assert_eq!(offset_of!(IAudioClientVtbl, start), 10 * PTR);
+        assert_eq!(offset_of!(IAudioClientVtbl, stop), 11 * PTR);
+        assert_eq!(offset_of!(IAudioClientVtbl, set_event_handle), 13 * PTR);
+        assert_eq!(offset_of!(IAudioClientVtbl, get_service), 14 * PTR);
+        assert_eq!(size_of::<IAudioClientVtbl>(), 15 * PTR);
+        assert_eq!(offset_of!(IAudioRenderClientVtbl, get_buffer), 3 * PTR);
+        assert_eq!(offset_of!(IAudioRenderClientVtbl, release_buffer), 4 * PTR);
+        assert_eq!(size_of::<IAudioRenderClientVtbl>(), 5 * PTR);
+    }
+
+    #[test]
+    fn hns_to_ns_scales_by_one_hundred_and_saturates() {
+        assert_eq!(hns_to_ns(100_000), 10_000_000); // 10ms
+        assert_eq!(hns_to_ns(0), 0);
+        assert_eq!(hns_to_ns(-5), 0);
+        assert_eq!(hns_to_ns(i64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn hns_to_frames_truncates_at_the_given_rate() {
+        assert_eq!(hns_to_frames(100_000, 48_000), 480); // 10ms
+        assert_eq!(hns_to_frames(30_000, 48_000), 144); // 3ms
+        assert_eq!(hns_to_frames(-1, 48_000), 0);
+        assert_eq!(hns_to_frames(i64::MAX, u32::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn output_latency_adds_the_queued_frames_and_the_stream_latency() {
+        // 480 フレーム(48kHz で 10ms)+ 10ms = 20ms。
+        assert_eq!(output_latency_ns(480, 48_000, 100_000), 20_000_000);
+        assert_eq!(output_latency_ns(0, 48_000, 0), 0);
+    }
+
+    #[test]
+    fn output_latency_ignores_negative_stream_latency_and_unknown_rate() {
+        assert_eq!(output_latency_ns(480, 48_000, -1), 10_000_000);
+        assert_eq!(output_latency_ns(480, 0, 100_000), 10_000_000);
+    }
+
+    #[test]
+    fn playback_start_adds_the_latency_and_saturates() {
+        assert_eq!(playback_start_ns(1_000, 500), 1_500);
+        assert_eq!(playback_start_ns(u64::MAX - 1, 10), u64::MAX);
+    }
+
+    #[test]
+    fn writable_frames_is_the_free_space_capped_and_never_negative() {
+        assert_eq!(writable_frames(960, 480), 480);
+        assert_eq!(writable_frames(960, 0), 960);
+        assert_eq!(writable_frames(960, 960), 0);
+        assert_eq!(writable_frames(960, 2_000), 0);
+        assert_eq!(writable_frames(u32::MAX, 0), MAX_RENDER_FRAMES);
+    }
+
+    #[test]
+    fn hresult_hex_prints_the_unsigned_value() {
+        assert_eq!(hresult_hex(AUDCLNT_E_DEVICE_INVALIDATED), "0x88890004");
+        assert_eq!(hresult_hex(E_NOTFOUND), "0x80070490");
+    }
+
+    #[test]
+    fn open_errors_for_a_missing_endpoint_map_to_no_output_device() {
+        assert!(matches!(
+            classify_open_error("GetDefaultAudioEndpoint", E_NOTFOUND),
+            BackendError::NoOutputDevice
+        ));
+        assert!(matches!(
+            classify_open_error("Activate", AUDCLNT_E_ENDPOINT_CREATE_FAILED),
+            BackendError::NoOutputDevice
+        ));
+    }
+
+    #[test]
+    fn other_open_errors_keep_the_stage_and_the_hresult() {
+        let error = classify_open_error("IAudioClient::Initialize", AUDCLNT_E_UNSUPPORTED_FORMAT);
+        match error {
+            BackendError::BuildStreamFailed(message) => {
+                assert!(message.contains("IAudioClient::Initialize"), "{message}");
+                assert!(
+                    message.contains("AUDCLNT_E_UNSUPPORTED_FORMAT"),
+                    "{message}"
+                );
+                assert!(message.contains("0x88890008"), "{message}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_errors_are_classified_like_the_other_backends() {
+        for hr in [
+            AUDCLNT_E_DEVICE_INVALIDATED,
+            AUDCLNT_E_SERVICE_NOT_RUNNING,
+            AUDCLNT_E_DEVICE_IN_USE,
+            AUDCLNT_E_RESOURCES_INVALIDATED,
+        ] {
+            assert_eq!(
+                classify_stream_error(hr),
+                StreamErrorReason::DeviceUnavailable,
+                "{}",
+                hresult_hex(hr)
+            );
+        }
+        assert_eq!(
+            classify_stream_error(E_ACCESSDENIED),
+            StreamErrorReason::PermissionDenied
+        );
+        assert_eq!(classify_stream_error(-1), StreamErrorReason::Backend);
+    }
+
+    #[cfg(target_os = "windows")]
+    mod device {
+        use super::super::*;
+        use mw_core::{BusId, Command, SoundData};
+
+        /// 実デバイス(既定の出力)を開き、440Hz の正弦波を数秒鳴らして、
+        /// コールバック回数・xrun 数・出力遅延を出力する。
+        /// `cargo test -p mw-backend plays_a_tone -- --ignored --nocapture` で手動実行する。
+        #[test]
+        #[ignore = "実デバイス(既定の出力)を開いて数秒鳴らすため、手元の Windows でのみ実行する"]
+        fn plays_a_tone_on_the_real_default_output_and_reports_the_numbers() {
+            let (renderer, sender, _reclaim, _music_producer, _music_clock, events, _bgm) =
+                mw_core::Renderer::build(mw_core::Config::default(), 48_000);
+            let mut backend = WindowsBackend::new();
+            backend
+                .open(renderer, events)
+                .expect("open should succeed on a machine with a default output device");
+            assert!(backend.is_open());
+            assert_eq!(backend.sample_rate(), TARGET_SAMPLE_RATE_HZ);
+
+            let frames = 48_000usize;
+            let mut interleaved = Vec::with_capacity(frames * CHANNELS);
+            for n in 0..frames {
+                let phase = 2.0 * std::f32::consts::PI * 440.0 * n as f32 / 48_000.0;
+                let s = 0.1 * phase.sin();
+                interleaved.push(s);
+                interleaved.push(s);
+            }
+            let sound = Arc::new(SoundData {
+                sample_rate: 48_000,
+                frames,
+                interleaved,
+            });
+            assert!(sender.send(Command::PlaySe {
+                voice_serial: 1,
+                sound_id: 1,
+                sound,
+                bus: BusId::Se,
+                volume: 1.0,
+            }));
+            assert!(sender.send(Command::SetVoiceLoop {
+                voice_serial: 1,
+                region: Some((0, frames as u64)),
+            }));
+
+            let started = std::time::Instant::now();
+            let mut latency_samples = Vec::new();
+            while started.elapsed() < Duration::from_secs(4) {
+                std::thread::sleep(Duration::from_millis(100));
+                latency_samples.push(backend.output_latency_ns());
+            }
+            let elapsed = started.elapsed().as_secs_f64();
+
+            let count = backend.callback_count();
+            let frames_per_callback = backend.last_callback_frames();
+            let underruns = backend.output_underrun_count();
+            let min = latency_samples.iter().copied().min().unwrap_or(0);
+            let max = latency_samples.iter().copied().max().unwrap_or(0);
+            println!(
+                "WASAPI real-device run: {elapsed:.2} s, callbacks={count} ({:.1}/s), \
+                 last_callback_frames={frames_per_callback}, xruns(suspected)={underruns}, \
+                 output_latency_ns min={min} max={max} ({:.3}..{:.3} ms)",
+                count as f64 / elapsed,
+                min as f64 / 1e6,
+                max as f64 / 1e6,
+            );
+
+            assert!(count > 0, "the render loop never ran");
+            assert!(frames_per_callback > 0);
+            assert!(max > 0, "no output latency was reported");
+
+            backend.close().expect("close should succeed");
+            assert!(!backend.is_open());
+            assert_eq!(backend.callback_count(), 0);
+        }
+    }
+}
