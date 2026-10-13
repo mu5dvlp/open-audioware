@@ -471,6 +471,14 @@ pub struct LinuxBackend {
 unsafe impl Send for LinuxBackend {}
 
 #[cfg(target_os = "linux")]
+impl Drop for LinuxBackend {
+    /// `close` せずに落とされても書き込みスレッドと PCM ハンドルを残さない。
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl Default for LinuxBackend {
     fn default() -> Self {
         Self::new()

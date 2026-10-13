@@ -183,22 +183,37 @@ WASAPI ホストと比べた表。Unity Editor(Windows)で鳴らすための出�
 |---|---|---|---|---|---|
 | W1 | 出力先 | 既定のレンダーエンドポイント | `eRender` / `eConsole` の既定を `IMMDeviceEnumerator::GetDefaultAudioEndpoint` で取る | 同じ | ✅ 鳴った |
 | W2 | 共有 / 排他 | 共有モード・イベント駆動 | 共有モード・イベント駆動(`EVENTCALLBACK`) | 同じ | ✅ |
-| W3 | 🔴 **サンプルレート** | f32 ステレオで 48kHz を優先して要求(`find_f32_stereo_config`) | 48kHz を要求し、`AUTOCONVERTPCM` + `SRC_DEFAULT_QUALITY` でエンジンに変換させる。`Renderer` へは 48000 を渡す。開いたとき、エンドポイントのミックス形式のレートもログに出す | 同じ | ✅ ミックス形式 48000 Hz 2ch のため変換は挟まらなかった。44.1kHz のエンドポイントでは未確認 |
+| W3 | 🔴 **サンプルレート** | f32 ステレオで 48kHz を優先して要求(`find_f32_stereo_config`) | 48kHz を要求し、`AUTOCONVERTPCM` + `SRC_DEFAULT_QUALITY` でエンジンに変換させる。`Renderer` へは 48000 を渡す。開いたとき、エンドポイントのミックス形式のレートもログに出す | 同じ | ✅ ミックス形式 48000 Hz 2ch では変換が挟まらない。レビューで装置の形式を 44.1k/2ch・96k/2ch・48k/6ch・48k/1ch に変えて開き、4 通りとも鳴った(バッファは 44.1k で 1124、96k で 1122 frames、遅延は約 13.4 ms〔padding のみの旧式での値〕) |
 | W4 | 形式 | f32 / 2ch | `WAVE_FORMAT_EXTENSIBLE`・IEEE float・32bit・2ch・`SPEAKER_FRONT_LEFT\|RIGHT` | 同じ | ✅ |
 | W5 | バッファ長 | 既定のデバイス周期 | `GetDevicePeriod` の既定周期を `Initialize` に渡す。開いた後に `GetBufferSize`・既定/最小周期・`GetStreamLatency` をログに出す(実効値のログ) | 同じ | ✅ 周期 10.000 ms(最小 3.000 ms)・バッファ 1056 frames・コールバック 480 frames |
-| W6 | 音声スレッドの優先度 | `audio_thread_priority`(MMCSS) | `AvSetMmThreadCharacteristicsW("Pro Audio")`(`avrt`)。失敗しても続行 | 同じ(目的) | 登録の成否はログに出していない |
-| W7 | 異常時のバッファ | データコールバックの前にゼロで埋める | `GetBuffer` の領域へ直接 `render`。ポインタが NULL・非アラインなら書かず `AUDCLNT_BUFFERFLAGS_SILENT` で返す。`render` が panic したらゼロで埋めて返し、`StreamError { Backend }` を積んで止まる | 同じ結果(正常時は `render` が全体を上書きする) | — |
-| W8 | xrun の数え方 | WASAPI は回数を出さない。本リポジトリのヒューリスティック(`OutputUnderrunTracker::observe`) | 同じヒューリスティック(基準はデバイス周期のフレーム数) | 同じ(OS の実数は無い) | ✅ 4 秒間 0 回 |
-| W9 | 🔴 **出力時刻・出力遅延** | `StreamInstant`(`GetBuffer` 時刻 + padding 等からの予測) | 出力遅延 = `GetCurrentPadding` のフレーム(ns 換算)+ `GetStreamLatency`。出力時刻 = `host_time_ns()`(`QueryPerformanceCounter`)+ 出力遅延。デバイス周期は padding に現れる(周期ぶん空いたときにイベントが来るため) | 同じ意味(DAC から出る予測時刻) | ✅ 12.000 ms(padding 576 frames + `GetStreamLatency` 0 ms) |
+| W6 | 音声スレッドの優先度 | `audio_thread_priority`(MMCSS) | `AvSetMmThreadCharacteristicsW("Pro Audio")`(`avrt`)。失敗しても続行 | 同じ(目的) | ✅ レビューで音声スレッドの `GetThreadPriority` が 15 であることを確認(登録の成否のログは出していない) |
+| W7 | 異常時のバッファ | データコールバックの前にゼロで埋める | `GetBuffer` の領域へ直接 `render`。ポインタが NULL・非アラインなら書かず `AUDCLNT_BUFFERFLAGS_SILENT` で返す。`render` が panic したらゼロで埋めて SILENT で返し、`StreamError { Backend }` を積んで止まる | 同じ結果(正常時は `render` が全体を上書きする) | — |
+| W8 | xrun の数え方 | WASAPI は回数を出さない。本リポジトリのヒューリスティック(`OutputUnderrunTracker::observe`) | 同じヒューリスティック(基準はデバイス周期のフレーム数) | 同じ(OS の実数は無い) | ✅ 実デバイスでは 4 秒間 0 回。⚠️ 仮想デバイス(VB-Audio Cable)ではイベントの間隔が不揃いで、1〜2 秒で 11〜18 回数えた(間隔だけを見る方法の限界。cpal 版も同じ)。音声スレッドを 15 ms 以上止めると 1 回ごとに 1 回数える |
+| W9 | 🔴 **出力時刻・出力遅延** | `StreamInstant`(`GetBuffer` 時刻 + `padding` + `GetStreamLatency` からの予測)。**エンジン周期とドライバのぶんを含まない** | `IAudioClock::GetPosition`(位置, 読んだ QPC)と、書き込み済みフレーム数から求める: QPC 時刻 + (書き込み済み − 再生済み)のフレームぶん(`clock_playback_start_ns`)。出力遅延 = その時刻 − コールバックに入った時刻。`IAudioClock` が取れないときだけ `padding` + `GetStreamLatency` に落とす | **違う(意図的)**。cpal 版より約 20 ms 大きい(正しい側) | ✅ 同じ装置・同じ設定で、`padding` + `GetStreamLatency` は 12.000 ms(`GetStreamLatency` は 0)、`IAudioClock` からは 31.7〜32.3 ms。レビューの別測定でも平均 32.00 ms |
 | W10 | エラーの分類 | `DeviceNotAvailable` 等を `DeviceUnavailable` に丸める | `AUDCLNT_E_DEVICE_INVALIDATED` / `SERVICE_NOT_RUNNING` / `ENDPOINT_CREATE_FAILED` / `DEVICE_IN_USE` / `RESOURCES_INVALIDATED` → `DeviceUnavailable`(内部再オープンの対象)、`E_ACCESSDENIED` → `PermissionDenied`、他 → `Backend`。開く途中の `E_NOTFOUND` / `ENDPOINT_CREATE_FAILED` は `NoOutputDevice` | 同じ | 単体テストで固定。実際の抜き差しは未確認 |
-| W11 | デバイスの抜き差し・既定出力の変更 | 抜かれると `StreamError` を出す。既定の切り替えには追従しない | `IMMNotificationClient` は持たない。`GetCurrentPadding` / `GetBuffer` が上のエラーを返したら `StreamError` を積んでスレッドを終える(Linux 版と同じ範囲)。既定を切り替えただけでは元のデバイスに残る | 同じ範囲 | **未確認**(USB / Bluetooth を抜く) |
+| W11 | デバイスの抜き差し・既定出力の変更 | 抜かれると `StreamError` を出す。既定の切り替えには追従しない | `IMMNotificationClient` は持たない。`GetCurrentPadding` / `GetBuffer` が上のエラーを返したら `StreamError` を積んでスレッドを終える(Linux 版と同じ範囲)。既定を切り替えただけでは元のデバイスに残る | 同じ範囲 | ✅ 既定を切り替えても元の装置に残る・装置の無効化で `DeviceUnavailable` が上がる(レビューで確認)。物理的な抜き差しは未確認 |
 | W12 | COM のアパートメント | 呼び出したスレッドに依存 | COM の呼び出しは専用スレッドの MTA で完結させ、結果だけチャネルで `open` へ返す(Unity のメインスレッドが STA でも影響を受けない) | 違う(良くなる方向) | ✅ |
-| W13 | 開く・閉じる | — | `open` は初期化の結果を最大 10 秒待つ。`close` は `SetEvent` で起こして join(待ち時間は周期より短い) | — | ✅ 開閉 1 回 |
+| W13 | 開く・閉じる | — | `open` は初期化の結果を最大 10 秒待つ。`close` は `SetEvent` で起こして join する。`Drop` でも `close` する(落としただけで音声スレッド・ハンドルが残らない) | — | ✅ 開閉 1 回。⚠️ **所要時間は OS・ドライバ側の費用で、最悪で約 0.8 秒**: 開いた直後に閉じる/閉じた直後に開くを続けると、open が 195〜724 ms、close が 229〜783 ms かかった(100 ms 置けば open 9〜24 ms・close 1〜2 ms)。`windows` クレートで直接 Initialize/Release を回しても同じ(Initialize 約 200 ms、Release 約 230 ms)ので実装の費用ではない。メインスレッドから呼ぶ経路(再オープン・シーン切替)ではフレームが落ちうる。非同期にする余地はあるが未実施 |
 
 実機の数字(`cargo test -p mw-backend plays_a_tone -- --ignored --nocapture`、440Hz を 4 秒):
-コールバック 402 回(100.2 回/秒)、1 回 480 frames、xrun(疑い)0、出力遅延 12.000 ms(最小 = 最大)。
+コールバック 401 回(99.9 回/秒)、1 回 480 frames、xrun(疑い)0、出力遅延 31.693〜32.277 ms。
+(初版は `padding` + `GetStreamLatency` で 12.000 ms と報告していたが、`IAudioClock` で測り直すと約 20 ms 小さかった。)
 
-未確認(実機): 44.1kHz など 48kHz 以外のエンドポイント、USB / Bluetooth の抜き差し(W11)、
+🔴 **使う側への注意(校正値)**: 出力遅延が cpal 版より約 20 ms 大きく出る(= 音楽クロックが「音が出る時刻」を
+その分先に見積もる)。自前の実装は既定ではないので、**既定を切り替える前に Windows の校正値
+〔出力遅延のオフセット〕を測り直す**こと。cpal 版の校正値をそのまま使うと約 20 ms ずれる。
+
+`close` せずに落としたときの後始末は `#[ignore]` のテスト
+(`cargo test -p mw-backend dropping_an_open_backend -- --ignored --nocapture`。20 回開いて落とし、
+音声スレッドが止まることとハンドル数が増えないこと〔177 → 182〕を見る)で確認している。
+Linux 版にも同じ `Drop` を足したが、Linux 実機では回していない。
+
+音声スレッドがイベントを待ってタイムアウトし続けた場合(約 1 秒ごと)は `GetCurrentPadding` で装置の
+状態を問い合わせ、失敗なら `StreamError` を積む。`open` が 10 秒の初期化待ちを超えて諦めた場合は、
+イベントハンドル 1 つとスレッドが残る(判断: 実際には再現できず、害は小さいのでそのまま)。
+出力遅延は最初のコールバックの前は 0(「未確定」。Linux 版と同じ契約)。
+
+未確認(実機): USB / Bluetooth の物理的な抜き差し(W11。装置の無効化では `DeviceUnavailable` が上がることをレビューで確認)、
 Windows Audio サービスの再起動、Unity Editor 上での音楽クロックと聴感のずれ。
 低遅延の `IAudioClient3`(共有モードの最小周期)は使っていない。
 

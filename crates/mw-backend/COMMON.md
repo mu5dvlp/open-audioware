@@ -235,7 +235,7 @@
   (Unity のメインスレッドが STA でも影響を受けない)。形式は f32・2ch・48kHz を要求し、
   `AUTOCONVERTPCM` でエンジンが変換する。専用スレッドは MMCSS("Pro Audio")に登録し、イベントを待って
   `GetBuffer` のバッファへ直接 `Renderer::render` する。バッファ先頭の出力時刻は
-  `host_time_ns()`(QPC)+ 出力遅延(`GetCurrentPadding` のフレーム + `GetStreamLatency`)。
+  `IAudioClock::GetPosition` と書き込み済みフレーム数から求める(`clock_playback_start_ns`。QPC は `host_time_ns()` と同じ時計)。cpal 版の `padding` + `GetStreamLatency` は実機で約 20 ms 小さいため使わない(時計が取れないときだけの代用)。🔴 cpal 版より出力遅延が約 20 ms 大きく出るので、既定を切り替える前に校正値を測り直すこと。`Drop` でも `close` する。
   xrun の実数は無いので `OutputUnderrunTracker::observe` だけ。**既知の差分**: デバイスの抜き差し・
   既定出力の変更の監視は無い(`AUDCLNT_E_DEVICE_INVALIDATED` 等で `Event::StreamError` を積んで
   スレッドを終える)/ `IAudioClient3` は使わない。純粋ロジック(形式の組み立て・遅延計算・エラー分類・

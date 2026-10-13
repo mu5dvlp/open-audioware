@@ -25,13 +25,16 @@
 //!
 //! # タイムスタンプ
 //!
-//! 今回書くバッファの先頭が DAC から出る時刻は、
-//! 「いま」+「バッファに残っている未再生のフレーム(`GetCurrentPadding`)」+
-//! 「エンジン〜エンドポイントの遅延(`GetStreamLatency`)」。「いま」は他の OS と同じ
-//! [`crate::host_time::host_time_ns`](`QueryPerformanceCounter`)なので `mw_host_time_ns()` と
-//! 直接比較できる。出力レイテンシ(`output_latency_ns`)はこの 2 項の合計
-//! ([`output_latency_ns`])。イベント駆動では「1 周期ぶん空いたらイベントが来る」ので、
-//! デバイス周期は `padding` に現れる。
+//! 今回書くバッファの先頭が装置位置に届く時刻は、`IAudioClock::GetPosition` が返す
+//! (位置, その位置を読んだ QPC)と、開始からここまでに書いたフレーム数から求める
+//! ([`clock_playback_start_ns`]): QPC 時刻 + (書き込み済み − 再生済み)のフレームぶん。
+//! QPC は [`crate::host_time::host_time_ns`] と同じ時計なので `mw_host_time_ns()` と
+//! 直接比較できる。出力レイテンシ(`output_latency_ns`)はこの時刻とコールバックに入った時刻の差。
+//!
+//! 🔴 cpal の WASAPI ホスト(と、この実装の初版)は「バッファに残っているフレーム
+//! (`GetCurrentPadding`)+ `GetStreamLatency`」で求めていたが、エンジン周期とドライバのぶん
+//! (実機で約 20ms)を含まず実際より小さい。`IAudioClock` が読めないときだけ、その式
+//! ([`output_latency_ns`])に落とす。
 //!
 //! # アンダーラン
 //!
@@ -94,6 +97,9 @@ pub const MAX_RENDER_FRAMES: u32 = 16_384;
 /// 初期化の完了を待つ上限。COM の初期化・デバイスの起動が詰まっても `open` が戻るようにする。
 pub const INIT_TIMEOUT_MS: u64 = 10_000;
 
+/// イベント待ちのタイムアウトがこの回数続いたら、装置の状態を問い合わせる(約 1 秒)。
+pub const TIMEOUTS_BEFORE_PROBE: u32 = 5;
+
 /// イベント待ちのタイムアウト(ms)。`close` は `SetEvent` で起こすので、これは保険。
 pub const WAIT_TIMEOUT_MS: u32 = 200;
 
@@ -154,6 +160,13 @@ pub const IID_IAUDIO_RENDER_CLIENT: Guid = Guid {
     data2: 0x3146,
     data3: 0x4483,
     data4: [0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2],
+};
+/// `IID_IAudioClock`。
+pub const IID_IAUDIO_CLOCK: Guid = Guid {
+    data1: 0xCD63_314F,
+    data2: 0x3FBA,
+    data3: 0x4A1B,
+    data4: [0x81, 0x2C, 0xEF, 0x96, 0x35, 0x87, 0x28, 0xE7],
 };
 /// `KSDATAFORMAT_SUBTYPE_IEEE_FLOAT`。
 pub const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: Guid = Guid {
@@ -247,6 +260,33 @@ pub fn output_latency_ns(padding_frames: u32, sample_rate: u32, stream_latency_h
 /// 今回書くバッファの先頭が出力される(と予測される)ホスト単調時刻(ns)。
 pub fn playback_start_ns(callback_ns: u64, latency_ns: u64) -> u64 {
     callback_ns.saturating_add(latency_ns)
+}
+
+/// `IAudioClock` から、次に書く先頭フレームが出力される(と予測される)ホスト単調時刻(ns)を求める。
+///
+/// `position` / `frequency` は `GetPosition` / `GetFrequency`(位置 ÷ 周波数 = 秒)、
+/// `position_qpc_100ns` は位置を読んだ時刻(QPC を 100ns 単位にしたもの)、
+/// `written_frames` は開始からここまでに `ReleaseBuffer` したフレーム数。
+/// 再生済みのフレーム数との差が「書き込み済みで未再生」で、そのぶん先が書く先頭の出力時刻。
+/// `frequency == 0` や `sample_rate == 0` は `None`。
+pub fn clock_playback_start_ns(
+    position: u64,
+    frequency: u64,
+    position_qpc_100ns: u64,
+    written_frames: u64,
+    sample_rate: u32,
+) -> Option<u64> {
+    if frequency == 0 || sample_rate == 0 {
+        return None;
+    }
+    let played =
+        (position as u128 * sample_rate as u128 / frequency as u128).min(u64::MAX as u128) as u64;
+    let unplayed = written_frames.saturating_sub(played);
+    Some(
+        position_qpc_100ns
+            .saturating_mul(100)
+            .saturating_add(frames_to_ns(unplayed, sample_rate)),
+    )
 }
 
 /// 今回書ける(空いている)フレーム数。`padding` が `buffer` を超える異常値は 0、
@@ -386,6 +426,15 @@ pub struct IAudioRenderClientVtbl {
     pub unknown: IUnknownVtbl,
     pub get_buffer: unsafe extern "system" fn(ThisPtr, u32, *mut *mut u8) -> Hresult,
     pub release_buffer: unsafe extern "system" fn(ThisPtr, u32, u32) -> Hresult,
+}
+
+/// `IAudioClock` の vtable。
+#[repr(C)]
+pub struct IAudioClockVtbl {
+    pub unknown: IUnknownVtbl,
+    pub get_frequency: unsafe extern "system" fn(ThisPtr, *mut u64) -> Hresult,
+    pub get_position: unsafe extern "system" fn(ThisPtr, *mut u64, *mut u64) -> Hresult,
+    pub get_characteristics: *const c_void,
 }
 
 /// `AUDCLNT_SHAREMODE_SHARED`。
@@ -577,7 +626,8 @@ impl Drop for MmcssRegistration {
 struct EventHandle(*mut c_void);
 
 // SAFETY: Win32 のイベントハンドルはプロセス内のどのスレッドからでも
-// `SetEvent` / `WaitForSingleObject` できる。閉じるのは音声スレッドを join した後の 1 回だけ。
+// `SetEvent` / `WaitForSingleObject` できる。閉じるのは `close`(`Drop` からも呼ぶ)が
+// 音声スレッドを join した後の 1 回だけ(`open` が初期化を待ちきれなかったときは閉じずに残す)。
 #[cfg(target_os = "windows")]
 unsafe impl Send for EventHandle {}
 
@@ -605,14 +655,41 @@ struct StreamInfo {
 struct Stream {
     // フィールドの宣言順 = 解放順(レンダークライアントを先に、`IAudioClient` を後に)。
     render: Com<IAudioRenderClientVtbl>,
+    /// 出力時刻の予測に使う。取れなければ `None`(padding + `GetStreamLatency` に落とす)。
+    clock: Option<ClockReader>,
     client: Com<IAudioClientVtbl>,
     info: StreamInfo,
+}
+
+/// `IAudioClock` と、その周波数(開いたときに 1 回読む)。
+#[cfg(target_os = "windows")]
+struct ClockReader {
+    clock: Com<IAudioClockVtbl>,
+    frequency: u64,
+}
+
+#[cfg(target_os = "windows")]
+impl ClockReader {
+    /// 装置位置を読み、次に書く先頭フレームの出力時刻(ホスト単調 ns)を返す。
+    /// 読めない・位置が時刻に結び付いていない(QPC が 0)ときは `None`。
+    fn playback_start_ns(&self, written_frames: u64, sample_rate: u32) -> Option<u64> {
+        let mut position = 0u64;
+        let mut qpc = 0u64;
+        // SAFETY: `clock` は有効、出力先はスタック上の `u64`。
+        let hr =
+            unsafe { (self.clock.vtbl().get_position)(self.clock.this(), &mut position, &mut qpc) };
+        if hr < 0 || qpc == 0 {
+            return None;
+        }
+        clock_playback_start_ns(position, self.frequency, qpc, written_frames, sample_rate)
+    }
 }
 
 #[cfg(target_os = "windows")]
 impl Drop for Stream {
     fn drop(&mut self) {
-        // SAFETY: `client` は有効。止まっていても `Stop` は成功する(失敗しても解放は続ける)。
+        // SAFETY: `client` は有効。装置が無効になった後などで `Stop` が失敗しても、
+        // 戻り値は捨てて解放を続ける。
         unsafe {
             (self.client.vtbl().stop)(self.client.this());
         }
@@ -753,10 +830,27 @@ impl Stream {
             BackendError::BuildStreamFailed("GetService(IAudioRenderClient) returned NULL".into())
         })?;
 
+        // 出力時刻の予測用の時計(取れなくても続行する)。
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `IID_IAUDIO_CLOCK` を要求しているので結果は `IAudioClock`。
+        let hr = unsafe { (client.vtbl().get_service)(client.this(), &IID_IAUDIO_CLOCK, &mut raw) };
+        let clock = if hr >= 0 {
+            // SAFETY: 成功した `GetService` は参照を 1 つ所有する `IAudioClock` を返す。
+            unsafe { Com::<IAudioClockVtbl>::from_raw(raw) }.and_then(|clock| {
+                let mut frequency = 0u64;
+                // SAFETY: 出力先はスタック上の `u64`。
+                let hr = unsafe { (clock.vtbl().get_frequency)(clock.this(), &mut frequency) };
+                (hr >= 0 && frequency > 0).then_some(ClockReader { clock, frequency })
+            })
+        } else {
+            None
+        };
+
         let period_frames =
             hns_to_frames(default_period_hns, TARGET_SAMPLE_RATE_HZ).clamp(1, MAX_RENDER_FRAMES);
         Ok(Self {
             render,
+            clock,
             client,
             info: StreamInfo {
                 sample_rate: TARGET_SAMPLE_RATE_HZ,
@@ -863,6 +957,9 @@ fn worker_loop(context: &mut WorkerContext, stream: &Stream) -> Option<StreamErr
     let info = stream.info;
     let client = &stream.client;
     let render = &stream.render;
+    // 開始からここまでに `ReleaseBuffer` したフレーム数(`IAudioClock` の位置との差が未再生分)。
+    let mut written_frames = 0u64;
+    let mut consecutive_timeouts = 0u32;
 
     loop {
         // SAFETY: `wake` は `Backend` が所有する有効なハンドル(join まで閉じられない)。
@@ -872,9 +969,24 @@ fn worker_loop(context: &mut WorkerContext, stream: &Stream) -> Option<StreamErr
         }
         match waited {
             WAIT_OBJECT_0 => {}
-            WAIT_TIMEOUT => continue,
+            WAIT_TIMEOUT => {
+                // イベントを通知しないまま止まった装置を拾う: 一定回数続いたら状態を問い合わせる。
+                consecutive_timeouts += 1;
+                if consecutive_timeouts >= TIMEOUTS_BEFORE_PROBE {
+                    consecutive_timeouts = 0;
+                    let mut padding = 0u32;
+                    // SAFETY: `client` は有効、出力先はスタック上の `u32`。
+                    let hr =
+                        unsafe { (client.vtbl().get_current_padding)(client.this(), &mut padding) };
+                    if hr < 0 {
+                        return Some(classify_stream_error(hr));
+                    }
+                }
+                continue;
+            }
             _ => return Some(StreamErrorReason::Backend),
         }
+        consecutive_timeouts = 0;
 
         let callback_ns = host_time_ns();
         let mut padding = 0u32;
@@ -895,7 +1007,19 @@ fn worker_loop(context: &mut WorkerContext, stream: &Stream) -> Option<StreamErr
             return Some(classify_stream_error(hr));
         }
 
-        let latency_ns = output_latency_ns(padding, info.sample_rate, info.stream_latency_hns);
+        // 出力時刻: 装置位置(`IAudioClock`)から求める。padding + `GetStreamLatency` は
+        // エンジン周期・ドライバのぶんを含まず実際より小さいので、時計が読めないときだけの代用。
+        let start_ns = stream
+            .clock
+            .as_ref()
+            .and_then(|clock| clock.playback_start_ns(written_frames, info.sample_rate))
+            .unwrap_or_else(|| {
+                playback_start_ns(
+                    callback_ns,
+                    output_latency_ns(padding, info.sample_rate, info.stream_latency_hns),
+                )
+            });
+        let latency_ns = start_ns.saturating_sub(callback_ns);
         context
             .output_latency_ns
             .store(latency_ns, Ordering::Relaxed);
@@ -916,7 +1040,6 @@ fn worker_loop(context: &mut WorkerContext, stream: &Stream) -> Option<StreamErr
             // 領域を返す。`ReleaseBuffer` するまでこのスレッドだけが触る。アラインは上で確認済み。
             let buffer =
                 unsafe { std::slice::from_raw_parts_mut(data.cast::<f32>(), sample_count) };
-            let start_ns = playback_start_ns(callback_ns, latency_ns);
             // 音声スレッド上で呼ぶ mw-core 側の経路は `Renderer::render` のみ。
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 context.renderer.render(buffer, start_ns);
@@ -924,10 +1047,12 @@ fn worker_loop(context: &mut WorkerContext, stream: &Stream) -> Option<StreamErr
             if result.is_err() {
                 panicked = true;
                 buffer.fill(0.0);
+                flags = AUDCLNT_BUFFERFLAGS_SILENT;
             }
         }
         // SAFETY: 直前の `GetBuffer` と同じ `frames`。
         let hr = unsafe { (render.vtbl().release_buffer)(render.this(), frames, flags) };
+        written_frames = written_frames.saturating_add(frames as u64);
         if panicked {
             return Some(StreamErrorReason::Backend);
         }
@@ -956,6 +1081,14 @@ pub struct WindowsBackend {
     last_output_underrun_host_time_ns: Arc<AtomicU64>,
     consecutive_output_underrun_count: Arc<AtomicU32>,
     logged_output_underrun_count: AtomicU64,
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsBackend {
+    /// `close` せずに落とされても音声スレッドとハンドルを残さない。
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1239,6 +1372,9 @@ mod tests {
         assert_eq!(offset_of!(IAudioRenderClientVtbl, get_buffer), 3 * PTR);
         assert_eq!(offset_of!(IAudioRenderClientVtbl, release_buffer), 4 * PTR);
         assert_eq!(size_of::<IAudioRenderClientVtbl>(), 5 * PTR);
+        assert_eq!(offset_of!(IAudioClockVtbl, get_frequency), 3 * PTR);
+        assert_eq!(offset_of!(IAudioClockVtbl, get_position), 4 * PTR);
+        assert_eq!(size_of::<IAudioClockVtbl>(), 6 * PTR);
     }
 
     #[test]
@@ -1274,6 +1410,33 @@ mod tests {
     fn playback_start_adds_the_latency_and_saturates() {
         assert_eq!(playback_start_ns(1_000, 500), 1_500);
         assert_eq!(playback_start_ns(u64::MAX - 1, 10), u64::MAX);
+    }
+
+    #[test]
+    fn clock_playback_start_is_the_position_time_plus_the_unplayed_frames() {
+        // 位置 1 秒ぶん(48000 frames @ 48kHz)を、QPC 5 秒の時点で読んだ。
+        // 書き込み済みは 48000 + 1536 frames = 未再生 1536 frames = 32ms。
+        let start = clock_playback_start_ns(48_000, 48_000, 50_000_000, 49_536, 48_000);
+        assert_eq!(start, Some(5_000_000_000 + 32_000_000));
+    }
+
+    #[test]
+    fn clock_playback_start_converts_the_position_with_the_clock_frequency() {
+        // 周波数が 96000 の時計で位置 96000 = 1 秒。
+        let start = clock_playback_start_ns(96_000, 96_000, 0, 48_480, 48_000);
+        assert_eq!(start, Some(10_000_000)); // 480 frames = 10ms
+    }
+
+    #[test]
+    fn clock_playback_start_treats_a_position_ahead_of_the_written_frames_as_nothing_queued() {
+        let start = clock_playback_start_ns(60_000, 48_000, 10, 48_000, 48_000);
+        assert_eq!(start, Some(1_000));
+    }
+
+    #[test]
+    fn clock_playback_start_is_none_without_a_usable_clock() {
+        assert_eq!(clock_playback_start_ns(1, 0, 0, 1, 48_000), None);
+        assert_eq!(clock_playback_start_ns(1, 48_000, 0, 1, 0), None);
     }
 
     #[test]
@@ -1415,6 +1578,66 @@ mod tests {
             backend.close().expect("close should succeed");
             assert!(!backend.is_open());
             assert_eq!(backend.callback_count(), 0);
+        }
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            fn GetProcessHandleCount(process: *mut std::ffi::c_void, count: *mut u32) -> i32;
+        }
+
+        fn process_handle_count() -> u32 {
+            let mut count = 0u32;
+            // SAFETY: 疑似ハンドルと、スタック上の有効な書き込み先。
+            unsafe {
+                GetProcessHandleCount(GetCurrentProcess(), &mut count);
+            }
+            count
+        }
+
+        /// `close` せずに drop しても、音声スレッドが止まりハンドルが残らないこと。
+        /// `cargo test -p mw-backend dropping_an_open_backend -- --ignored --nocapture` で実行する。
+        #[test]
+        #[ignore = "実デバイス(既定の出力)を開くため、手元の Windows でのみ実行する"]
+        fn dropping_an_open_backend_stops_the_render_thread_and_releases_handles() {
+            let open = || {
+                let (renderer, _sender, _reclaim, _music_producer, _music_clock, events, _bgm) =
+                    mw_core::Renderer::build(mw_core::Config::default(), 48_000);
+                let mut backend = WindowsBackend::new();
+                backend
+                    .open(renderer, events)
+                    .expect("open should succeed on a machine with a default output device");
+                backend
+            };
+            // ハンドル数の基準(1 回目の確保・COM の初期化ぶんを先に済ませる)。
+            drop(open());
+            let handles_before = process_handle_count();
+
+            for _ in 0..20 {
+                let backend = open();
+                std::thread::sleep(Duration::from_millis(30));
+                let count = Arc::clone(&backend.callback_count);
+                assert!(
+                    count.load(Ordering::Relaxed) > 0,
+                    "the render loop never ran"
+                );
+                drop(backend);
+                // drop の後は音声スレッドが回らない。
+                let after_drop = count.load(Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(60));
+                assert_eq!(
+                    count.load(Ordering::Relaxed),
+                    after_drop,
+                    "the render thread kept running after drop"
+                );
+            }
+
+            let handles_after = process_handle_count();
+            println!("handles before={handles_before} after={handles_after}");
+            assert!(
+                handles_after <= handles_before + 5,
+                "handles leaked: {handles_before} -> {handles_after}"
+            );
         }
     }
 }
