@@ -8,6 +8,7 @@
 pub mod android_context;
 pub mod backend;
 pub mod cpal_backend;
+pub mod first_start_restart;
 pub mod heartbeat;
 pub mod host_time;
 pub mod ios_interruption;

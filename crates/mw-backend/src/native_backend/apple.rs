@@ -766,8 +766,18 @@ fn refresh_ios_output_latency(
     reason: &str,
 ) {
     let previous_latency_ns = device_extra_latency_ns.load(Ordering::Relaxed);
-    let new_latency_ns = query_ios_output_latency_ns();
+    // 0 は「不明」(セッションが落ち着く前などに起きる)。前の値を保つ。
+    let queried_latency_ns = query_ios_output_latency_ns();
+    let new_latency_ns =
+        crate::first_start_restart::keep_known_latency(previous_latency_ns, queried_latency_ns);
     device_extra_latency_ns.store(new_latency_ns, Ordering::Relaxed);
+    if queried_latency_ns == 0 && previous_latency_ns != 0 {
+        crate::mw_log!(
+            "[mw-backend] (native/apple ios) output_latency read as 0 ({reason}); \
+             treating it as unknown and keeping {:.3} ms",
+            previous_latency_ns as f64 / 1_000_000.0,
+        );
+    }
 
     let previous_buffer_ns = io_buffer_duration_ns.load(Ordering::Relaxed);
     let new_buffer_ns = query_ios_io_buffer_duration_ns();
@@ -1457,6 +1467,10 @@ pub struct AppleBackend {
     /// consecutive_oversized_callbacks`]/[`UnitControl::consecutive_oversized_callbacks`] と
     /// 同じ `Arc`。
     consecutive_oversized_callbacks: Arc<AtomicU32>,
+    /// 最初の曲の予約の前に出力を一度動かし直す設定
+    /// (`first_start_restart` モジュール doc)。既定は有効。
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    first_start_restart: crate::first_start_restart::FirstStartRestart,
 }
 
 // SAFETY: `control` の中に生ポインタ(AudioUnit・context)を持つが、それらは
@@ -1507,7 +1521,14 @@ impl AppleBackend {
             logged_io_probe_restart_epoch: AtomicU64::new(u64::MAX),
             logged_io_probe_host_time_ns: AtomicU64::new(0),
             consecutive_oversized_callbacks: Arc::new(AtomicU32::new(0)),
+            first_start_restart: crate::first_start_restart::FirstStartRestart::from_env(),
         }
+    }
+
+    /// 「最初の曲の予約の前に出力を一度動かし直す」設定を変える(既定は有効。
+    /// 環境変数 `MW_FIRST_START_RESTART=0` でも切れる)。
+    pub fn set_first_start_restart(&mut self, enabled: bool) {
+        self.first_start_restart = crate::first_start_restart::FirstStartRestart { enabled };
     }
 }
 
@@ -1820,6 +1841,24 @@ impl Backend for AppleBackend {
         // (`crates/mw-ffi/src/ffi.rs::mw_music_play_scheduled` から)。
         #[cfg(any(target_os = "ios", target_os = "tvos"))]
         if let Some(control) = self.control.as_ref() {
+            // `open()` の後で初めての予約(`restart_epoch == 0`)なら、読み直しの前に出力を
+            // 一度動かし直す(`play()` が補正項も読み直し、世代を進める)。
+            match crate::first_start_restart::restart_if_first_start(
+                control.as_ref(),
+                &self.restart_epoch,
+                self.first_start_restart,
+            ) {
+                crate::first_start_restart::RestartOutcome::Restarted => crate::mw_log!(
+                    "[mw-backend] (native/apple ios) restarted the output unit once before the \
+                     first music schedule"
+                ),
+                crate::first_start_restart::RestartOutcome::Failed(e) => {
+                    crate::mw_log!(
+                        "[mw-backend] (native/apple ios) first-start restart failed: {e}"
+                    )
+                }
+                _ => {}
+            }
             refresh_ios_output_latency(
                 &self.device_extra_latency_ns,
                 &self.io_buffer_duration_ns,
