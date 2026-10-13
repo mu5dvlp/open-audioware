@@ -1398,6 +1398,8 @@ pub struct AppleBackend {
     logged_callback_frames: AtomicU32,
     output_latency_ns: Arc<AtomicU64>,
     render_completions: Arc<AtomicU64>,
+    /// 診断用のハートビート(`MW_AUDIO_HEARTBEAT` で有効にしたときだけ。[`crate::heartbeat`])。
+    heartbeat: Option<crate::heartbeat::Heartbeat>,
     /// [`Backend::log_output_latency_once`] が直近にログへ出した時点の
     /// [`restart_epoch`](Self::restart_epoch) の値。`u64::MAX` は「まだ1度も
     /// ログしていない」を表す初期値(通常の `restart_epoch` がこの値に達することは
@@ -1487,6 +1489,7 @@ impl AppleBackend {
             logged_callback_frames: AtomicU32::new(0),
             output_latency_ns: Arc::new(AtomicU64::new(0)),
             render_completions: Arc::new(AtomicU64::new(0)),
+            heartbeat: None,
             logged_output_latency_epoch: AtomicU64::new(u64::MAX),
             sample_rate: 0,
             output_underrun_count: Arc::new(AtomicU64::new(0)),
@@ -1716,6 +1719,11 @@ impl Backend for AppleBackend {
             Arc::clone(&self.render_completions),
         ));
 
+        self.heartbeat = crate::heartbeat::Heartbeat::start_if_enabled(
+            "apple",
+            Arc::clone(&self.render_completions),
+            Arc::clone(&self.callback_frames),
+        );
         self.control = Some(control);
         self.sample_rate = sample_rate as u32;
         Ok(())
@@ -1730,6 +1738,7 @@ impl Backend for AppleBackend {
         // 復帰確認のワーカーがあっても、下で `OpenUnit` を取り出した後の操作は
         // `UnitControl` が空振りさせる。
         self.ios_interruption = None;
+        self.heartbeat = None;
 
         let open = self
             .control

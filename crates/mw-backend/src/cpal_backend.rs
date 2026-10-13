@@ -128,6 +128,9 @@ pub struct CpalBackend {
     /// 何度でも呼べる(`logged_output_latency` と異なり `AtomicBool` ではなく値そのもの
     /// を持つ——「初回だけ」ではなく「新しく増えた分だけ都度」ログしたいため)。
     logged_output_underrun_count: AtomicU64,
+    /// 診断用のハートビートのスレッド(`MW_AUDIO_HEARTBEAT` で有効にしたときだけ。
+    /// [`crate::heartbeat`])。`close` で最初に止める。
+    heartbeat: Option<crate::heartbeat::Heartbeat>,
 }
 
 impl CpalBackend {
@@ -138,6 +141,7 @@ impl CpalBackend {
             callback_frames: Arc::new(AtomicU32::new(0)),
             callback_ticks: Arc::new(AtomicU64::new(0)),
             render_completions: Arc::new(AtomicU64::new(0)),
+            heartbeat: None,
             output_latency_ns: Arc::new(AtomicU64::new(0)),
             logged_output_latency: AtomicBool::new(false),
             sample_rate: 0,
@@ -287,6 +291,11 @@ impl Backend for CpalBackend {
             Arc::clone(&self.callback_ticks),
         ));
 
+        self.heartbeat = crate::heartbeat::Heartbeat::start_if_enabled(
+            "cpal",
+            Arc::clone(&self.callback_ticks),
+            Arc::clone(&self.callback_frames),
+        );
         self.sample_rate = config.sample_rate;
         self.stream = Some(stream);
         Ok(())
@@ -298,6 +307,7 @@ impl Backend for CpalBackend {
                 // ストリームを実際に止める前に割り込み監視を止める(観測を続けたまま
                 // 止まりかけのストリームへ `pause()`/`play()` を呼び直すのを避ける)。
                 self.ios_interruption = None;
+                self.heartbeat = None;
                 // `pause` はベストエフォート。stream の drop で確実にコールバックは止まる。
                 let _ = stream.pause();
                 // `pause()` の後に最後のコールバックが `Release` で残した書き込みを、

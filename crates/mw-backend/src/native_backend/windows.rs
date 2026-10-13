@@ -1552,6 +1552,8 @@ pub struct WindowsBackend {
     last_output_underrun_host_time_ns: Arc<AtomicU64>,
     consecutive_output_underrun_count: Arc<AtomicU32>,
     logged_output_underrun_count: AtomicU64,
+    /// 診断用のハートビート(`MW_AUDIO_HEARTBEAT` で有効にしたときだけ。[`crate::heartbeat`])。
+    heartbeat: Option<crate::heartbeat::Heartbeat>,
 }
 
 #[cfg(target_os = "windows")]
@@ -1585,6 +1587,7 @@ impl WindowsBackend {
             last_output_underrun_host_time_ns: Arc::new(AtomicU64::new(0)),
             consecutive_output_underrun_count: Arc::new(AtomicU32::new(0)),
             logged_output_underrun_count: AtomicU64::new(0),
+            heartbeat: None,
         }
     }
 
@@ -1664,6 +1667,11 @@ impl Backend for WindowsBackend {
                     info.period_frames,
                     info.stream_latency_hns as f64 / 10_000.0,
                 );
+                self.heartbeat = crate::heartbeat::Heartbeat::start_if_enabled(
+                    "windows",
+                    Arc::clone(&self.callback_count),
+                    Arc::clone(&self.callback_frames),
+                );
                 self.thread = Some(thread);
                 self.wake = Some(wake);
                 self.sample_rate = info.sample_rate;
@@ -1696,6 +1704,7 @@ impl Backend for WindowsBackend {
         let (Some(thread), Some(wake)) = (self.thread.take(), self.wake.take()) else {
             return Err(BackendError::NotOpen);
         };
+        self.heartbeat = None;
         self.stop.store(true, Ordering::Release);
         // SAFETY: ハンドルは有効(まだ閉じていない)。待っている音声スレッドを起こす。
         unsafe {

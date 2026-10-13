@@ -90,6 +90,15 @@
   経路と一切競合しない)。経緯・実装判断の詳細は `docs/history/04-2026-08-31.md`
   「M3 完了」参照。⚠️ 実機(Android)での動作確認はまだ行っていない。
 
+- `heartbeat`(診断用。既定では無効)— 出力コールバックの累計回数を一定間隔で
+  `[mw-backend] audio heartbeat ticks=<n> last_frames=<f> backend=<label>` の 1 行にして
+  ログへ出す。通知なしに出力が止まったかをログだけで判定するためのもの。環境変数
+  `MW_AUDIO_HEARTBEAT`(`1` で 1000 ms、50 以上の整数ならその値が間隔〔ms〕)を
+  `Backend::open` の前に設定すると有効。`heartbeat::set_interval_ms` でも設定できる。
+  音声コールバックは既存のカウンタを進めるだけで、読み出しとログは専用スレッド
+  (`Condvar` で待つので `close` / `Drop` で即座に止まる)。cpal / Apple / Android /
+  Windows の各 `Backend` が `open` で起こし、`close` で止める(Linux の CI 用実装には無い)。
+
 - `underrun::OutputUnderrunTracker`(M3「アンダーラン検知・テレメトリ」)— 音声
   コールバックの間隔が想定より大きく開いたこと(「アンダーラン(の疑い)」)を検知する。
   **`mw_core::Event::Underrun`(楽曲/BGM のデコードリングバッファ枯渇の検知、M2)とは

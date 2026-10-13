@@ -674,6 +674,8 @@ pub struct AndroidBackend {
     output_latency_ns: Arc<AtomicU64>,
     buffer_size_frames: Arc<AtomicU32>,
     render_completions: Arc<AtomicU64>,
+    /// 診断用のハートビート(`MW_AUDIO_HEARTBEAT` で有効にしたときだけ。[`crate::heartbeat`])。
+    heartbeat: Option<crate::heartbeat::Heartbeat>,
     logged_output_latency: AtomicBool,
     sample_rate: u32,
     output_underrun_count: Arc<AtomicU64>,
@@ -717,6 +719,7 @@ impl AndroidBackend {
             output_latency_ns: Arc::new(AtomicU64::new(0)),
             buffer_size_frames: Arc::new(AtomicU32::new(0)),
             render_completions: Arc::new(AtomicU64::new(0)),
+            heartbeat: None,
             logged_output_latency: AtomicBool::new(false),
             sample_rate: 0,
             output_underrun_count: Arc::new(AtomicU64::new(0)),
@@ -906,6 +909,11 @@ impl Backend for AndroidBackend {
             CHANNELS,
         );
 
+        self.heartbeat = crate::heartbeat::Heartbeat::start_if_enabled(
+            "android",
+            Arc::clone(&self.render_completions),
+            Arc::clone(&self.callback_frames),
+        );
         self.stream = Some(stream);
         self.context_ptr = Some(context_ptr);
         self.error_context_ptr = Some(error_context_ptr);
@@ -914,6 +922,7 @@ impl Backend for AndroidBackend {
     }
 
     fn close(&mut self) -> Result<(), BackendError> {
+        self.heartbeat = None;
         match (
             self.stream.take(),
             self.context_ptr.take(),
