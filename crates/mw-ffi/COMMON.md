@@ -142,6 +142,7 @@ M2-7: 楽曲再生 / M4-3: BGM のネイティブ化)
 ```rust
 mw_abi_version() -> u32                                          // 定数 1
 mw_host_time_ns() -> u64                                          // ホスト単調時刻(ns)。ハンドル不要
+mw_set_heartbeat_interval_ms(interval_ms: u32)                 // 診断ログ(出力コールバックの進み)の間隔。0 で無効。mw_init の前に呼ぶ。ハンドル不要
 mw_init(out_handle: *mut u64) -> MwResult                        // 冪等。既定出力デバイスにストリームを開く。デコードスレッドを1本立てる
 mw_shutdown(handle: u64) -> MwResult                              // 冪等ではない(無効ハンドルはエラー)。ストリームを閉じ、デコードスレッドを止めて join する
 

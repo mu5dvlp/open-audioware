@@ -45,6 +45,20 @@ pub extern "C" fn mw_host_time_ns() -> u64 {
     mw_backend::host_time_ns()
 }
 
+/// 出力コールバックの進みをログへ出す診断用ハートビートの間隔(ミリ秒)を設定する。
+///
+/// `0` で無効(環境変数 `MW_AUDIO_HEARTBEAT` の指定も打ち消す)。`1` 以上はその間隔
+/// (50 未満は 50 に切り上げる)。環境変数を使えない環境(モバイルなど)から有効にするための入口。
+/// **`mw_init` より前に呼ぶこと**(出力を開くときに読まれる。開いた後の変更は次に開くときから効く)。
+///
+/// ハンドル不要。ABI バージョンは据え置き(関数の追加のみ)。
+/// アロケーション・ロック・パニック経路を持たない(アトミックな書き込みだけ)ため、
+/// `catch_unwind` で包んでいない。
+#[unsafe(no_mangle)]
+pub extern "C" fn mw_set_heartbeat_interval_ms(interval_ms: u32) {
+    mw_backend::heartbeat::set_interval_ms(u64::from(interval_ms));
+}
+
 /// ミドルウェアを初期化し、既定の出力デバイスにストリームを開いて再生を開始する。
 ///
 /// 冪等: 既に初期化済みの場合は同一ハンドルを `out_handle` に書き `MwResult::Ok` を返す
@@ -2688,6 +2702,19 @@ mod tests {
     }
 
     // --- M2-5: ホスト単調時刻 / 予約発音 --------------------------------------
+
+    #[test]
+    fn set_heartbeat_interval_ms_overrides_and_zero_disables() {
+        use std::time::Duration;
+        mw_set_heartbeat_interval_ms(300);
+        assert_eq!(
+            mw_backend::heartbeat::configured_interval(),
+            Some(Duration::from_millis(300))
+        );
+        mw_set_heartbeat_interval_ms(0);
+        assert_eq!(mw_backend::heartbeat::configured_interval(), None);
+        mw_backend::heartbeat::clear_interval_override();
+    }
 
     #[test]
     fn host_time_ns_is_monotonically_non_decreasing_across_ffi_boundary() {
