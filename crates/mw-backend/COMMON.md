@@ -97,7 +97,7 @@
   `Backend::open` の前に設定すると有効。`heartbeat::set_interval_ms` でも設定できる。
   音声コールバックは既存のカウンタを進めるだけで、読み出しとログは専用スレッド
   (`Condvar` で待つので `close` / `Drop` で即座に止まる)。cpal / Apple / Android /
-  Windows の各 `Backend` が `open` で起こし、`close` で止める(Linux の CI 用実装には無い)。
+  Windows / Linux(ALSA)の各 `Backend` が `open` で起こし、`close` で止める。
 
 - `underrun::OutputUnderrunTracker`(M3「アンダーラン検知・テレメトリ」)— 音声
   コールバックの間隔が想定より大きく開いたこと(「アンダーラン(の疑い)」)を検知する。

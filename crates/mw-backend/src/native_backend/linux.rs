@@ -313,6 +313,8 @@ struct WriterContext {
     events: Arc<EventQueue>,
     stop: Arc<AtomicBool>,
     callback_frames: Arc<AtomicU32>,
+    /// 書き込みの周回の累計(ハートビート用。書き込みスレッドだけが進める)。
+    callback_ticks: Arc<AtomicU64>,
     output_latency_ns: Arc<AtomicU64>,
 }
 
@@ -377,6 +379,7 @@ fn writer_loop(context: &mut WriterContext) -> Option<StreamErrorReason> {
         context
             .callback_frames
             .store(frames as u32, Ordering::Relaxed);
+        context.callback_ticks.fetch_add(1, Ordering::Relaxed);
         context
             .underrun_tracker
             .observe(callback_ns, frames as u32, rate);
@@ -454,6 +457,9 @@ pub struct LinuxBackend {
     thread: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     callback_frames: Arc<AtomicU32>,
+    callback_ticks: Arc<AtomicU64>,
+    /// 診断用のハートビート(`MW_AUDIO_HEARTBEAT` で有効にしたときだけ。[`crate::heartbeat`])。
+    heartbeat: Option<crate::heartbeat::Heartbeat>,
     output_latency_ns: Arc<AtomicU64>,
     logged_output_latency: AtomicBool,
     sample_rate: u32,
@@ -493,6 +499,8 @@ impl LinuxBackend {
             thread: None,
             stop: Arc::new(AtomicBool::new(false)),
             callback_frames: Arc::new(AtomicU32::new(0)),
+            callback_ticks: Arc::new(AtomicU64::new(0)),
+            heartbeat: None,
             output_latency_ns: Arc::new(AtomicU64::new(0)),
             logged_output_latency: AtomicBool::new(false),
             sample_rate: 0,
@@ -578,6 +586,7 @@ impl Backend for LinuxBackend {
             events,
             stop: Arc::clone(&self.stop),
             callback_frames: Arc::clone(&self.callback_frames),
+            callback_ticks: Arc::clone(&self.callback_ticks),
             output_latency_ns: Arc::clone(&self.output_latency_ns),
         };
         let thread = std::thread::Builder::new()
@@ -601,6 +610,11 @@ impl Backend for LinuxBackend {
              channels={CHANNELS}, period={period_frames} frames, buffer={buffer_size} frames"
         );
 
+        self.heartbeat = crate::heartbeat::Heartbeat::start_if_enabled(
+            "linux",
+            Arc::clone(&self.callback_ticks),
+            Arc::clone(&self.callback_frames),
+        );
         self.pcm = Some(pcm);
         self.thread = Some(thread);
         self.sample_rate = sample_rate;
@@ -611,6 +625,8 @@ impl Backend for LinuxBackend {
         let (Some(pcm), Some(thread)) = (self.pcm.take(), self.thread.take()) else {
             return Err(BackendError::NotOpen);
         };
+        // 観測を先に止める(止まりかけの出力を読み続けない)。
+        self.heartbeat = None;
         self.stop.store(true, Ordering::Release);
         // スレッドは `writei` のブロック(最大でバッファ長ぶん)を抜けた次の周回で止まる。
         // パニックで終わっていても `Err` が返るだけなので無視してよい。
@@ -624,6 +640,7 @@ impl Backend for LinuxBackend {
 
         self.sample_rate = 0;
         self.callback_frames.store(0, Ordering::Relaxed);
+        self.callback_ticks.store(0, Ordering::Relaxed);
         self.output_latency_ns.store(0, Ordering::Relaxed);
         self.logged_output_latency.store(false, Ordering::Relaxed);
         self.output_underrun_count.store(0, Ordering::Relaxed);
