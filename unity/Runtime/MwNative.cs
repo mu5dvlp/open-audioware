@@ -617,6 +617,16 @@ namespace Mw.Native
         }
 
         /// <summary>
+        /// 診断用ハートビート(出力コールバックの進みを一定間隔でログへ出す)の間隔をミリ秒で設定する。
+        /// <c>0</c> で無効。<b><see cref="Init"/> より前に呼ぶこと</b>(出力を開くときに読まれる)。
+        /// 環境変数を使えない環境(モバイルなど)から有効にするための入口。ハンドル不要。
+        /// </summary>
+        public static void SetHeartbeatIntervalMs(uint intervalMs)
+        {
+            NativeMethods.mw_set_heartbeat_interval_ms(intervalMs);
+        }
+
+        /// <summary>
         /// 出力レイテンシ(ns)の実測値を取得する。
         /// <para>
         /// <b>0 は「まだ不明」を意味する</b>(オーディオコールバックが1度も走っていない)。

@@ -47,6 +47,20 @@ namespace Mw.Native.Generated
         internal static extern ulong mw_host_time_ns();
 
         /// <summary>
+        ///  出力コールバックの進みをログへ出す診断用ハートビートの間隔(ミリ秒)を設定する。
+        ///
+        ///  `0` で無効(環境変数 `MW_AUDIO_HEARTBEAT` の指定も打ち消す)。`1` 以上はその間隔
+        ///  (50 未満は 50 に切り上げる)。環境変数を使えない環境(モバイルなど)から有効にするための入口。
+        ///  **`mw_init` より前に呼ぶこと**(出力を開くときに読まれる。開いた後の変更は次に開くときから効く)。
+        ///
+        ///  ハンドル不要。ABI バージョンは据え置き(関数の追加のみ)。
+        ///  アロケーション・ロック・パニック経路を持たない(アトミックな書き込みだけ)ため、
+        ///  `catch_unwind` で包んでいない。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "mw_set_heartbeat_interval_ms", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern void mw_set_heartbeat_interval_ms(uint interval_ms);
+
+        /// <summary>
         ///  ミドルウェアを初期化し、既定の出力デバイスにストリームを開いて再生を開始する。
         ///
         ///  冪等: 既に初期化済みの場合は同一ハンドルを `out_handle` に書き `MwResult::Ok` を返す
@@ -237,6 +251,14 @@ namespace Mw.Native.Generated
         ///  現状はこの呼び出しだけでは実際に音は鳴らない(楽曲ボイスが `Loading` のまま予約が
         ///  繰り下げられ続ける)。予約発火の仕組み自体は `mw-core` のオフラインレンダリング
         ///  テストで検証済み。
+        ///
+        ///  **呼ぶたびに出力レイテンシの補正項を読み直す**(`mw_backend::Backend::
+        ///  refresh_output_latency` へ委譲。既定は no-op、iOS/tvOS の `backend-native` だけが
+        ///  実際に読み直す)。セッションが
+        ///  落ち着く前に `open()` 直後の値を読んだまま固定されることへの対処で、曲の再生中
+        ///  (世代をまたがない途中)に値が変わって音楽クロックが跳ぶことを避けるため、
+        ///  読み直すのは「予約」というこの境目だけに絞ってある
+        ///  (`mw_backend::native_backend::apple` モジュール doc「タイムスタンプの扱い」参照)。
         /// </summary>
         [DllImport(__DllName, EntryPoint = "mw_music_play_scheduled", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern MwResult mw_music_play_scheduled(ulong handle, ulong host_time_ns);
@@ -292,7 +314,7 @@ namespace Mw.Native.Generated
         ///
         ///  `out_state` には [`crate::types::MwMusicState`] の判別子(`Loading=0` /
         ///  `Ready=1` / `Playing=2` / `Paused=3`)を書き込む。素の `i32` として渡す理由は
-        ///  `crates/mw-ffi/CLAUDE.md`「enum を FFI 引数に直接使わない理由」を参照
+        ///  `crates/mw-ffi/COMMON.md`「enum を FFI 引数に直接使わない理由」を参照
         ///  (`MwMusicState` 自体は csbindgen が C# enum を生成するので、呼び出し側は
         ///  受け取った `int` をそのままキャストして使える)。
         ///
@@ -322,6 +344,11 @@ namespace Mw.Native.Generated
         ///
         ///  `frames` へ再位置決めしたうえで既定ランプでフェードインする。`Loading` 中は
         ///  音声スレッド側で無視される(クラッシュしない)。
+        ///
+        ///  再開は位置を決め直して音楽クロックの世代が進む境目なので、
+        ///  [`mw_music_play_scheduled`] と同じく出力レイテンシの補正項を読み直す
+        ///  (`mw_backend::Backend::refresh_output_latency`。iOS/tvOS ではオーバーサイズの
+        ///  コールバックが続いていれば、この時点で出力を作り直す)。
         /// </summary>
         [DllImport(__DllName, EntryPoint = "mw_music_resume_at", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern MwResult mw_music_resume_at(ulong handle, ulong frames);
@@ -397,7 +424,7 @@ namespace Mw.Native.Generated
         ///  BGM ボイスの再生状態を取得する(`mw_music_state` の BGM 版)。
         ///
         ///  `out_state` には [`crate::types::MwMusicState`] の判別子を書き込む(`mw_music_state`
-        ///  と同じ理由で素の `i32`。`crates/mw-ffi/CLAUDE.md`「enum を FFI 引数に直接使わない
+        ///  と同じ理由で素の `i32`。`crates/mw-ffi/COMMON.md`「enum を FFI 引数に直接使わない
         ///  理由」参照)。**クロックの一部ではない**——BGM は曲位置・世代カウンタを持たない
         ///  (M14)ため、`mw_music_get_position` に相当する BGM 版の関数は無い。
         ///
@@ -538,6 +565,13 @@ namespace Mw.Native.Generated
         ///  `ReopenPolicy::is_due` の安価なチェックのみで即座に戻るため、定常状態の
         ///  非ブロッキング性は保たれる。
         ///
+        ///  あわせて、[`crate::handle::Instance::log_provisional_sample_rate_warning_once`]
+        ///  (出力デバイスのサンプルレートが確定する前に音声コールバックが描画を始めていたら
+        ///  1インスタンスにつき1回だけログへ出す)をこのゲームスレッド経路から呼ぶ
+        ///  (**コールバック内から呼んではいけない**——`mw_log!` はアロケーションとロックを
+        ///  伴うため、初期構築仕様『§5.3』のリアルタイム安全性規約に抵触する。
+        ///  `mw_get_output_latency_ns` と同じ配線パターン)。
+        ///
         ///  # Safety
         ///  `cap &gt; 0` の場合、`buf` は `cap` 個の [`MwEvent`] を書き込み可能な有効なポインタで
         ///  なければならない。`cap &lt;= 0` の場合は `buf` が null でもよい(書き込みを行わない。
@@ -610,7 +644,7 @@ namespace Mw.Native.Generated
     ///  (フィールドごとに `[MarshalAs(UnmanagedType.U1)]` を明示すれば一致させられるが、
     ///  csbindgen の自動生成コードにその指定をさせる仕組みは無く、手で後から
     ///  付け足すのは「手書きの宣言ズレを構造的に排除する」という csbindgen 採用の目的
-    ///  (`crates/mw-ffi/CLAUDE.md`)に反する)。そこで `event.rs::MwEvent` の
+    ///  (`crates/mw-ffi/COMMON.md`)に反する)。そこで `event.rs::MwEvent` の
     ///  `payload: u64` と同じ考え方で、素の `u8`(0 または 1)として持たせ、C# 側の
     ///  bool への解釈は呼び出し側(手書きの薄いラッパ `Mw.Native`)の責務にする——
     ///  これで構造体全体が疑いなく blittable になる。
