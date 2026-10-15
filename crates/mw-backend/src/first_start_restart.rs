@@ -14,8 +14,8 @@
 //! pause → play を行う。曲はまだ鳴っていないので、世代(`restart_epoch`)が進んでも害は無い。
 //! `play()` が世代を進めるので、同じ `open()` の間は二度目以降は走らない。
 //!
-//! 切り替え: [`FirstStartRestart::from_env`]([`ENV_VAR`] が `0` / `false` / `off` で無効)。
-//! 既定は有効。
+//! 切り替え: [`FirstStartRestart::from_env`]([`ENV_VAR`] が `1` / `true` / `on` で有効)。
+//! 既定は無効。
 //!
 //! # 出力遅延が 0 と読めたとき
 //!
@@ -26,31 +26,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ios_interruption::RecoverableOutput;
 
-/// 無効にする環境変数の名前。`0` / `false` / `off`(大文字小文字は問わない)で無効。
+/// 有効にする環境変数の名前。`1` / `true` / `on`(大文字小文字は問わない)で有効。
 pub const ENV_VAR: &str = "MW_FIRST_START_RESTART";
 
-/// 「最初の予約の前に出力を動かし直す」設定。既定は有効。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 「最初の予約の前に出力を動かし直す」設定。既定は無効。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FirstStartRestart {
     pub enabled: bool,
 }
 
-impl Default for FirstStartRestart {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
-}
-
 impl FirstStartRestart {
-    /// 環境変数 [`ENV_VAR`] から読む。未設定・空・認識できない値は既定(有効)。
+    /// 環境変数 [`ENV_VAR`] から読む。未設定・空・認識できない値は無効。
     pub fn from_env() -> Self {
         Self::from_value(std::env::var(ENV_VAR).ok().as_deref())
     }
 
     pub fn from_value(value: Option<&str>) -> Self {
         let enabled = match value.map(|v| v.trim().to_ascii_lowercase()) {
-            Some(v) => !matches!(v.as_str(), "0" | "false" | "off"),
-            None => true,
+            Some(v) => matches!(v.as_str(), "1" | "true" | "on"),
+            None => false,
         };
         Self { enabled }
     }
@@ -140,7 +134,7 @@ mod tests {
     fn runs_once_when_epoch_is_zero() {
         let epoch = AtomicU64::new(0);
         let m = mock(&epoch, false);
-        let c = FirstStartRestart::default();
+        let c = FirstStartRestart { enabled: true };
         assert_eq!(
             restart_if_first_start(&m, &epoch, c),
             RestartOutcome::Restarted
@@ -157,7 +151,7 @@ mod tests {
     fn skipped_when_epoch_already_advanced() {
         let epoch = AtomicU64::new(3);
         let m = mock(&epoch, false);
-        let out = restart_if_first_start(&m, &epoch, FirstStartRestart::default());
+        let out = restart_if_first_start(&m, &epoch, FirstStartRestart { enabled: true });
         assert_eq!(out, RestartOutcome::AlreadyRestarted);
         assert!(m.calls.lock().unwrap().is_empty());
     }
@@ -166,7 +160,7 @@ mod tests {
     fn skipped_when_disabled() {
         let epoch = AtomicU64::new(0);
         let m = mock(&epoch, false);
-        let out = restart_if_first_start(&m, &epoch, FirstStartRestart { enabled: false });
+        let out = restart_if_first_start(&m, &epoch, FirstStartRestart::default());
         assert_eq!(out, RestartOutcome::Disabled);
         assert!(m.calls.lock().unwrap().is_empty());
     }
@@ -175,19 +169,23 @@ mod tests {
     fn reports_failure_but_still_tries_play() {
         let epoch = AtomicU64::new(0);
         let m = mock(&epoch, true);
-        let out = restart_if_first_start(&m, &epoch, FirstStartRestart::default());
+        let out = restart_if_first_start(&m, &epoch, FirstStartRestart { enabled: true });
         assert_eq!(out, RestartOutcome::Failed("play: boom".into()));
         assert_eq!(*m.calls.lock().unwrap(), vec!["pause", "play"]);
     }
 
     #[test]
     fn env_value_parsing() {
-        assert!(FirstStartRestart::from_value(None).enabled);
-        assert!(FirstStartRestart::from_value(Some("1")).enabled);
-        assert!(FirstStartRestart::from_value(Some("")).enabled);
+        assert!(!FirstStartRestart::default().enabled);
+        assert!(!FirstStartRestart::from_value(None).enabled);
+        assert!(!FirstStartRestart::from_value(Some("")).enabled);
         assert!(!FirstStartRestart::from_value(Some("0")).enabled);
-        assert!(!FirstStartRestart::from_value(Some(" OFF ")).enabled);
         assert!(!FirstStartRestart::from_value(Some("false")).enabled);
+        assert!(!FirstStartRestart::from_value(Some("yes")).enabled);
+        assert!(FirstStartRestart::from_value(Some("1")).enabled);
+        assert!(FirstStartRestart::from_value(Some("true")).enabled);
+        assert!(FirstStartRestart::from_value(Some(" ON ")).enabled);
+        assert!(FirstStartRestart::from_value(Some("True")).enabled);
     }
 
     #[test]

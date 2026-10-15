@@ -1525,8 +1525,8 @@ impl AppleBackend {
         }
     }
 
-    /// 「最初の曲の予約の前に出力を一度動かし直す」設定を変える(既定は有効。
-    /// 環境変数 `MW_FIRST_START_RESTART=0` でも切れる)。
+    /// 「最初の曲の予約の前に出力を一度動かし直す」設定を変える(既定は無効。
+    /// 環境変数 `MW_FIRST_START_RESTART=1` でも有効にできる)。
     pub fn set_first_start_restart(&mut self, enabled: bool) {
         self.first_start_restart = crate::first_start_restart::FirstStartRestart { enabled };
     }
