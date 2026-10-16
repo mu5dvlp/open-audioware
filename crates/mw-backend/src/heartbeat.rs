@@ -5,13 +5,17 @@
 //! 1 行の書式:
 //!
 //! ```text
-//! [mw-backend] audio heartbeat ticks=<n> last_frames=<f> backend=<label>
+//! [mw-backend] audio heartbeat ticks=<n> last_frames=<f> backend=<label> peak=<p>
 //! ```
+//!
+//! iOS / tvOS では末尾に ` session_rate=<Hz> session_channels=<n> session_out=[<portType>,..]
+//! category=<c>` が付く(OS への問い合わせはこの専用スレッドで行う)。
 //!
 //! - `ticks`: 開いてからの出力コールバックの累計回数(単調増加。再オープンで 0 に戻る)。
 //!   2 つの行で値が増えていれば、その間に出力が動いている。
 //! - `last_frames`: 直近のコールバックが処理したフレーム数。
 //! - `backend`: 出力の実装(`cpal` / `apple` / `android` / `windows` / `linux`)。
+//! - `peak`: 前回の行からの間に出力バッファへ書かれた最大の絶対値(0 なら無音を出している)。
 //!
 //! # 有効にする
 //!
@@ -78,8 +82,11 @@ pub fn configured_interval() -> Option<Duration> {
 }
 
 /// ログ 1 行の本文(`[mw-backend]` の接頭辞付き)を作る。
-pub fn format_line(label: &str, ticks: u64, last_frames: u32) -> String {
-    format!("[mw-backend] audio heartbeat ticks={ticks} last_frames={last_frames} backend={label}")
+pub fn format_line(label: &str, ticks: u64, last_frames: u32, peak: f32) -> String {
+    format!(
+        "[mw-backend] audio heartbeat ticks={ticks} last_frames={last_frames} backend={label} \
+         peak={peak:.6}"
+    )
 }
 
 /// ハートビートのスレッド。`Drop` で止めて join する。
@@ -96,12 +103,24 @@ impl Heartbeat {
         ticks: Arc<AtomicU64>,
         last_frames: Arc<AtomicU32>,
     ) -> Option<Self> {
+        Self::start_if_enabled_with_peak(label, ticks, last_frames, Arc::new(AtomicU32::new(0)))
+    }
+
+    /// [`Self::start_if_enabled`] に、出力の最大の絶対値(`f32` のビット列。読むたびに 0 へ
+    /// 戻す)も渡す版。`peak=` の値になる。
+    pub fn start_if_enabled_with_peak(
+        label: &'static str,
+        ticks: Arc<AtomicU64>,
+        last_frames: Arc<AtomicU32>,
+        peak: Arc<AtomicU32>,
+    ) -> Option<Self> {
         let interval = configured_interval()?;
         Self::start_with(
             interval,
             label,
             ticks,
             last_frames,
+            peak,
             crate::platform_log::write,
         )
     }
@@ -112,6 +131,7 @@ impl Heartbeat {
         label: &'static str,
         ticks: Arc<AtomicU64>,
         last_frames: Arc<AtomicU32>,
+        peak: Arc<AtomicU32>,
         mut emit: F,
     ) -> Option<Self>
     where
@@ -133,11 +153,19 @@ impl Heartbeat {
                         return;
                     }
                     drop(guard);
-                    emit(&format_line(
+                    let peak_now = f32::from_bits(peak.swap(0, Ordering::Relaxed));
+                    let mut line = format_line(
                         label,
                         ticks.load(Ordering::Relaxed),
                         last_frames.load(Ordering::Relaxed),
-                    ));
+                        peak_now,
+                    );
+                    let session = crate::ios_session::session_summary();
+                    if !session.is_empty() {
+                        line.push(' ');
+                        line.push_str(&session);
+                    }
+                    emit(&line);
                 }
             })
             .ok()?;
@@ -192,8 +220,8 @@ mod tests {
     #[test]
     fn format_line_has_the_documented_shape() {
         assert_eq!(
-            format_line("windows", 42, 480),
-            "[mw-backend] audio heartbeat ticks=42 last_frames=480 backend=windows"
+            format_line("windows", 42, 480, 0.25),
+            "[mw-backend] audio heartbeat ticks=42 last_frames=480 backend=windows peak=0.250000"
         );
     }
 
@@ -224,6 +252,7 @@ mod tests {
             "test",
             Arc::clone(&ticks),
             Arc::clone(&frames),
+            Arc::new(AtomicU32::new(0)),
             move |line| sink.lock().unwrap().push(line.to_string()),
         )
         .expect("thread spawn");
@@ -242,7 +271,7 @@ mod tests {
         let mut previous = 0u64;
         for line in &lines {
             assert!(line.starts_with("[mw-backend] audio heartbeat ticks="));
-            assert!(line.ends_with("last_frames=512 backend=test"));
+            assert!(line.ends_with("last_frames=512 backend=test peak=0.000000"));
             let value: u64 = line
                 .split("ticks=")
                 .nth(1)
@@ -263,6 +292,7 @@ mod tests {
             Duration::from_secs(3600),
             "test",
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicU32::new(0)),
             move |_| *sink.lock().unwrap() += 1,
         )

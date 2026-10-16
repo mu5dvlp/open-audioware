@@ -101,6 +101,10 @@ pub struct CpalBackend {
     /// 連続した場合に「進んだかどうか」を値の変化だけでは区別できない。単調増加の
     /// カウンタなら、値が変わっていれば必ず「少なくとも1回呼ばれた」ことを意味する。
     callback_ticks: Arc<AtomicU64>,
+    /// 直近のハートビート間隔に出力バッファへ書いた最大の絶対値(`f32` のビット列)。
+    /// 音声スレッドが `fetch_max` で更新し、ハートビートのスレッドが `swap(0)` で読む。
+    /// 非負の `f32` はビット列の順序が値の順序と一致するので整数の `fetch_max` で足りる。
+    callback_peak: Arc<AtomicU32>,
     /// 音声スレッドが `Renderer::render` を呼び終えるたびに `Release` で加算する
     /// カウンタ(値そのものに意味は無い)。`close()` がストリーム停止後に `Acquire` で
     /// 読み、最後のコールバックの書き込みと drop 側の読み出しの間に happens-before の
@@ -140,6 +144,7 @@ impl CpalBackend {
             ios_interruption: None,
             callback_frames: Arc::new(AtomicU32::new(0)),
             callback_ticks: Arc::new(AtomicU64::new(0)),
+            callback_peak: Arc::new(AtomicU32::new(0)),
             render_completions: Arc::new(AtomicU64::new(0)),
             heartbeat: None,
             output_latency_ns: Arc::new(AtomicU64::new(0)),
@@ -257,6 +262,7 @@ impl Backend for CpalBackend {
             // `ios_interruption::Watcher::new` へも同じカウンタを渡すため、ここでは
             // clone を渡す(コールバッククロージャへムーブされる分)。
             ticks: Arc::clone(&self.callback_ticks),
+            peak: Arc::clone(&self.callback_peak),
             render_completions: Arc::clone(&self.render_completions),
         };
         let underrun_tracker = OutputUnderrunTracker::new(
@@ -291,10 +297,11 @@ impl Backend for CpalBackend {
             Arc::clone(&self.callback_ticks),
         ));
 
-        self.heartbeat = crate::heartbeat::Heartbeat::start_if_enabled(
+        self.heartbeat = crate::heartbeat::Heartbeat::start_if_enabled_with_peak(
             "cpal",
             Arc::clone(&self.callback_ticks),
             Arc::clone(&self.callback_frames),
+            Arc::clone(&self.callback_peak),
         );
         self.sample_rate = config.sample_rate;
         self.stream = Some(stream);
@@ -323,6 +330,7 @@ impl Backend for CpalBackend {
                 self.sample_rate = 0;
                 self.callback_frames.store(0, Ordering::Relaxed);
                 self.callback_ticks.store(0, Ordering::Relaxed);
+                self.callback_peak.store(0, Ordering::Relaxed);
                 self.render_completions.store(0, Ordering::Relaxed);
                 self.output_latency_ns.store(0, Ordering::Relaxed);
                 self.logged_output_latency.store(false, Ordering::Relaxed);
@@ -495,6 +503,8 @@ struct CallbackTelemetry {
     output_latency_ns: Arc<AtomicU64>,
     /// [`CpalBackend::callback_ticks`] へ渡す `Arc`。
     ticks: Arc<AtomicU64>,
+    /// [`CpalBackend::callback_peak`] へ渡す `Arc`。
+    peak: Arc<AtomicU32>,
     /// [`CpalBackend::render_completions`] へ渡す `Arc`。
     render_completions: Arc<AtomicU64>,
 }
@@ -516,6 +526,7 @@ fn build_output_stream(
         frames: callback_frames,
         output_latency_ns,
         ticks: callback_ticks,
+        peak: callback_peak,
         render_completions,
     } = telemetry;
     // ストリーム構成時に確定するサンプルレート。オープン中は変わらないため、
@@ -586,6 +597,14 @@ fn build_output_stream(
                 // mw-core の別関数を追加で呼んではいない)。
                 // `Renderer::render` はリアルタイム安全性規約(§5.3)を満たす実装である前提。
                 renderer.render(data, buffer_start_host_time_ns);
+
+                // 調査用: 出力バッファの最大の絶対値(ハートビートが `peak=` で出す)。
+                // ループとアトミック1回のみ(アロケーション・ロック・IO なし)。
+                let mut peak = 0.0_f32;
+                for sample in data.iter() {
+                    peak = peak.max(sample.abs());
+                }
+                callback_peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
 
                 // `close()` がストリーム停止後の `Acquire` でこの書き込みを観測する
                 // ための同期点(`CpalBackend::render_completions` のdoc参照)。

@@ -693,9 +693,11 @@ mod imp {
     use objc2_avf_audio::{
         AVAudioSessionInterruptionNotification, AVAudioSessionInterruptionOptionKey,
         AVAudioSessionInterruptionOptions, AVAudioSessionInterruptionType,
-        AVAudioSessionInterruptionTypeKey, AVAudioSessionMediaServicesWereResetNotification,
-        AVAudioSessionRouteChangeNotification, AVAudioSessionRouteChangeReason,
-        AVAudioSessionRouteChangeReasonKey,
+        AVAudioSessionInterruptionTypeKey, AVAudioSessionMediaServicesWereLostNotification,
+        AVAudioSessionMediaServicesWereResetNotification, AVAudioSessionRouteChangeNotification,
+        AVAudioSessionRouteChangePreviousRouteKey, AVAudioSessionRouteChangeReason,
+        AVAudioSessionRouteChangeReasonKey, AVAudioSessionRouteDescription,
+        AVAudioSessionSilenceSecondaryAudioHintNotification,
     };
     use objc2_foundation::{NSNotification, NSNotificationCenter, NSNumber, NSString, ns_string};
 
@@ -923,6 +925,46 @@ mod imp {
                 }
             }
 
+            // 調査用(ログだけ。状態も復帰も触らない): メディアサービスの喪失・
+            // 二次音声を黙らせるヒントの変化。cpal 版は作り直せないので、リセットも
+            // ここでログだけ残す(自前 RemoteIO 版は上の本処理が受ける)。
+            // SAFETY: 通知名はプロセス生存中変化しない静的値。
+            let log_only = unsafe {
+                [
+                    (
+                        AVAudioSessionMediaServicesWereLostNotification,
+                        "MediaServicesWereLost",
+                        true,
+                    ),
+                    (
+                        AVAudioSessionSilenceSecondaryAudioHintNotification,
+                        "SilenceSecondaryAudioHint",
+                        true,
+                    ),
+                    (
+                        AVAudioSessionMediaServicesWereResetNotification,
+                        "MediaServicesWereReset",
+                        !stream.supports_rebuild(),
+                    ),
+                ]
+            };
+            for (name, label, enabled) in log_only {
+                let Some(name) = name.filter(|_| enabled) else {
+                    continue;
+                };
+                let block = RcBlock::new(move |_: NonNull<NSNotification>| {
+                    crate::mw_log!(
+                        "[mw-backend] probe notification: {label} {} {}",
+                        crate::ios_session::session_summary(),
+                        crate::ios_session::other_audio_summary()
+                    );
+                });
+                let observer = unsafe {
+                    nc.addObserverForName_object_queue_usingBlock(Some(name), None, None, &block)
+                };
+                observers.push(observer);
+            }
+
             // 出力停止ウォッチドッグ(V14。`OutputStallDetector` のクラス doc)。
             // observer の登録がすべて済んだ後に起こす —— 先に起こすと、まだ observer が
             // 揃っていない状態で復帰を試みることになりうる。
@@ -1081,6 +1123,12 @@ mod imp {
         // (このプロジェクトが何度も踏んできた罠。調査記録「Bluetooth
         // 再接続で無音になるケース」参照)。
         crate::mw_log!("[mw-backend] AVAudioSession route change notification received");
+        // 調査用: reason に関係なく、変化の前後のルートと現在のセッション状態を残す。
+        crate::mw_log!(
+            "[mw-backend] route change detail: previous_out=[{}] {}",
+            previous_route_outputs(notif),
+            crate::ios_session::session_summary()
+        );
         let Some(reason) = route_change_reason(notif) else {
             crate::mw_log!(
                 "[mw-backend] ios_interruption: failed to interpret route change reason from \
@@ -1160,6 +1208,26 @@ mod imp {
             AVAudioSessionRouteChangeReason::CategoryChange => RouteChangeReason::CategoryChange,
             AVAudioSessionRouteChangeReason::Override => RouteChangeReason::Override,
             _ => RouteChangeReason::Other,
+        }
+    }
+
+    /// 通知の userInfo にある「変化の前のルート」の出力ポート(取れなければ `?`)。
+    fn previous_route_outputs(notif: &NSNotification) -> String {
+        let Some(user_info) = notif.userInfo() else {
+            return "?".to_string();
+        };
+        let Some(key) = (unsafe { AVAudioSessionRouteChangePreviousRouteKey }) else {
+            return "?".to_string();
+        };
+        // SAFETY: `route_change_reason` と同じ reinterpret。
+        let dict = unsafe { user_info.cast_unchecked::<NSString, AnyObject>() };
+        let Some(value) = dict.objectForKey(key) else {
+            return "?".to_string();
+        };
+        match value.downcast_ref::<AVAudioSessionRouteDescription>() {
+            // SAFETY: 型を確かめた有効なオブジェクト。
+            Some(route) => unsafe { crate::ios_session::route_outputs(route) },
+            None => "?".to_string(),
         }
     }
 

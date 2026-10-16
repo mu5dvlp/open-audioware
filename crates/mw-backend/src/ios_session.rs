@@ -71,10 +71,27 @@ pub fn deactivate() {
 #[cfg(not(any(target_os = "ios", target_os = "tvos")))]
 pub fn deactivate() {}
 
+/// 調査用: レート・出力チャンネル数・出力ポート・カテゴリの現況(ハートビート用)。
+/// iOS / tvOS 以外では空文字列。
+#[cfg(any(target_os = "ios", target_os = "tvos"))]
+pub fn session_summary() -> String {
+    imp::session_summary()
+}
+
+/// iOS / tvOS 以外では空文字列。
+#[cfg(not(any(target_os = "ios", target_os = "tvos")))]
+pub fn session_summary() -> String {
+    String::new()
+}
+
+#[cfg(any(target_os = "ios", target_os = "tvos"))]
+pub(crate) use imp::{other_audio_summary, route_outputs};
+
 #[cfg(any(target_os = "ios", target_os = "tvos"))]
 mod imp {
     use objc2_avf_audio::{
-        AVAudioSession, AVAudioSessionCategoryPlayback, AVAudioSessionSetActiveOptions,
+        AVAudioSession, AVAudioSessionCategoryPlayback, AVAudioSessionRouteDescription,
+        AVAudioSessionSetActiveOptions,
     };
 
     use super::{PREFERRED_IO_BUFFER_DURATION_SEC, PREFERRED_SAMPLE_RATE_HZ};
@@ -127,13 +144,62 @@ mod imp {
             // 計測結果の解釈に直結するので、記録(`docs/measurement-m1.md` §7.1)へ
             // 転記できるようこの1行で完結させている。
             crate::mw_log!(
-                "[mw-backend] AVAudioSession configured: sample_rate={} Hz, io_buffer={:.3} ms, \
-                 output_latency={:.3} ms, output_channels={}",
+                "[mw-backend] AVAudioSession configured: sample_rate={} Hz, io_buffer={:.3} ms,                  output_latency={:.3} ms, output_channels={}, category={},                  category_options={:#x}, outputs=[{}], other_audio_playing={},                  secondary_audio_silence_hint={}",
                 session.sampleRate(),
                 session.IOBufferDuration() * 1000.0,
                 session.outputLatency() * 1000.0,
                 session.outputNumberOfChannels(),
+                session.category(),
+                session.categoryOptions().0,
+                route_outputs(&session.currentRoute()),
+                session.isOtherAudioPlaying(),
+                session.secondaryAudioShouldBeSilencedHint(),
             );
+        }
+    }
+
+    /// 出力ポートの `portType` をカンマ区切りにしたもの(例: `Speaker` / `BluetoothA2DPOutput`)。
+    ///
+    /// # Safety
+    /// `route` は有効な `AVAudioSessionRouteDescription`。
+    pub unsafe fn route_outputs(route: &AVAudioSessionRouteDescription) -> String {
+        let outputs = unsafe { route.outputs() };
+        let mut text = String::new();
+        for index in 0..outputs.count() {
+            if index > 0 {
+                text.push(',');
+            }
+            let port = outputs.objectAtIndex(index);
+            text.push_str(&unsafe { port.portType() }.to_string());
+        }
+        text
+    }
+
+    /// 調査用の1行ぶんの現況(レート・出力チャンネル数・出力ポート・カテゴリ)。
+    pub fn session_summary() -> String {
+        // SAFETY: `configure` と同じ——共有インスタンスの読み取り専用 getter のみ。
+        unsafe {
+            let session = AVAudioSession::sharedInstance();
+            format!(
+                "session_rate={} session_channels={} session_out=[{}] category={}",
+                session.sampleRate(),
+                session.outputNumberOfChannels(),
+                route_outputs(&session.currentRoute()),
+                session.category(),
+            )
+        }
+    }
+
+    /// 通知の調査ログ用: 他アプリの音・二次音声を黙らせるヒントの現況。
+    pub fn other_audio_summary() -> String {
+        // SAFETY: 読み取り専用 getter のみ。
+        unsafe {
+            let session = AVAudioSession::sharedInstance();
+            format!(
+                "other_audio_playing={} secondary_audio_silence_hint={}",
+                session.isOtherAudioPlaying(),
+                session.secondaryAudioShouldBeSilencedHint(),
+            )
         }
     }
 

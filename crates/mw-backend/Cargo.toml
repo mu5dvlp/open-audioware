@@ -21,7 +21,7 @@ cpal = "=0.18.1"
 # 詳細は crates/mw-backend/src/ios_session.rs を参照。
 [target.'cfg(any(target_os = "ios", target_os = "tvos"))'.dependencies.objc2-avf-audio]
 version = "0.3"
-features = ["std", "AVAudioSession", "AVAudioSessionTypes"]
+features = ["std", "AVAudioSession", "AVAudioSessionRoute", "AVAudioSessionTypes"]
 default-features = false
 
 # AVAudioSessionInterruptionNotification / UIApplicationDidBecomeActiveNotification を
