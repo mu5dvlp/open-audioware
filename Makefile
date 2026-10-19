@@ -122,14 +122,14 @@ setup:
 	@echo "== cargo-ndk =="
 	@if ! command -v cargo-ndk >/dev/null 2>&1; then \
 		echo "cargo-ndk が見つからないため導入します"; \
-		cargo install cargo-ndk; \
+		cargo install --locked cargo-ndk; \
 	else \
 		echo "cargo-ndk は導入済み: $$(cargo ndk --version)"; \
 	fi
 	@echo "== cargo-deny =="
 	@if ! command -v cargo-deny >/dev/null 2>&1; then \
 		echo "cargo-deny が見つからないため導入します"; \
-		cargo install cargo-deny; \
+		cargo install --locked cargo-deny; \
 	else \
 		echo "cargo-deny は導入済み: $$(cargo deny --version)"; \
 	fi
@@ -146,7 +146,7 @@ setup:
 
 lint:
 	cargo fmt --all -- --check
-	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy --locked --workspace --all-targets -- -D warnings
 	cargo deny check
 	@$(MAKE) --no-print-directory cargo-machete
 	@$(MAKE) --no-print-directory third-party-licenses-check
@@ -247,7 +247,7 @@ csharp-check: ## MwNative.cs を Unity 無しでコンパイルする(P3-8)
 	}
 	@test -f $(CSHARP_GENERATED) || { \
 	  echo "[info] $(CSHARP_GENERATED) が無いので cargo build で生成します"; \
-	  cargo build -p mw-ffi; \
+	  cargo build --locked -p mw-ffi; \
 	}
 	@echo "[csharp-check] 既定(Unity Editor / macOS / Android 経路)"
 	@dotnet build $(CSHARP_ABI_PROJECT) -v q --nologo
@@ -377,7 +377,7 @@ format:
 	cargo fmt --all
 
 test:
-	cargo test --workspace
+	cargo test --locked --workspace
 
 # --- Miri(unsafe の未定義動作の検査)---------------------------------------
 #
@@ -504,7 +504,7 @@ bench:
 # --document-private-items は付けない: 読者は C ABI の利用者で、内部実装は対象外。
 
 doc: doc-coverage
-	cargo doc -p mw-ffi -p mw-core -p mw-backend --no-deps
+	cargo doc --locked -p mw-ffi -p mw-core -p mw-backend --no-deps
 	@echo "generated: target/doc/mw_ffi/index.html"
 
 # doc の前提(全エクスポート関数に doc コメントがある)を機械で見張る。
@@ -516,7 +516,7 @@ doc-coverage:
 # 1回走らせるだけで unity/Runtime/Generated/NativeMethods.g.cs が再生成される
 # (関数シグネチャはターゲットに依存しないため、ホストビルドで十分)。
 bindgen:
-	cargo build -p mw-ffi
+	cargo build --locked -p mw-ffi
 	@test -f unity/Runtime/Generated/NativeMethods.g.cs \
 		&& echo "generated: unity/Runtime/Generated/NativeMethods.g.cs" \
 		|| (echo "NativeMethods.g.cs の生成に失敗しました" && exit 1)
@@ -526,8 +526,8 @@ bindgen:
 # Intel Mac と Apple Silicon Mac のどちらの Unity Editor でも同じ配布物を使えるよう、
 # macOS 用 dylib は両ターゲットを release ビルドし、lipo で universal に束ねる。
 build-macos:
-	cargo build -p mw-ffi --release --target aarch64-apple-darwin
-	cargo build -p mw-ffi --release --target x86_64-apple-darwin
+	cargo build --locked -p mw-ffi --release --target aarch64-apple-darwin
+	cargo build --locked -p mw-ffi --release --target x86_64-apple-darwin
 	@mkdir -p $(PLUGINS_MACOS_DIR)
 	@# install name はビルドした機械の絶対パスになるので、配布物では @rpath に揃える
 	@# (Unity はプラグインをパスで読み込むため、値そのものは読み込みに影響しない)。
@@ -548,7 +548,7 @@ build-macos:
 	@echo "built: $(PLUGINS_MACOS_DIR)/libmw_ffi.dylib($$(lipo -archs $(PLUGINS_MACOS_DIR)/libmw_ffi.dylib))"
 
 build-ios:
-	cargo build -p mw-ffi --release --target aarch64-apple-ios
+	cargo build --locked -p mw-ffi --release --target aarch64-apple-ios
 	@mkdir -p $(PLUGINS_IOS_DIR)
 	@rm -rf $(XCFRAMEWORK)
 	xcodebuild -create-xcframework \
@@ -558,7 +558,7 @@ build-ios:
 
 build-android:
 	cargo ndk -t $(ANDROID_ABI) -P $(ANDROID_API_LEVEL) -o /tmp/mgct-mw-android-out \
-		build -p mw-ffi --release
+		build --locked -p mw-ffi --release
 	@mkdir -p $(PLUGINS_ANDROID_DIR)
 	@cp /tmp/mgct-mw-android-out/$(ANDROID_ABI)/libmw_ffi.so $(PLUGINS_ANDROID_DIR)/libmw_ffi.so
 	@echo "built: $(PLUGINS_ANDROID_DIR)/libmw_ffi.so"
