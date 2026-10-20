@@ -20,6 +20,17 @@ ANDROID_NDK_HOME     ?= $(UNITY_HUB_EDITOR_DIR)/PlaybackEngines/AndroidPlayer/ND
 endif
 export ANDROID_NDK_HOME
 
+# Socket Firewall(sfw)。あれば `make setup` の cargo 取得の前に付ける。入れ方: `npm i -g sfw`。
+# 外すときは `make setup SFW=`、無いときに止めたいときは `SFW_REQUIRED=1`。
+SFW ?= $(shell command -v sfw 2>/dev/null)
+SFW_REQUIRED ?= 0
+# Windows の cargo(schannel)は sfw の中継の証明書の失効確認で落ちるため、sfw を使うときだけ失効確認を切る。
+ifneq (,$(filter MINGW% MSYS% CYGWIN%,$(shell uname -s)))
+SFW_CARGO = $(if $(SFW),CARGO_HTTP_CHECK_REVOKE=false $(SFW),)
+else
+SFW_CARGO = $(SFW)
+endif
+
 # AAudio(Android のローレイテンシ出力 API)は API level 26 以降が必要。
 ANDROID_API_LEVEL   ?= 26
 ANDROID_ABI          ?= arm64-v8a
@@ -113,6 +124,13 @@ help:
 # --- setup --------------------------------------------------------------
 
 setup:
+	@if [ -z "$(SFW)" ]; then \
+		echo "警告: sfw(Socket Firewall)が無いので素の cargo で続けます。入れ方: npm i -g sfw"; \
+		[ "$(SFW_REQUIRED)" = "1" ] && { echo "SFW_REQUIRED=1 のため中止します"; exit 1; }; \
+		true; \
+	fi
+	@echo "== cargo fetch =="
+	$(SFW_CARGO) cargo fetch --locked
 	@echo "== rustup targets =="
 	rustup target add \
 		aarch64-apple-darwin \
@@ -122,14 +140,14 @@ setup:
 	@echo "== cargo-ndk =="
 	@if ! command -v cargo-ndk >/dev/null 2>&1; then \
 		echo "cargo-ndk が見つからないため導入します"; \
-		cargo install --locked cargo-ndk; \
+		$(SFW_CARGO) cargo install --locked cargo-ndk; \
 	else \
 		echo "cargo-ndk は導入済み: $$(cargo ndk --version)"; \
 	fi
 	@echo "== cargo-deny =="
 	@if ! command -v cargo-deny >/dev/null 2>&1; then \
 		echo "cargo-deny が見つからないため導入します"; \
-		cargo install --locked cargo-deny; \
+		$(SFW_CARGO) cargo install --locked cargo-deny; \
 	else \
 		echo "cargo-deny は導入済み: $$(cargo deny --version)"; \
 	fi

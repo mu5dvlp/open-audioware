@@ -179,7 +179,7 @@ Makefile・コードのどちらもアーチ非依存に書いてあります。
 
 | コマンド | 内容 |
 |---|---|
-| `make setup` | ツールチェーン・ターゲット・cargo-ndk 等の導入確認 |
+| `make setup` | ツールチェーン・ターゲット・cargo-ndk 等の導入確認(`sfw`〈Socket Firewall〉があれば cargo の前に付ける。`npm i -g sfw`)|
 | `make lint` | `cargo fmt --check` + `cargo clippy -D warnings` + `cargo deny check` + 第三者表記の鮮度検査 |
 | `make third-party-licenses` | [`THIRD-PARTY-LICENSES.md`](./THIRD-PARTY-LICENSES.md) を再生成。**依存を足したら必ず実行** |
 | `make third-party-licenses-check` | 再生成して差分が無いか検査(`make lint` から呼ばれる) |
