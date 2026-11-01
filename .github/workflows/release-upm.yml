@@ -46,7 +46,7 @@ jobs:
       # タグ push で動く(= 特権コンテキストの)ビルドなので、他の ref で書かれた
       # キャッシュを信用して取り込まない(zizmor cache-poisoning 対応)。
       # lookup-only により、キャッシュの有無確認はするが内容は復元しない。
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           lookup-only: true
 
@@ -79,7 +79,7 @@ jobs:
       # タグ push で動く(= 特権コンテキストの)ビルドなので、他の ref で書かれた
       # キャッシュを信用して取り込まない(zizmor cache-poisoning 対応)。
       # lookup-only により、キャッシュの有無確認はするが内容は復元しない。
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           lookup-only: true
 
@@ -116,7 +116,7 @@ jobs:
       # タグ push で動く(= 特権コンテキストの)ビルドなので、他の ref で書かれた
       # キャッシュを信用して取り込まない(zizmor cache-poisoning 対応)。
       # lookup-only により、キャッシュの有無確認はするが内容は復元しない。
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           lookup-only: true
 
